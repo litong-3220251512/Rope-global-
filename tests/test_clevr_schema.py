@@ -4,8 +4,11 @@ import importlib
 import json
 import math
 import unittest
-from dataclasses import FrozenInstanceError, replace
+from copy import copy
+from dataclasses import FrozenInstanceError
+from fractions import Fraction
 
+import numpy as np
 import torch
 
 from src.local_rope import build_axial_cis
@@ -84,7 +87,9 @@ class CLEVRSchemaTests(unittest.TestCase):
     def test_marker_rejects_location_fields_inconsistent_with_source_coordinates(self):
         grid = self.schema.GridSpec(480, 320, 224, 224, 16, 16)
         location = grid.locate(object_index=0, x=239, y=159)
-        forged = replace(location, patch_x=7, region_x=1)
+        forged = copy(location)
+        object.__setattr__(forged, "patch_x", 7)
+        object.__setattr__(forged, "region_x", 1)
 
         with self.assertRaises(ValueError):
             grid.marker(forged)
@@ -173,7 +178,7 @@ class CLEVRSchemaTests(unittest.TestCase):
         )
         self.assertEqual(adjacent.label, "upper-left")
 
-    def test_swapping_objects_inverts_label_and_preserves_region_slice(self):
+    def test_swapping_objects_covers_both_label_involutions_and_preserves_region_slice(self):
         grid = self.schema.GridSpec(480, 320, 224, 224, 16, 16)
         metadata = dict(
             grid=grid,
@@ -181,28 +186,26 @@ class CLEVRSchemaTests(unittest.TestCase):
             official_split="train",
             image_filename="CLEVR_train_000020.png",
         )
-        forward = self.schema.build_relative_query(
-            **metadata,
-            a_index=0,
-            a_x=20,
-            a_y=20,
-            b_index=1,
-            b_x=200,
-            b_y=100,
-        )
-        reverse = self.schema.build_relative_query(
-            **metadata,
-            a_index=1,
-            a_x=200,
-            a_y=100,
-            b_index=0,
-            b_x=20,
-            b_y=20,
-        )
-
-        self.assertEqual((forward.label, reverse.label), ("upper-left", "lower-right"))
-        self.assertTrue(forward.same_region)
-        self.assertEqual(forward.same_region, reverse.same_region)
+        cases = [
+            ((20, 20), (200, 100), "upper-left", "lower-right", True),
+            ((200, 20), (20, 100), "upper-right", "lower-left", True),
+            ((20, 200), (300, 100), "lower-left", "upper-right", False),
+            ((300, 200), (20, 100), "lower-right", "upper-left", False),
+        ]
+        for a, b, forward_label, reverse_label, same_region in cases:
+            with self.subTest(forward_label=forward_label, same_region=same_region):
+                forward = self.schema.build_relative_query(
+                    **metadata, a_index=0, a_x=a[0], a_y=a[1],
+                    b_index=1, b_x=b[0], b_y=b[1],
+                )
+                reverse = self.schema.build_relative_query(
+                    **metadata, a_index=1, a_x=b[0], a_y=b[1],
+                    b_index=0, b_x=a[0], b_y=a[1],
+                )
+                self.assertEqual((forward.label, reverse.label),
+                                 (forward_label, reverse_label))
+                self.assertEqual(forward.same_region, same_region)
+                self.assertEqual(forward.same_region, reverse.same_region)
 
     def test_query_metadata_and_relative_object_identity_are_validated(self):
         grid = self.schema.GridSpec(480, 320, 224, 224, 16, 16)
@@ -219,6 +222,7 @@ class CLEVRSchemaTests(unittest.TestCase):
             dict(scene_id=-1),
             dict(scene_id=True),
             dict(official_split="test"),
+            dict(official_split=[]),
             dict(image_filename=""),
         ]:
             arguments = dict(valid)
@@ -239,6 +243,52 @@ class CLEVRSchemaTests(unittest.TestCase):
                 b_x=200,
                 b_y=100,
             )
+
+    def test_public_records_cannot_bypass_the_validated_construction_paths(self):
+        grid = self.schema.GridSpec(480, 320, 224, 224, 16, 16)
+        valid_location = grid.locate(object_index=0, x=20, y=20)
+        with self.assertRaises(TypeError):
+            self.schema.ObjectLocation(
+                object_index=0,
+                x=20,
+                y=20,
+                patch_x=13,
+                patch_y=13,
+                region_x=1,
+                region_y=1,
+            )
+        with self.assertRaises(TypeError):
+            self.schema.QueryRecord(
+                scene_id=21,
+                official_split="invalid",
+                image_filename="",
+                source_width=480,
+                source_height=320,
+                query_kind="relative",
+                object_a=valid_location,
+                object_b=None,
+                label="lower-right",
+                same_region=True,
+            )
+
+    def test_non_native_real_coordinates_are_normalized_for_strict_json_export(self):
+        grid = self.schema.GridSpec(480, 320, 224, 224, 16, 16)
+        query = self.schema.build_absolute_query(
+            grid=grid,
+            scene_id=23,
+            official_split="train",
+            image_filename="CLEVR_train_000023.png",
+            object_index=0,
+            x=np.float32(12.5),
+            y=Fraction(3, 2),
+        )
+
+        encoded = json.dumps(query.to_dict(), allow_nan=False)
+        restored = json.loads(encoded)
+        self.assertEqual(restored["object_a"]["x"], 12.5)
+        self.assertEqual(restored["object_a"]["y"], 1.5)
+        self.assertIs(type(query.object_a.x), float)
+        self.assertIs(type(query.object_a.y), float)
 
     def test_query_record_exports_a_complete_json_serializable_manifest_entry(self):
         grid = self.schema.GridSpec(480, 320, 224, 224, 16, 16)

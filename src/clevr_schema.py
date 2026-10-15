@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import InitVar, asdict, dataclass
 from numbers import Real
 from typing import Literal
 
 import torch
 from torch import Tensor
+
+
+_CONSTRUCTION_TOKEN = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +23,11 @@ class ObjectLocation:
     patch_y: int
     region_x: int
     region_y: int
+    _construction_token: InitVar[object] = None
+
+    def __post_init__(self, _construction_token: object) -> None:
+        if _construction_token is not _CONSTRUCTION_TOKEN:
+            raise TypeError("ObjectLocation records must be created by GridSpec.locate")
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +42,11 @@ class QueryRecord:
     object_b: ObjectLocation | None
     label: int | str
     same_region: bool | None
+    _construction_token: InitVar[object] = None
+
+    def __post_init__(self, _construction_token: object) -> None:
+        if _construction_token is not _CONSTRUCTION_TOKEN:
+            raise TypeError("QueryRecord records must be created by query builders")
 
     def to_dict(self) -> dict[str, object]:
         """Return a nested record suitable for JSON-lines manifests."""
@@ -80,16 +93,19 @@ class GridSpec:
             raise ValueError("object coordinates must be finite real numbers")
         if not 0 <= x < self.source_width or not 0 <= y < self.source_height:
             raise ValueError("object coordinates lie outside the source image")
-        patch_x = int(self.patch_columns * x / self.source_width)
-        patch_y = int(self.patch_rows * y / self.source_height)
+        normalized_x = x if isinstance(x, int) else float(x)
+        normalized_y = y if isinstance(y, int) else float(y)
+        patch_x = int(self.patch_columns * normalized_x / self.source_width)
+        patch_y = int(self.patch_rows * normalized_y / self.source_height)
         return ObjectLocation(
             object_index=object_index,
-            x=x,
-            y=y,
+            x=normalized_x,
+            y=normalized_y,
             patch_x=patch_x,
             patch_y=patch_y,
             region_x=(2 * patch_x) // self.patch_columns,
             region_y=(2 * patch_y) // self.patch_rows,
+            _construction_token=_CONSTRUCTION_TOKEN,
         )
 
     def marker(self, location: ObjectLocation) -> Tensor:
@@ -107,7 +123,7 @@ class GridSpec:
 def _validate_query_metadata(scene_id: int, official_split: str, image_filename: str) -> None:
     if not isinstance(scene_id, int) or isinstance(scene_id, bool) or scene_id < 0:
         raise ValueError("scene_id must be a non-negative integer")
-    if official_split not in {"train", "val"}:
+    if not isinstance(official_split, str) or official_split not in {"train", "val"}:
         raise ValueError("official_split must be train or val")
     if not isinstance(image_filename, str) or not image_filename.strip():
         raise ValueError("image_filename must be a non-empty string")
@@ -136,6 +152,7 @@ def build_absolute_query(
         object_b=None,
         label=2 * location.region_y + location.region_x,
         same_region=None,
+        _construction_token=_CONSTRUCTION_TOKEN,
     )
 
 
@@ -175,4 +192,5 @@ def build_relative_query(
         label=f"{vertical}-{horizontal}",
         same_region=(object_a.region_x, object_a.region_y)
         == (object_b.region_x, object_b.region_y),
+        _construction_token=_CONSTRUCTION_TOKEN,
     )
