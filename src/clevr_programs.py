@@ -10,6 +10,14 @@ class ProgramSchemaError(ValueError):
     """Raised when a CLEVR functional program violates its source schema."""
 
 
+class SceneSchemaError(ValueError):
+    """Raised when a scene cannot support faithful official-answer auditing."""
+
+
+class AnswerMismatchError(ValueError):
+    """Raised when a recomputed answer disagrees with the published answer."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramNode:
     function: str
@@ -53,6 +61,10 @@ _FILTER_VALUES = {
     "filter_shape": frozenset({"cube", "sphere", "cylinder"}),
     "filter_size": frozenset({"small", "large"}),
     "filter_material": frozenset({"rubber", "metal"}),
+}
+_OBJECT_VALUES = {
+    function.removeprefix("filter_"): values
+    for function, values in _FILTER_VALUES.items()
 }
 _TARGET_FUNCTIONS = frozenset(
     {"scene", "unique", "relate", "exist", *_FILTER_VALUES}
@@ -148,3 +160,89 @@ def select_single_relation_exist(
     return SelectionDecision(
         relation=nodes[relate_index].value_inputs[0], exclusion_reason=None
     )
+
+
+def evaluate_selected_program(nodes: tuple[ProgramNode, ...], scene: object) -> bool:
+    """Evaluate only the selected linear program family on one scene graph."""
+    decision = select_single_relation_exist(nodes, "yes")
+    if decision.relation is None:
+        raise ProgramSchemaError("only selected relation-existence programs can be evaluated")
+
+    objects, relationships = _validate_scene(scene)
+    output: list[int] | int | bool = []
+    for node in nodes:
+        if node.function == "scene":
+            output = list(range(len(objects)))
+        elif node.function in _FILTER_VALUES:
+            attribute = node.function.removeprefix("filter_")
+            value = node.value_inputs[0]
+            output = [index for index in output if objects[index][attribute] == value]
+        elif node.function == "unique":
+            if len(output) != 1:
+                raise SceneSchemaError("unique must receive exactly one object")
+            output = output[0]
+        elif node.function == "relate":
+            output = list(relationships[node.value_inputs[0]][output])
+        elif node.function == "exist":
+            output = bool(output)
+
+    return output
+
+
+def _validate_scene(
+    scene: object,
+) -> tuple[list[Mapping[str, object]], Mapping[str, list[list[int]]]]:
+    if not isinstance(scene, Mapping):
+        raise SceneSchemaError("scene must be a mapping")
+    objects = scene.get("objects")
+    relationships = scene.get("relationships")
+    if not isinstance(objects, list):
+        raise SceneSchemaError("scene objects must be a list")
+    if not isinstance(relationships, Mapping):
+        raise SceneSchemaError("scene relationships must be a mapping")
+
+    for object_index, scene_object in enumerate(objects):
+        if not isinstance(scene_object, Mapping):
+            raise SceneSchemaError(f"scene object {object_index} must be a mapping")
+        for attribute, allowed_values in _OBJECT_VALUES.items():
+            if scene_object.get(attribute) not in allowed_values:
+                raise SceneSchemaError(
+                    f"scene object {object_index} has invalid or missing {attribute}"
+                )
+
+    object_count = len(objects)
+    for relation in _RELATIONS:
+        rows = relationships.get(relation)
+        if not isinstance(rows, list) or len(rows) != object_count:
+            raise SceneSchemaError(
+                f"relationship {relation} must have one row per object"
+            )
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, list):
+                raise SceneSchemaError(
+                    f"relationship {relation} row {row_index} must be a list"
+                )
+            if any(
+                type(related_index) is not int
+                or not 0 <= related_index < object_count
+                for related_index in row
+            ):
+                raise SceneSchemaError(
+                    f"relationship {relation} row {row_index} contains an invalid object index"
+                )
+
+    return objects, relationships
+
+
+def audit_official_answer(
+    nodes: tuple[ProgramNode, ...], scene: object, answer: object
+) -> None:
+    """Require the official yes/no answer to match independent evaluation."""
+    select_single_relation_exist(nodes, answer)
+    recomputed = evaluate_selected_program(nodes, scene)
+    expected = answer == "yes"
+    if recomputed is not expected:
+        raise AnswerMismatchError(
+            f"official answer {answer!r} disagrees with recomputed "
+            f"{'yes' if recomputed else 'no'!r}"
+        )

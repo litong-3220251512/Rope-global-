@@ -1,12 +1,17 @@
 """Data-free tests for selecting and auditing CLEVR functional programs."""
 
 import unittest
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
 
 from src.clevr_programs import (
+    AnswerMismatchError,
     ProgramNode,
     ProgramSchemaError,
+    SceneSchemaError,
     SelectionDecision,
+    audit_official_answer,
+    evaluate_selected_program,
     parse_program,
     select_single_relation_exist,
 )
@@ -310,6 +315,143 @@ class ProgramSelectionTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 SelectionDecision(**arguments)
+
+
+class ProgramEvaluationTests(unittest.TestCase):
+    def setUp(self):
+        self.scene = {
+            "objects": [
+                {"color": "red", "shape": "cube", "size": "small", "material": "rubber"},
+                {"color": "blue", "shape": "sphere", "size": "large", "material": "metal"},
+                {"color": "green", "shape": "cylinder", "size": "small", "material": "metal"},
+            ],
+            "relationships": {
+                "left": [[1, 2], [2], []],
+                "right": [[], [0], [0, 1]],
+                "front": [[2], [], [1]],
+                "behind": [[1], [2], []],
+            },
+        }
+
+    def _program(self, relation, post_filter, post_value):
+        return parse_program([
+            {"function": "scene", "inputs": [], "value_inputs": []},
+            {"function": "filter_color", "inputs": [0], "value_inputs": ["red"]},
+            {"function": "filter_shape", "inputs": [1], "value_inputs": ["cube"]},
+            {"function": "filter_size", "inputs": [2], "value_inputs": ["small"]},
+            {"function": "filter_material", "inputs": [3], "value_inputs": ["rubber"]},
+            {"function": "unique", "inputs": [4], "value_inputs": []},
+            {"function": "relate", "inputs": [5], "value_inputs": [relation]},
+            {"function": post_filter, "inputs": [6], "value_inputs": [post_value]},
+            {"function": "exist", "inputs": [7], "value_inputs": []},
+        ])
+
+    def test_evaluator_executes_each_filter_and_relation_with_literal_results(self):
+        cases = [
+            ("left", "filter_color", "blue", True),
+            ("right", "filter_color", "blue", False),
+            ("front", "filter_material", "metal", True),
+            ("behind", "filter_size", "large", True),
+        ]
+        for relation, post_filter, post_value, expected in cases:
+            nodes = self._program(relation, post_filter, post_value)
+            with self.subTest(relation=relation):
+                self.assertIs(evaluate_selected_program(nodes, self.scene), expected)
+
+    def test_official_answer_audit_accepts_hand_checked_yes_and_no(self):
+        yes_nodes = self._program("left", "filter_shape", "sphere")
+        no_nodes = self._program("right", "filter_shape", "sphere")
+
+        self.assertIsNone(audit_official_answer(yes_nodes, self.scene, "yes"))
+        self.assertIsNone(audit_official_answer(no_nodes, self.scene, "no"))
+
+    def test_unique_rejects_zero_or_multiple_matching_objects(self):
+        cases = [
+            ("filter_color", "purple"),
+            ("filter_size", "small"),
+        ]
+        for filter_function, value in cases:
+            nodes = parse_program([
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": filter_function, "inputs": [0], "value_inputs": [value]},
+                {"function": "unique", "inputs": [1], "value_inputs": []},
+                {"function": "relate", "inputs": [2], "value_inputs": ["left"]},
+                {"function": "exist", "inputs": [3], "value_inputs": []},
+            ])
+            with self.subTest(filter_function=filter_function), self.assertRaises(
+                SceneSchemaError
+            ):
+                evaluate_selected_program(nodes, self.scene)
+
+    def test_scene_rejects_wrong_relationship_row_count_and_out_of_range_indices(self):
+        nodes = self._program("left", "filter_color", "blue")
+        malformed_scenes = []
+
+        wrong_row_count = deepcopy(self.scene)
+        wrong_row_count["relationships"]["left"] = [[1, 2], [2]]
+        malformed_scenes.append(wrong_row_count)
+
+        out_of_range = deepcopy(self.scene)
+        out_of_range["relationships"]["left"][0] = [3]
+        malformed_scenes.append(out_of_range)
+
+        boolean_index = deepcopy(self.scene)
+        boolean_index["relationships"]["left"][0] = [True]
+        malformed_scenes.append(boolean_index)
+
+        for scene in malformed_scenes:
+            with self.subTest(scene=scene), self.assertRaises(SceneSchemaError):
+                evaluate_selected_program(nodes, scene)
+
+    def test_scene_rejects_missing_or_invalid_object_attributes(self):
+        nodes = self._program("left", "filter_color", "blue")
+        mutations = [
+            ("color", None),
+            ("color", "orange"),
+            ("shape", "cone"),
+            ("size", "medium"),
+            ("material", "wood"),
+        ]
+        for attribute, replacement in mutations:
+            scene = deepcopy(self.scene)
+            if replacement is None:
+                del scene["objects"][1][attribute]
+            else:
+                scene["objects"][1][attribute] = replacement
+            with self.subTest(attribute=attribute, replacement=replacement), self.assertRaises(
+                SceneSchemaError
+            ):
+                evaluate_selected_program(nodes, scene)
+
+    def test_scene_rejects_malformed_top_level_collections_and_relation_rows(self):
+        nodes = self._program("left", "filter_color", "blue")
+        malformed = [
+            None,
+            {"objects": {}, "relationships": self.scene["relationships"]},
+            {"objects": self.scene["objects"], "relationships": []},
+            {"objects": self.scene["objects"], "relationships": {"left": [[], [], []]}},
+            {
+                "objects": self.scene["objects"],
+                "relationships": {
+                    "left": [[1, 2], [2], "not-a-row"],
+                    "right": [[], [0], [0, 1]],
+                    "front": [[2], [], [1]],
+                    "behind": [[1], [2], []],
+                },
+            },
+        ]
+        for scene in malformed:
+            with self.subTest(scene=scene), self.assertRaises(SceneSchemaError):
+                evaluate_selected_program(nodes, scene)
+
+    def test_official_answer_disagreement_is_a_hard_failure_in_both_directions(self):
+        yes_result = self._program("left", "filter_shape", "sphere")
+        no_result = self._program("right", "filter_shape", "sphere")
+
+        with self.assertRaises(AnswerMismatchError):
+            audit_official_answer(yes_result, self.scene, "no")
+        with self.assertRaises(AnswerMismatchError):
+            audit_official_answer(no_result, self.scene, "yes")
 
 
 if __name__ == "__main__":
