@@ -82,6 +82,89 @@ class VocabularyTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             vocabulary.id_to_token = ()
 
+    def test_public_constructor_rejects_invalid_fixed_id_vocabularies(self):
+        invalid_vocabularies = (
+            (
+                "wrong special IDs",
+                {"<NULL>": 1, "<START>": 0, "<END>": 2, "<UNK>": 3},
+                ("<NULL>", "<START>", "<END>", "<UNK>"),
+            ),
+            (
+                "wrong special order",
+                {"<NULL>": 0, "<END>": 1, "<START>": 2, "<UNK>": 3},
+                ("<NULL>", "<END>", "<START>", "<UNK>"),
+            ),
+            (
+                "duplicate token",
+                {
+                    "<NULL>": 0,
+                    "<START>": 1,
+                    "<END>": 2,
+                    "<UNK>": 3,
+                    "red": 4,
+                },
+                ("<NULL>", "<START>", "<END>", "<UNK>", "red", "red"),
+            ),
+            (
+                "unsorted ordinary tokens",
+                {
+                    "<NULL>": 0,
+                    "<START>": 1,
+                    "<END>": 2,
+                    "<UNK>": 3,
+                    "red": 4,
+                    "blue": 5,
+                },
+                ("<NULL>", "<START>", "<END>", "<UNK>", "red", "blue"),
+            ),
+            (
+                "non-dense inverse mapping",
+                {
+                    "<NULL>": 0,
+                    "<START>": 1,
+                    "<END>": 2,
+                    "<UNK>": 3,
+                    "red": 5,
+                },
+                ("<NULL>", "<START>", "<END>", "<UNK>", "red"),
+            ),
+            (
+                "non-mapping token IDs",
+                [],
+                ("<NULL>", "<START>", "<END>", "<UNK>"),
+            ),
+            (
+                "mutable token sequence",
+                {"<NULL>": 0, "<START>": 1, "<END>": 2, "<UNK>": 3},
+                ["<NULL>", "<START>", "<END>", "<UNK>"],
+            ),
+            (
+                "non-string token",
+                {
+                    "<NULL>": 0,
+                    "<START>": 1,
+                    "<END>": 2,
+                    "<UNK>": 3,
+                    7: 4,
+                },
+                ("<NULL>", "<START>", "<END>", "<UNK>", 7),
+            ),
+            (
+                "non-integer ID",
+                {
+                    "<NULL>": 0,
+                    "<START>": 1,
+                    "<END>": 2,
+                    "<UNK>": 3,
+                    "red": "4",
+                },
+                ("<NULL>", "<START>", "<END>", "<UNK>", "red"),
+            ),
+        )
+        for name, token_to_id, id_to_token in invalid_vocabularies:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                Vocabulary(token_to_id=token_to_id, id_to_token=id_to_token)
+
     def test_encoding_maps_unseen_tokens_to_unk_without_expanding_vocabulary(self):
         vocabulary = build_vocabulary(("Is the cube red?",))
         original_mapping = dict(vocabulary.token_to_id)
