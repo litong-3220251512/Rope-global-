@@ -222,7 +222,8 @@ def _validate_scene(
         if not isinstance(scene_object, Mapping):
             raise SceneSchemaError(f"scene object {object_index} must be a mapping")
         for attribute, allowed_values in _OBJECT_VALUES.items():
-            if scene_object.get(attribute) not in allowed_values:
+            value = scene_object.get(attribute)
+            if not isinstance(value, str) or value not in allowed_values:
                 raise SceneSchemaError(
                     f"scene object {object_index} has invalid or missing {attribute}"
                 )
@@ -249,6 +250,11 @@ def _validate_scene(
                 )
 
     return objects, relationships
+
+
+def validate_scene(scene: object) -> None:
+    """Validate the complete object and relationship schema without executing a program."""
+    _validate_scene(scene)
 
 
 def audit_official_answer(

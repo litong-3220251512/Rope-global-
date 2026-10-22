@@ -24,6 +24,7 @@ from src.clevr_programs import (
     audit_official_answer,
     parse_program,
     select_single_relation_exist,
+    validate_scene,
 )
 from src.clevr_text import Vocabulary, build_vocabulary, encode_question
 
@@ -51,7 +52,7 @@ class SourceQuestion:
     source_position: int
     question: str
     program: tuple[ProgramNode, ...]
-    answer: object
+    answer: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +252,10 @@ def _load_scenes(
             raise CLEVRDataError(f"{context} objects must be a list")
         if not isinstance(scene.get("relationships"), Mapping):
             raise CLEVRDataError(f"{context} relationships must be a mapping")
+        try:
+            validate_scene(scene)
+        except SceneSchemaError as exc:
+            raise CLEVRDataError(f"{context} has an invalid scene: {exc}") from exc
 
         image_path = root / "images" / split / image_filename
         _verify_png(image_path)
@@ -304,6 +309,9 @@ def _load_questions(
                 f"{image_filename!r} disagree with the scene"
             )
         question_text = _require_string(question, "question", context)
+        answer = _require_string(question, "answer", context)
+        if not answer:
+            raise CLEVRDataError(f"{context} answer must be a non-empty string")
         try:
             program = parse_program(question.get("program"))
         except ProgramSchemaError as exc:
@@ -317,7 +325,7 @@ def _load_questions(
             source_position=source_position,
             question=question_text,
             program=program,
-            answer=question.get("answer"),
+            answer=answer,
         )
         questions.append(record)
         question_indices.add(question_index)

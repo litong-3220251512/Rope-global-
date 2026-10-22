@@ -7,16 +7,20 @@ import unittest
 from contextlib import redirect_stderr
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
-from run_clevr_data_audit import main as audit_main
+import run_clevr_data_audit as audit_cli
 from src.clevr_audit import (
     CLEVRDataError,
     SelectedQuestion,
     build_audit,
     load_source_index,
 )
+
+
+audit_main = audit_cli.main
 
 
 def _program() -> list[dict[str, object]]:
@@ -226,7 +230,7 @@ class _AuditFixture(_CLEVRFixture):
         record = _question(split, question_index, image_index)
         record["question"] = question
         record["program"] = _excluded_program(reason)
-        record["answer"] = 2 if reason == "unsupported_function" else "yes"
+        record["answer"] = "2" if reason == "unsupported_function" else "yes"
         self.questions[split].append(record)
 
 
@@ -377,6 +381,41 @@ class SourceIndexTests(unittest.TestCase):
         image_path.write_bytes(b"not a PNG")
 
         with self.assertRaisesRegex(CLEVRDataError, "unreadable PNG"):
+            load_source_index(self.root)
+
+    def test_scene_without_questions_still_requires_complete_relationship_schema(self) -> None:
+        self.fixture.questions["train"] = []
+        self.fixture.scenes["train"][0]["relationships"] = {}
+        self.fixture.write_json()
+
+        with self.assertRaisesRegex(
+            CLEVRDataError, "relationship (left|right|front|behind)"
+        ):
+            load_source_index(self.root)
+
+    def test_scene_used_only_by_excluded_question_rejects_nonstring_attributes(self) -> None:
+        self.fixture.questions["train"][0]["program"] = _excluded_program(
+            "unsupported_function"
+        )
+        self.fixture.questions["train"][0]["answer"] = "1"
+        self.fixture.scenes["train"][0]["objects"][0]["color"] = []
+        self.fixture.write_json()
+
+        with self.assertRaisesRegex(CLEVRDataError, "invalid or missing color"):
+            load_source_index(self.root)
+
+    def test_excluded_question_requires_a_present_scalar_string_answer(self) -> None:
+        self.fixture.questions["train"][0]["program"] = _excluded_program(
+            "unsupported_function"
+        )
+        del self.fixture.questions["train"][0]["answer"]
+        self.fixture.write_json()
+        with self.assertRaisesRegex(CLEVRDataError, "answer must be a string"):
+            load_source_index(self.root)
+
+        self.fixture.questions["train"][0]["answer"] = ["1"]
+        self.fixture.write_json()
+        with self.assertRaisesRegex(CLEVRDataError, "answer must be a string"):
             load_source_index(self.root)
 
 
@@ -622,6 +661,18 @@ class AuditCLITests(unittest.TestCase):
             )
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
+    def test_refuses_existing_empty_output_directory(self) -> None:
+        output_dir = self.temporary_root / "empty-output"
+        output_dir.mkdir()
+
+        with self.assertRaisesRegex(CLEVRDataError, "already exists"):
+            audit_main(
+                ["--data-root", str(self.data_root), "--output-dir", str(output_dir)]
+            )
+
+        self.assertTrue(output_dir.is_dir())
+        self.assertEqual(list(output_dir.iterdir()), [])
+
     def test_refuses_output_directory_symlink_without_touching_target(self) -> None:
         target = self.temporary_root / "target"
         target.mkdir()
@@ -643,7 +694,6 @@ class AuditCLITests(unittest.TestCase):
 
     def test_success_atomically_writes_the_four_complete_artifacts(self) -> None:
         output_dir = self.temporary_root / "output"
-        output_dir.mkdir()
 
         exit_code = audit_main(
             ["--data-root", str(self.data_root), "--output-dir", str(output_dir)]
@@ -734,6 +784,69 @@ class AuditCLITests(unittest.TestCase):
         self.assertEqual(
             list(self.temporary_root.glob(f".{output_dir.name}.tmp-*")), []
         )
+
+    def test_mid_serialization_failure_cleans_staging_and_lock(self) -> None:
+        output_dir = self.temporary_root / "write-failure"
+        real_write_json = audit_cli._write_json
+        call_count = 0
+
+        def fail_on_second_json(path: Path, value: object) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError("injected write failure")
+            real_write_json(path, value)
+
+        with mock.patch.object(
+            audit_cli, "_write_json", side_effect=fail_on_second_json
+        ), self.assertRaisesRegex(OSError, "injected write failure"):
+            audit_main(
+                ["--data-root", str(self.data_root), "--output-dir", str(output_dir)]
+            )
+
+        self.assertFalse(output_dir.exists())
+        self.assertEqual(
+            list(self.temporary_root.glob(f".{output_dir.name}.tmp-*")), []
+        )
+        self.assertFalse((self.temporary_root / f".{output_dir.name}.lock").exists())
+
+    def test_rename_failure_cleans_staging_and_lock(self) -> None:
+        output_dir = self.temporary_root / "rename-failure"
+
+        with mock.patch.object(
+            Path, "rename", side_effect=OSError("injected rename failure")
+        ), self.assertRaisesRegex(OSError, "injected rename failure"):
+            audit_main(
+                ["--data-root", str(self.data_root), "--output-dir", str(output_dir)]
+            )
+
+        self.assertFalse(output_dir.exists())
+        self.assertEqual(
+            list(self.temporary_root.glob(f".{output_dir.name}.tmp-*")), []
+        )
+        self.assertFalse((self.temporary_root / f".{output_dir.name}.lock").exists())
+
+    def test_destination_appearance_during_publish_is_not_replaced(self) -> None:
+        output_dir = self.temporary_root / "raced-output"
+        real_write_artifacts = audit_cli._write_artifacts
+
+        def write_then_create_destination(directory, audit, data_root) -> None:
+            real_write_artifacts(directory, audit, data_root)
+            output_dir.mkdir()
+
+        with mock.patch.object(
+            audit_cli, "_write_artifacts", side_effect=write_then_create_destination
+        ), self.assertRaisesRegex(CLEVRDataError, "appeared during publication"):
+            audit_main(
+                ["--data-root", str(self.data_root), "--output-dir", str(output_dir)]
+            )
+
+        self.assertTrue(output_dir.is_dir())
+        self.assertEqual(list(output_dir.iterdir()), [])
+        self.assertEqual(
+            list(self.temporary_root.glob(f".{output_dir.name}.tmp-*")), []
+        )
+        self.assertFalse((self.temporary_root / f".{output_dir.name}.lock").exists())
 
 
 def _json_keys(path: Path) -> set[str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import shutil
 import tempfile
@@ -38,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         required=True,
-        help="New or empty directory for the four audit artifacts.",
+        help="New directory for the four audit artifacts.",
     )
     return parser
 
@@ -57,6 +58,7 @@ def _validate_output_target(output_dir: Path) -> Path:
             raise CLEVRDataError(f"cannot inspect output directory {output}: {exc}") from exc
         if nonempty:
             raise CLEVRDataError(f"refusing to overwrite nonempty output directory: {output}")
+        raise CLEVRDataError(f"output directory already exists: {output}")
     return output
 
 
@@ -162,18 +164,39 @@ def _write_artifacts(directory: Path, audit: AuditResult, data_root: Path) -> No
 
 def _publish_atomically(output: Path, audit: AuditResult, data_root: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(
-        tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent)
-    )
+    lock_path = output.parent / f".{output.name}.lock"
     try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise CLEVRDataError(
+            f"audit publication lock already exists: {lock_path}"
+        ) from exc
+    temporary: Path | None = None
+    try:
+        os.write(lock_fd, f"pid={os.getpid()}\n".encode("ascii"))
+        if output.exists() or output.is_symlink():
+            raise CLEVRDataError(
+                f"output directory appeared during publication: {output}"
+            )
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent)
+        )
         _write_artifacts(temporary, audit, data_root)
-        if output.exists():
-            output.rmdir()
+        if output.exists() or output.is_symlink():
+            raise CLEVRDataError(
+                f"output directory appeared during publication: {output}"
+            )
         temporary.rename(output)
     except BaseException:
-        if temporary.exists():
+        if temporary is not None and temporary.exists():
             shutil.rmtree(temporary)
         raise
+    finally:
+        os.close(lock_fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def main(argv: Sequence[str] | None = None) -> int:
