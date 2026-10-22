@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 
 from PIL import Image
 
+from run_clevr_data_audit import main as audit_main
 from src.clevr_audit import (
     CLEVRDataError,
     SelectedQuestion,
@@ -574,6 +577,180 @@ class AuditCoverageTests(unittest.TestCase):
         )
         self.assertEqual(empty_cell.count, 0)
         self.assertIsNone(empty_cell.accuracy)
+
+
+class AuditCLITests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.temporary_root = Path(self.temporary_directory.name)
+        self.data_root = self.temporary_root / "CLEVR_v1.0"
+        self.fixture = _AuditFixture(self.data_root)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_requires_explicit_data_root_and_rejects_download_option(self) -> None:
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as missing:
+            audit_main(["--output-dir", str(self.temporary_root / "output")])
+        self.assertEqual(missing.exception.code, 2)
+        self.assertIn("--data-root", stderr.getvalue())
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as download:
+            audit_main(
+                [
+                    "--data-root",
+                    str(self.data_root),
+                    "--output-dir",
+                    str(self.temporary_root / "output"),
+                    "--download",
+                ]
+            )
+        self.assertEqual(download.exception.code, 2)
+        self.assertIn("unrecognized arguments: --download", stderr.getvalue())
+
+    def test_refuses_to_overwrite_nonempty_output_directory(self) -> None:
+        output_dir = self.temporary_root / "output"
+        output_dir.mkdir()
+        sentinel = output_dir / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        with self.assertRaisesRegex(CLEVRDataError, "nonempty output directory"):
+            audit_main(
+                ["--data-root", str(self.data_root), "--output-dir", str(output_dir)]
+            )
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_refuses_output_directory_symlink_without_touching_target(self) -> None:
+        target = self.temporary_root / "target"
+        target.mkdir()
+        output_link = self.temporary_root / "output-link"
+        output_link.symlink_to(target, target_is_directory=True)
+
+        with self.assertRaisesRegex(CLEVRDataError, "must not be a symlink"):
+            audit_main(
+                [
+                    "--data-root",
+                    str(self.data_root),
+                    "--output-dir",
+                    str(output_link),
+                ]
+            )
+
+        self.assertTrue(output_link.is_symlink())
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_success_atomically_writes_the_four_complete_artifacts(self) -> None:
+        output_dir = self.temporary_root / "output"
+        output_dir.mkdir()
+
+        exit_code = audit_main(
+            ["--data-root", str(self.data_root), "--output-dir", str(output_dir)]
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            {path.name for path in output_dir.iterdir()},
+            {
+                "image_partitions.json",
+                "vocabulary.json",
+                "selected_questions.jsonl",
+                "audit_report.json",
+            },
+        )
+        partitions = json.loads(
+            (output_dir / "image_partitions.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            {name: len(rows) for name, rows in partitions["partitions"].items()},
+            {"train": 9, "dev": 1, "base_test": 2, "confirmation": 2},
+        )
+        vocabulary = json.loads(
+            (output_dir / "vocabulary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(vocabulary["token_to_id"]["<NULL>"], 0)
+        self.assertEqual(vocabulary["id_to_token"][:4], [
+            "<NULL>",
+            "<START>",
+            "<END>",
+            "<UNK>",
+        ])
+        selected_rows = [
+            json.loads(line)
+            for line in (output_dir / "selected_questions.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(len(selected_rows), 11)
+        self.assertEqual(
+            set(selected_rows[0]),
+            {
+                "partition",
+                "official_split",
+                "image_index",
+                "image_filename",
+                "image_path",
+                "question_index",
+                "source_position",
+                "question",
+                "encoded_tokens",
+                "answer",
+                "relation",
+            },
+        )
+        self.assertEqual(
+            selected_rows[0]["image_path"], "images/train/CLEVR_train_000003.png"
+        )
+        report = json.loads(
+            (output_dir / "audit_report.json").read_text(encoding="utf-8")
+        )
+        empty_cell = next(
+            item
+            for item in report["cell_counts"]
+            if (item["partition"], item["relation"], item["answer"])
+            == ("base_test", "left", 0)
+        )
+        self.assertEqual(empty_cell["count"], 0)
+        self.assertEqual(empty_cell["accuracy"], "NA")
+        serialized_keys = {
+            key.lower()
+            for artifact in output_dir.iterdir()
+            for key in _json_keys(artifact)
+        }
+        self.assertTrue(serialized_keys.isdisjoint({"sha", "sha256", "md5", "digest"}))
+
+    def test_failed_audit_leaves_no_final_or_temporary_artifacts(self) -> None:
+        self.fixture.questions["train"][0]["answer"] = "yes"
+        self.fixture.write_json()
+        output_dir = self.temporary_root / "failed-output"
+
+        with self.assertRaisesRegex(CLEVRDataError, "official answer"):
+            audit_main(
+                ["--data-root", str(self.data_root), "--output-dir", str(output_dir)]
+            )
+
+        self.assertFalse(output_dir.exists())
+        self.assertEqual(
+            list(self.temporary_root.glob(f".{output_dir.name}.tmp-*")), []
+        )
+
+
+def _json_keys(path: Path) -> set[str]:
+    if path.suffix == ".jsonl":
+        values = [json.loads(line) for line in path.read_text().splitlines()]
+    else:
+        values = [json.loads(path.read_text())]
+    keys: set[str] = set()
+    stack = list(values)
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            keys.update(value)
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return keys
 
 
 if __name__ == "__main__":
