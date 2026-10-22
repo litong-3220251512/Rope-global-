@@ -104,39 +104,21 @@ def _excluded(reason: str) -> SelectionDecision:
     return SelectionDecision(relation=None, exclusion_reason=reason)
 
 
-def select_single_relation_exist(
-    nodes: tuple[ProgramNode, ...], answer: object
-) -> SelectionDecision:
-    """Select the frozen linear single-relation existence program family."""
-    if not isinstance(nodes, tuple) or not nodes or any(
-        not isinstance(node, ProgramNode) for node in nodes
-    ):
-        raise ProgramSchemaError("nodes must be a non-empty tuple of ProgramNode records")
-
-    functions = tuple(node.function for node in nodes)
-    if any(function not in _TARGET_FUNCTIONS for function in functions):
-        return _excluded("unsupported_function")
-
-    expected_inputs = tuple(
-        () if position == 0 else (position - 1,) for position in range(len(nodes))
-    )
-    if tuple(node.inputs for node in nodes) != expected_inputs:
-        return _excluded("non_linear_program")
-    if functions.count("unique") != 1:
-        return _excluded("unique_count")
-    if functions.count("relate") != 1:
-        return _excluded("relate_count")
-    if functions.count("scene") != 1 or functions[0] != "scene":
-        return _excluded("scene_layout")
-    if functions.count("exist") != 1 or functions[-1] != "exist":
-        return _excluded("exist_layout")
-
-    unique_index = functions.index("unique")
-    relate_index = functions.index("relate")
-    if relate_index != unique_index + 1:
-        return _excluded("unique_relate_adjacency")
-
+def _validate_program_node_arguments(nodes: tuple[ProgramNode, ...]) -> None:
     for position, node in enumerate(nodes):
+        if any(input_index >= position for input_index in node.inputs):
+            raise ProgramSchemaError(
+                f"program node {position} references itself or a later node"
+            )
+
+        if node.function not in _TARGET_FUNCTIONS:
+            continue
+        expected_input_count = 0 if node.function == "scene" else 1
+        if len(node.inputs) != expected_input_count:
+            raise ProgramSchemaError(
+                f"target node {position} {node.function} requires "
+                f"{expected_input_count} input(s)"
+            )
         if node.function in {"scene", "unique", "exist"}:
             if node.value_inputs:
                 raise ProgramSchemaError(
@@ -153,6 +135,41 @@ def select_single_relation_exist(
                 raise ProgramSchemaError(
                     f"target node {position} has invalid relate value_inputs"
                 )
+
+
+def select_single_relation_exist(
+    nodes: tuple[ProgramNode, ...], answer: object
+) -> SelectionDecision:
+    """Select the frozen linear single-relation existence program family."""
+    if not isinstance(nodes, tuple) or not nodes or any(
+        not isinstance(node, ProgramNode) for node in nodes
+    ):
+        raise ProgramSchemaError("nodes must be a non-empty tuple of ProgramNode records")
+    _validate_program_node_arguments(nodes)
+
+    functions = tuple(node.function for node in nodes)
+    if any(function not in _TARGET_FUNCTIONS for function in functions):
+        return _excluded("unsupported_function")
+
+    if functions.count("unique") != 1:
+        return _excluded("unique_count")
+    if functions.count("relate") != 1:
+        return _excluded("relate_count")
+    if functions.count("scene") != 1 or functions[0] != "scene":
+        return _excluded("scene_layout")
+    if functions.count("exist") != 1 or functions[-1] != "exist":
+        return _excluded("exist_layout")
+
+    expected_inputs = tuple(
+        () if position == 0 else (position - 1,) for position in range(len(nodes))
+    )
+    if tuple(node.inputs for node in nodes) != expected_inputs:
+        return _excluded("non_linear_program")
+
+    unique_index = functions.index("unique")
+    relate_index = functions.index("relate")
+    if relate_index != unique_index + 1:
+        return _excluded("unique_relate_adjacency")
 
     if not isinstance(answer, str) or answer not in {"yes", "no"}:
         raise ProgramSchemaError("target program answer must be exactly 'yes' or 'no'")

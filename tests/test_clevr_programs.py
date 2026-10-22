@@ -206,13 +206,15 @@ class ProgramSelectionTests(unittest.TestCase):
             SelectionDecision(relation=None, exclusion_reason="unsupported_function"),
         )
 
-    def test_excludes_branches_skips_and_wrong_first_inputs_as_non_linear(self):
+    def test_excludes_arity_valid_skips_as_non_linear(self):
         cases = [
             [
                 {"function": "scene", "inputs": [], "value_inputs": []},
-                {"function": "unique", "inputs": [0, 0], "value_inputs": []},
-                {"function": "relate", "inputs": [1], "value_inputs": ["left"]},
-                {"function": "exist", "inputs": [2], "value_inputs": []},
+                {"function": "filter_color", "inputs": [0], "value_inputs": ["red"]},
+                {"function": "filter_shape", "inputs": [0], "value_inputs": ["cube"]},
+                {"function": "unique", "inputs": [2], "value_inputs": []},
+                {"function": "relate", "inputs": [3], "value_inputs": ["left"]},
+                {"function": "exist", "inputs": [4], "value_inputs": []},
             ],
             [
                 {"function": "scene", "inputs": [], "value_inputs": []},
@@ -221,18 +223,118 @@ class ProgramSelectionTests(unittest.TestCase):
                 {"function": "relate", "inputs": [2], "value_inputs": ["left"]},
                 {"function": "exist", "inputs": [3], "value_inputs": []},
             ],
-            [
-                {"function": "scene", "inputs": [0], "value_inputs": []},
-                {"function": "unique", "inputs": [0], "value_inputs": []},
-                {"function": "relate", "inputs": [1], "value_inputs": ["left"]},
-                {"function": "exist", "inputs": [2], "value_inputs": []},
-            ],
         ]
         for raw in cases:
             with self.subTest(raw=raw):
                 self.assertEqual(
                     select_single_relation_exist(parse_program(raw), "yes"),
                     SelectionDecision(relation=None, exclusion_reason="non_linear_program"),
+                )
+
+    def test_rejects_target_input_arity_and_invalid_references_before_exclusion(self):
+        malformed = [
+            [
+                {"function": "scene", "inputs": [0], "value_inputs": []},
+                {"function": "unique", "inputs": [0], "value_inputs": []},
+                {"function": "relate", "inputs": [1], "value_inputs": ["left"]},
+                {"function": "exist", "inputs": [2], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "unique", "inputs": [0, 0], "value_inputs": []},
+                {"function": "relate", "inputs": [1], "value_inputs": ["left"]},
+                {"function": "exist", "inputs": [2], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "filter_color", "inputs": [0, 0], "value_inputs": ["red"]},
+                {"function": "count", "inputs": [1], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "unique", "inputs": [0], "value_inputs": []},
+                {"function": "relate", "inputs": [], "value_inputs": ["left"]},
+                {"function": "exist", "inputs": [2], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "unique", "inputs": [0], "value_inputs": []},
+                {"function": "relate", "inputs": [1], "value_inputs": ["left"]},
+                {"function": "exist", "inputs": [1, 2], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "count", "inputs": [2], "value_inputs": []},
+                {"function": "exist", "inputs": [1], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "count", "inputs": [1], "value_inputs": []},
+            ],
+        ]
+        for raw in malformed:
+            with self.subTest(raw=raw), self.assertRaises(ProgramSchemaError):
+                select_single_relation_exist(parse_program(raw), "yes")
+
+    def test_rejects_target_value_arguments_even_in_non_target_layouts(self):
+        malformed = [
+            [
+                {"function": "scene", "inputs": [], "value_inputs": ["extra"]},
+                {"function": "count", "inputs": [0], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "unique", "inputs": [0], "value_inputs": ["extra"]},
+                {"function": "count", "inputs": [1], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "relate", "inputs": [0], "value_inputs": ["above"]},
+                {"function": "exist", "inputs": [1], "value_inputs": []},
+            ],
+            [
+                {"function": "scene", "inputs": [], "value_inputs": []},
+                {"function": "filter_color", "inputs": [0], "value_inputs": ["orange"]},
+                {"function": "count", "inputs": [1], "value_inputs": []},
+            ],
+        ]
+        for raw in malformed:
+            with self.subTest(raw=raw), self.assertRaises(ProgramSchemaError):
+                select_single_relation_exist(parse_program(raw), "yes")
+
+    def test_excludes_well_formed_official_non_target_programs(self):
+        programs_and_answers = [
+            (
+                [
+                    {"function": "scene", "inputs": [], "value_inputs": []},
+                    {"function": "count", "inputs": [0], "value_inputs": []},
+                ],
+                3,
+            ),
+            (
+                [
+                    {"function": "scene", "inputs": [], "value_inputs": []},
+                    {"function": "unique", "inputs": [0], "value_inputs": []},
+                    {"function": "query_color", "inputs": [1], "value_inputs": []},
+                ],
+                "red",
+            ),
+            (
+                [
+                    {"function": "scene", "inputs": [], "value_inputs": []},
+                    {"function": "filter_color", "inputs": [0], "value_inputs": ["red"]},
+                    {"function": "filter_shape", "inputs": [0], "value_inputs": ["cube"]},
+                    {"function": "union", "inputs": [1, 2], "value_inputs": []},
+                    {"function": "count", "inputs": [3], "value_inputs": []},
+                ],
+                2,
+            ),
+        ]
+        for raw, answer in programs_and_answers:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    select_single_relation_exist(parse_program(raw), answer),
+                    SelectionDecision(relation=None, exclusion_reason="unsupported_function"),
                 )
 
     def test_excludes_wrong_counts_order_and_terminal_with_stable_categories(self):
@@ -285,10 +387,11 @@ class ProgramSelectionTests(unittest.TestCase):
             (
                 "scene_layout",
                 [
-                    {"function": "filter_color", "inputs": [], "value_inputs": ["red"]},
-                    {"function": "unique", "inputs": [0], "value_inputs": []},
-                    {"function": "relate", "inputs": [1], "value_inputs": ["left"]},
-                    {"function": "exist", "inputs": [2], "value_inputs": []},
+                    {"function": "scene", "inputs": [], "value_inputs": []},
+                    {"function": "scene", "inputs": [], "value_inputs": []},
+                    {"function": "unique", "inputs": [1], "value_inputs": []},
+                    {"function": "relate", "inputs": [2], "value_inputs": ["left"]},
+                    {"function": "exist", "inputs": [3], "value_inputs": []},
                 ],
             ),
             (
@@ -358,6 +461,51 @@ class ProgramEvaluationTests(unittest.TestCase):
             with self.subTest(relation=relation):
                 self.assertIs(evaluate_selected_program(nodes, self.scene), expected)
 
+    def test_each_post_relation_filter_can_remove_a_nonempty_relation_result(self):
+        cases = [
+            ("left", "filter_color", "blue", True),
+            ("left", "filter_color", "purple", False),
+            ("left", "filter_shape", "sphere", True),
+            ("left", "filter_shape", "cube", False),
+            ("front", "filter_size", "small", True),
+            ("front", "filter_size", "large", False),
+            ("left", "filter_material", "metal", True),
+            ("left", "filter_material", "rubber", False),
+        ]
+        for relation, filter_function, value, expected in cases:
+            nodes = self._program(relation, filter_function, value)
+            with self.subTest(filter_function=filter_function, value=value):
+                self.assertIs(evaluate_selected_program(nodes, self.scene), expected)
+
+    def test_each_pre_unique_filter_is_necessary_for_a_single_reference(self):
+        scene = {
+            "objects": [
+                {"color": "red", "shape": "cube", "size": "small", "material": "rubber"},
+                {"color": "blue", "shape": "cube", "size": "small", "material": "rubber"},
+                {"color": "red", "shape": "sphere", "size": "small", "material": "rubber"},
+                {"color": "red", "shape": "cube", "size": "large", "material": "rubber"},
+                {"color": "red", "shape": "cube", "size": "small", "material": "metal"},
+            ],
+            "relationships": {
+                "left": [[1], [], [], [], []],
+                "right": [[], [0], [], [], []],
+                "front": [[], [], [], [], []],
+                "behind": [[], [], [], [], []],
+            },
+        }
+        nodes = parse_program([
+            {"function": "scene", "inputs": [], "value_inputs": []},
+            {"function": "filter_color", "inputs": [0], "value_inputs": ["red"]},
+            {"function": "filter_shape", "inputs": [1], "value_inputs": ["cube"]},
+            {"function": "filter_size", "inputs": [2], "value_inputs": ["small"]},
+            {"function": "filter_material", "inputs": [3], "value_inputs": ["rubber"]},
+            {"function": "unique", "inputs": [4], "value_inputs": []},
+            {"function": "relate", "inputs": [5], "value_inputs": ["left"]},
+            {"function": "exist", "inputs": [6], "value_inputs": []},
+        ])
+
+        self.assertIs(evaluate_selected_program(nodes, scene), True)
+
     def test_official_answer_audit_accepts_hand_checked_yes_and_no(self):
         yes_nodes = self._program("left", "filter_shape", "sphere")
         no_nodes = self._program("right", "filter_shape", "sphere")
@@ -381,7 +529,7 @@ class ProgramEvaluationTests(unittest.TestCase):
             with self.subTest(filter_function=filter_function), self.assertRaises(
                 SceneSchemaError
             ):
-                evaluate_selected_program(nodes, self.scene)
+                audit_official_answer(nodes, self.scene, "yes")
 
     def test_scene_rejects_wrong_relationship_row_count_and_out_of_range_indices(self):
         nodes = self._program("left", "filter_color", "blue")
