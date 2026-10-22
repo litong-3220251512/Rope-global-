@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 
 from PIL import Image
 
-from src.clevr_audit import CLEVRDataError, load_source_index
+from src.clevr_audit import (
+    CLEVRDataError,
+    SelectedQuestion,
+    build_audit,
+    load_source_index,
+)
 
 
 def _program() -> list[dict[str, object]]:
@@ -40,6 +45,68 @@ def _scene(split: str, image_index: int) -> dict[str, object]:
             "behind": [[]],
         },
     }
+
+
+def _audit_scene(split: str, image_index: int) -> dict[str, object]:
+    scene = _scene(split, image_index)
+    scene["objects"] = [
+        {
+            "color": "red",
+            "shape": "cube",
+            "size": "small",
+            "material": "rubber",
+        },
+        {
+            "color": "blue",
+            "shape": "sphere",
+            "size": "large",
+            "material": "metal",
+        },
+    ]
+    scene["relationships"] = {
+        relation: [[1], []]
+        for relation in ("left", "right", "front", "behind")
+    }
+    return scene
+
+
+def _selected_program(relation: str, target_shape: str) -> list[dict[str, object]]:
+    return [
+        {"function": "scene", "inputs": [], "value_inputs": []},
+        {
+            "function": "filter_color",
+            "inputs": [0],
+            "value_inputs": ["red"],
+        },
+        {"function": "unique", "inputs": [1], "value_inputs": []},
+        {"function": "relate", "inputs": [2], "value_inputs": [relation]},
+        {
+            "function": "filter_shape",
+            "inputs": [3],
+            "value_inputs": [target_shape],
+        },
+        {"function": "exist", "inputs": [4], "value_inputs": []},
+    ]
+
+
+def _excluded_program(reason: str) -> list[dict[str, object]]:
+    if reason == "unsupported_function":
+        return [
+            {"function": "scene", "inputs": [], "value_inputs": []},
+            {"function": "count", "inputs": [0], "value_inputs": []},
+        ]
+    if reason == "relate_count":
+        return [
+            {"function": "scene", "inputs": [], "value_inputs": []},
+            {
+                "function": "filter_color",
+                "inputs": [0],
+                "value_inputs": ["red"],
+            },
+            {"function": "unique", "inputs": [1], "value_inputs": []},
+            {"function": "exist", "inputs": [2], "value_inputs": []},
+        ]
+    raise ValueError(f"unknown fixture exclusion reason: {reason}")
 
 
 def _question(
@@ -86,6 +153,78 @@ class _CLEVRFixture:
             ).write_text(
                 json.dumps({"questions": self.questions[split]}), encoding="utf-8"
             )
+
+
+class _AuditFixture(_CLEVRFixture):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.scenes = {
+            "train": [_audit_scene("train", index) for index in range(10)],
+            "val": [_audit_scene("val", index) for index in range(4)],
+        }
+        self.questions = {"train": [], "val": []}
+        for split, count in (("train", 10), ("val", 4)):
+            for image_index in range(count):
+                Image.new("RGBA", (2, 2), (10, 20, 30, 255)).save(
+                    root
+                    / "images"
+                    / split
+                    / f"CLEVR_{split}_{image_index:06d}.png"
+                )
+
+        for relation in ("left", "right", "front", "behind"):
+            for answer, target_shape in (("no", "cube"), ("yes", "sphere")):
+                self.add_selected(
+                    split="train",
+                    image_index=3,
+                    relation=relation,
+                    answer=answer,
+                    target_shape=target_shape,
+                    question=f"trainword {relation} {answer}?",
+                )
+        self.add_excluded("train", 3, "unsupported_function", "train excluded?")
+        self.add_selected(
+            "train", 6, "left", "yes", "sphere", "devonly left yes?"
+        )
+        self.add_excluded("train", 6, "relate_count", "dev excluded?")
+        self.add_selected(
+            "val", 1, "left", "yes", "sphere", "baseonly left yes?"
+        )
+        self.add_excluded("val", 1, "unsupported_function", "base excluded?")
+        self.add_selected(
+            "val", 3, "right", "no", "cube", "confirmonly right no?"
+        )
+        self.write_json()
+
+    def add_selected(
+        self,
+        split: str,
+        image_index: int,
+        relation: str,
+        answer: str,
+        target_shape: str,
+        question: str,
+    ) -> None:
+        question_index = len(self.questions[split])
+        record = _question(split, question_index, image_index)
+        record["question"] = question
+        record["program"] = _selected_program(relation, target_shape)
+        record["answer"] = answer
+        self.questions[split].append(record)
+
+    def add_excluded(
+        self,
+        split: str,
+        image_index: int,
+        reason: str,
+        question: str,
+    ) -> None:
+        question_index = len(self.questions[split])
+        record = _question(split, question_index, image_index)
+        record["question"] = question
+        record["program"] = _excluded_program(reason)
+        record["answer"] = 2 if reason == "unsupported_function" else "yes"
+        self.questions[split].append(record)
 
 
 class SourceIndexTests(unittest.TestCase):
@@ -236,6 +375,205 @@ class SourceIndexTests(unittest.TestCase):
 
         with self.assertRaisesRegex(CLEVRDataError, "unreadable PNG"):
             load_source_index(self.root)
+
+
+class AuditManifestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.fixture = _AuditFixture(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_builds_split_before_filter_manifest_and_train_only_vocabulary(self) -> None:
+        audit = build_audit(load_source_index(self.root))
+
+        self.assertEqual(
+            [
+                (
+                    summary.partition,
+                    summary.mother_image_count,
+                    summary.selected_image_count,
+                    summary.selected_question_count,
+                )
+                for summary in audit.partition_summaries
+            ],
+            [
+                ("train", 9, 1, 8),
+                ("dev", 1, 1, 1),
+                ("base_test", 2, 1, 1),
+                ("confirmation", 2, 1, 1),
+            ],
+        )
+        image_three_partitions = {
+            record.partition
+            for record in audit.selected_questions
+            if record.official_split == "train" and record.image_index == 3
+        }
+        self.assertEqual(image_three_partitions, {"train"})
+
+        self.assertIn("trainword", audit.vocabulary.token_to_id)
+        self.assertNotIn("devonly", audit.vocabulary.token_to_id)
+        self.assertNotIn("baseonly", audit.vocabulary.token_to_id)
+        dev_record = next(
+            record for record in audit.selected_questions if record.partition == "dev"
+        )
+        self.assertEqual(dev_record.encoded_tokens[1], 3)
+
+    def test_audits_answers_and_keeps_only_offline_manifest_fields(self) -> None:
+        audit = build_audit(load_source_index(self.root))
+
+        self.assertEqual(
+            tuple(field.name for field in fields(SelectedQuestion)),
+            (
+                "partition",
+                "official_split",
+                "image_index",
+                "image_filename",
+                "image_path",
+                "question_index",
+                "source_position",
+                "question",
+                "encoded_tokens",
+                "answer",
+                "relation",
+            ),
+        )
+        first = audit.selected_questions[0]
+        self.assertEqual(
+            (
+                first.partition,
+                first.official_split,
+                first.image_index,
+                first.question_index,
+                first.source_position,
+                first.answer,
+                first.relation,
+            ),
+            ("train", "train", 3, 0, 0, 0, "left"),
+        )
+        self.fixture.questions["train"][0]["answer"] = "yes"
+        self.fixture.write_json()
+        with self.assertRaisesRegex(CLEVRDataError, "official answer"):
+            build_audit(load_source_index(self.root))
+
+    def test_reports_exact_exclusions_all_cells_and_source_summaries(self) -> None:
+        audit = build_audit(load_source_index(self.root))
+
+        self.assertEqual(
+            [
+                (item.partition, item.reason, item.count)
+                for item in audit.exclusion_counts
+            ],
+            [
+                ("train", "unsupported_function", 1),
+                ("dev", "relate_count", 1),
+                ("base_test", "unsupported_function", 1),
+            ],
+        )
+        self.assertEqual(len(audit.cell_counts), 32)
+        train_cells = {
+            (item.relation, item.answer): item.count
+            for item in audit.cell_counts
+            if item.partition == "train"
+        }
+        self.assertEqual(
+            train_cells,
+            {
+                ("left", 0): 1,
+                ("left", 1): 1,
+                ("right", 0): 1,
+                ("right", 1): 1,
+                ("front", 0): 1,
+                ("front", 1): 1,
+                ("behind", 0): 1,
+                ("behind", 1): 1,
+            },
+        )
+        self.assertTrue(all(item.accuracy is None for item in audit.cell_counts))
+        self.assertEqual(
+            {
+                (summary.official_split, summary.scene_count, summary.question_count)
+                for summary in audit.source_summaries
+            },
+            {("train", 10, 11), ("val", 4, 3)},
+        )
+        self.assertEqual(
+            {
+                (summary.relative_path, summary.record_count)
+                for summary in audit.file_summaries
+            },
+            {
+                ("scenes/CLEVR_train_scenes.json", 10),
+                ("questions/CLEVR_train_questions.json", 11),
+                ("scenes/CLEVR_val_scenes.json", 4),
+                ("questions/CLEVR_val_questions.json", 3),
+            },
+        )
+        self.assertTrue(all(summary.size_bytes > 0 for summary in audit.file_summaries))
+
+
+class AuditCoverageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.fixture = _AuditFixture(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_empty_required_partition_is_a_hard_failure(self) -> None:
+        self.fixture.questions["train"] = [
+            question
+            for question in self.fixture.questions["train"]
+            if question["image_index"] != 6
+        ]
+        self.fixture.write_json()
+
+        with self.assertRaisesRegex(CLEVRDataError, "required partition dev is empty"):
+            build_audit(load_source_index(self.root))
+
+    def test_missing_training_answer_class_is_a_hard_failure(self) -> None:
+        self.fixture.questions["train"] = [
+            question
+            for question in self.fixture.questions["train"]
+            if question["image_index"] != 3 or question["answer"] != "yes"
+        ]
+        self.fixture.write_json()
+
+        with self.assertRaisesRegex(CLEVRDataError, "train.*answer class.*yes"):
+            build_audit(load_source_index(self.root))
+
+    def test_missing_training_relation_is_a_hard_failure(self) -> None:
+        retained: list[dict[str, object]] = []
+        for question in self.fixture.questions["train"]:
+            if question["image_index"] != 3:
+                retained.append(question)
+                continue
+            program = question["program"]
+            relation_nodes = [
+                node for node in program if node["function"] == "relate"
+            ]
+            if not relation_nodes or relation_nodes[0]["value_inputs"] != ["behind"]:
+                retained.append(question)
+        self.fixture.questions["train"] = retained
+        self.fixture.write_json()
+
+        with self.assertRaisesRegex(CLEVRDataError, "train.*relation.*behind"):
+            build_audit(load_source_index(self.root))
+
+    def test_empty_evaluation_cell_is_retained_as_zero_with_na_accuracy(self) -> None:
+        audit = build_audit(load_source_index(self.root))
+
+        empty_cell = next(
+            item
+            for item in audit.cell_counts
+            if (item.partition, item.relation, item.answer)
+            == ("base_test", "left", 0)
+        )
+        self.assertEqual(empty_cell.count, 0)
+        self.assertIsNone(empty_cell.accuracy)
 
 
 if __name__ == "__main__":

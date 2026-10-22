@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,8 +11,21 @@ from types import MappingProxyType
 
 from PIL import Image, UnidentifiedImageError
 
-from src.clevr_partitions import ImageIdentity
-from src.clevr_programs import ProgramNode, ProgramSchemaError, parse_program
+from src.clevr_partitions import (
+    ImageIdentity,
+    ImagePartitions,
+    build_image_partitions,
+)
+from src.clevr_programs import (
+    AnswerMismatchError,
+    ProgramNode,
+    ProgramSchemaError,
+    SceneSchemaError,
+    audit_official_answer,
+    parse_program,
+    select_single_relation_exist,
+)
+from src.clevr_text import Vocabulary, build_vocabulary, encode_question
 
 
 class CLEVRDataError(ValueError):
@@ -45,6 +59,103 @@ class SourceIndex:
     data_root: Path
     scenes: tuple[SourceScene, ...]
     questions: tuple[SourceQuestion, ...]
+
+
+_PARTITIONS = ("train", "dev", "base_test", "confirmation")
+_RELATIONS = ("left", "right", "front", "behind")
+
+
+@dataclass(frozen=True, slots=True)
+class SelectedQuestion:
+    """Offline-only selected-question manifest row, not a model batch item."""
+
+    partition: str
+    official_split: str
+    image_index: int
+    image_filename: str
+    image_path: Path
+    question_index: int
+    source_position: int
+    question: str
+    encoded_tokens: tuple[int, ...]
+    answer: int
+    relation: str
+
+    def __post_init__(self) -> None:
+        if self.partition not in _PARTITIONS:
+            raise ValueError("partition is not part of the frozen protocol")
+        if self.official_split not in {"train", "val"}:
+            raise ValueError("official_split must be exactly 'train' or 'val'")
+        if self.answer not in {0, 1}:
+            raise ValueError("answer must use no=0 / yes=1")
+        if self.relation not in _RELATIONS:
+            raise ValueError("relation is not part of the frozen task")
+        if not isinstance(self.encoded_tokens, tuple) or any(
+            type(token_id) is not int or token_id < 0
+            for token_id in self.encoded_tokens
+        ):
+            raise ValueError("encoded_tokens must be non-negative integer IDs")
+
+
+@dataclass(frozen=True, slots=True)
+class CellCount:
+    partition: str
+    relation: str
+    answer: int
+    count: int
+    accuracy: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExclusionCount:
+    partition: str
+    reason: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionSummary:
+    partition: str
+    mother_image_count: int
+    selected_image_count: int
+    selected_question_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SourceSummary:
+    official_split: str
+    scene_count: int
+    question_count: int
+    image_count: int
+    image_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFileSummary:
+    relative_path: str
+    size_bytes: int
+    record_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class AuditResult:
+    selected_questions: tuple[SelectedQuestion, ...]
+    vocabulary: Vocabulary
+    image_partitions: ImagePartitions
+    cell_counts: tuple[CellCount, ...]
+    exclusion_counts: tuple[ExclusionCount, ...]
+    partition_summaries: tuple[PartitionSummary, ...]
+    source_summaries: tuple[SourceSummary, ...]
+    file_summaries: tuple[SourceFileSummary, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingQuestion:
+    partition: str
+    source: SourceQuestion
+    scene: SourceScene
+    answer: int
+    relation: str
 
 
 def _read_collection(path: Path, field: str) -> list[object]:
@@ -235,4 +346,235 @@ def load_source_index(data_root: Path) -> SourceIndex:
         data_root=root,
         scenes=tuple(all_scenes),
         questions=tuple(all_questions),
+    )
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(nested) for key, nested in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(nested) for nested in value]
+    return value
+
+
+def _partition_lookup(
+    partitions: ImagePartitions,
+) -> dict[tuple[str, int], str]:
+    lookup: dict[tuple[str, int], str] = {}
+    for partition in _PARTITIONS:
+        for image in getattr(partitions, partition):
+            key = (image.official_split, image.image_index)
+            if key in lookup:
+                raise CLEVRDataError(f"image {key} appears in multiple partitions")
+            lookup[key] = partition
+    return lookup
+
+
+def _source_file_summaries(source: SourceIndex) -> tuple[SourceFileSummary, ...]:
+    summaries: list[SourceFileSummary] = []
+    for split in ("train", "val"):
+        entries = (
+            (
+                f"scenes/CLEVR_{split}_scenes.json",
+                sum(scene.official_split == split for scene in source.scenes),
+            ),
+            (
+                f"questions/CLEVR_{split}_questions.json",
+                sum(question.official_split == split for question in source.questions),
+            ),
+        )
+        for relative_path, record_count in entries:
+            path = source.data_root / relative_path
+            try:
+                size_bytes = path.stat().st_size
+            except OSError as exc:
+                raise CLEVRDataError(f"cannot stat CLEVR source file {path}: {exc}") from exc
+            summaries.append(
+                SourceFileSummary(
+                    relative_path=relative_path,
+                    size_bytes=size_bytes,
+                    record_count=record_count,
+                )
+            )
+    return tuple(summaries)
+
+
+def _source_summaries(source: SourceIndex) -> tuple[SourceSummary, ...]:
+    summaries: list[SourceSummary] = []
+    for split in ("train", "val"):
+        scenes = tuple(
+            scene for scene in source.scenes if scene.official_split == split
+        )
+        try:
+            image_bytes = sum(scene.image_path.stat().st_size for scene in scenes)
+        except OSError as exc:
+            raise CLEVRDataError(f"cannot stat a {split} CLEVR image: {exc}") from exc
+        summaries.append(
+            SourceSummary(
+                official_split=split,
+                scene_count=len(scenes),
+                question_count=sum(
+                    question.official_split == split for question in source.questions
+                ),
+                image_count=len(scenes),
+                image_bytes=image_bytes,
+            )
+        )
+    return tuple(summaries)
+
+
+def _enforce_coverage(selected_questions: tuple[SelectedQuestion, ...]) -> None:
+    partition_counts = Counter(item.partition for item in selected_questions)
+    for partition in _PARTITIONS:
+        if partition_counts[partition] == 0:
+            raise CLEVRDataError(f"required partition {partition} is empty")
+
+    train_answers = {
+        item.answer for item in selected_questions if item.partition == "train"
+    }
+    for answer, name in ((0, "no"), (1, "yes")):
+        if answer not in train_answers:
+            raise CLEVRDataError(f"train is missing answer class {name}")
+
+    train_relations = {
+        item.relation for item in selected_questions if item.partition == "train"
+    }
+    for relation in _RELATIONS:
+        if relation not in train_relations:
+            raise CLEVRDataError(f"train is missing relation {relation}")
+
+
+def build_audit(source: SourceIndex) -> AuditResult:
+    """Select, answer-audit, partition, and encode the frozen CLEVR task."""
+    if not isinstance(source, SourceIndex):
+        raise TypeError("source must be a SourceIndex")
+
+    train_images = tuple(
+        ImageIdentity(scene.official_split, scene.image_index, scene.image_filename)
+        for scene in source.scenes
+        if scene.official_split == "train"
+    )
+    val_images = tuple(
+        ImageIdentity(scene.official_split, scene.image_index, scene.image_filename)
+        for scene in source.scenes
+        if scene.official_split == "val"
+    )
+    image_partitions = build_image_partitions(train_images, val_images)
+    partition_by_image = _partition_lookup(image_partitions)
+    scene_by_image = {
+        (scene.official_split, scene.image_index): scene for scene in source.scenes
+    }
+
+    pending: list[_PendingQuestion] = []
+    exclusions: Counter[tuple[str, str]] = Counter()
+    for question in source.questions:
+        image_key = (question.official_split, question.image_index)
+        partition = partition_by_image[image_key]
+        try:
+            decision = select_single_relation_exist(question.program, question.answer)
+        except ProgramSchemaError as exc:
+            raise CLEVRDataError(
+                f"{question.official_split} question {question.question_index} "
+                f"violates the program contract: {exc}"
+            ) from exc
+        if decision.exclusion_reason is not None:
+            exclusions[(partition, decision.exclusion_reason)] += 1
+            continue
+
+        scene = scene_by_image[image_key]
+        try:
+            audit_official_answer(
+                question.program, _thaw_json(scene.scene_data), question.answer
+            )
+        except (ProgramSchemaError, SceneSchemaError, AnswerMismatchError) as exc:
+            raise CLEVRDataError(
+                f"{question.official_split} question {question.question_index} "
+                f"failed official answer audit: {exc}"
+            ) from exc
+        if decision.relation is None or question.answer not in {"no", "yes"}:
+            raise AssertionError("selected questions must have a relation and binary answer")
+        pending.append(
+            _PendingQuestion(
+                partition=partition,
+                source=question,
+                scene=scene,
+                answer=1 if question.answer == "yes" else 0,
+                relation=decision.relation,
+            )
+        )
+
+    vocabulary = build_vocabulary(
+        tuple(
+            item.source.question for item in pending if item.partition == "train"
+        )
+    )
+    selected_questions = tuple(
+        SelectedQuestion(
+            partition=item.partition,
+            official_split=item.source.official_split,
+            image_index=item.source.image_index,
+            image_filename=item.source.image_filename,
+            image_path=item.scene.image_path,
+            question_index=item.source.question_index,
+            source_position=item.source.source_position,
+            question=item.source.question,
+            encoded_tokens=encode_question(item.source.question, vocabulary),
+            answer=item.answer,
+            relation=item.relation,
+        )
+        for item in pending
+    )
+    _enforce_coverage(selected_questions)
+
+    observed_cells = Counter(
+        (item.partition, item.relation, item.answer) for item in selected_questions
+    )
+    cell_counts = tuple(
+        CellCount(
+            partition=partition,
+            relation=relation,
+            answer=answer,
+            count=observed_cells[(partition, relation, answer)],
+        )
+        for partition in _PARTITIONS
+        for relation in _RELATIONS
+        for answer in (0, 1)
+    )
+    exclusion_counts = tuple(
+        ExclusionCount(partition=partition, reason=reason, count=count)
+        for partition in _PARTITIONS
+        for reason, count in sorted(
+            (
+                (reason, count)
+                for (observed_partition, reason), count in exclusions.items()
+                if observed_partition == partition
+            )
+        )
+    )
+    partition_summaries = tuple(
+        PartitionSummary(
+            partition=partition,
+            mother_image_count=len(getattr(image_partitions, partition)),
+            selected_image_count=len(
+                {
+                    (item.official_split, item.image_index)
+                    for item in selected_questions
+                    if item.partition == partition
+                }
+            ),
+            selected_question_count=sum(
+                item.partition == partition for item in selected_questions
+            ),
+        )
+        for partition in _PARTITIONS
+    )
+    return AuditResult(
+        selected_questions=selected_questions,
+        vocabulary=vocabulary,
+        image_partitions=image_partitions,
+        cell_counts=cell_counts,
+        exclusion_counts=exclusion_counts,
+        partition_summaries=partition_summaries,
+        source_summaries=_source_summaries(source),
+        file_summaries=_source_file_summaries(source),
     )
