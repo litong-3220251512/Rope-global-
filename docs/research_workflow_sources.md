@@ -55,3 +55,4 @@ Kassis et al., *Scientific Agent Skills: A Library of Procedural Knowledge for R
 - 各科研 skill 的真实活跃用户数、调用频次及对 VLN 的因果收益：不知道。
 - 用户最终要研究的 VLN benchmark、传感器设置、候选基线、可用数据/权重和预算：尚未确定。
 - 截至核查日各 VLN 条件下完整的 SOTA 排名：本次未完成系统核验，不能宣称。
+- Windows 连接问题的 2026-10-18 排查记录见连接手册：用户当时验证远程 `/mcp` 返回 HTTP 400，HTTP 链路可达；该记录不表示当前 Codex MCP 工具或浏览器连接状态。
