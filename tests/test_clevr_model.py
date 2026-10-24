@@ -9,6 +9,44 @@ from src.clevr_model import CLEVRQuestionEncoder
 
 
 class CLEVRQuestionEncoderTests(unittest.TestCase):
+    def test_applies_embedding_exactly_once(self):
+        encoder = CLEVRQuestionEncoder(vocab_size=8)
+        call_count = 0
+
+        def count_call(_module, _inputs, _output):
+            nonlocal call_count
+            call_count += 1
+
+        handle = encoder.embedding.register_forward_hook(count_call)
+        try:
+            encoder(
+                torch.tensor(((1, 4, 2),), dtype=torch.int64),
+                torch.tensor((3,), dtype=torch.int64),
+            )
+        finally:
+            handle.remove()
+
+        self.assertEqual(call_count, 1)
+
+    def test_applies_gru_exactly_once(self):
+        encoder = CLEVRQuestionEncoder(vocab_size=8)
+        call_count = 0
+
+        def count_call(_module, _inputs, _output):
+            nonlocal call_count
+            call_count += 1
+
+        handle = encoder.gru.register_forward_hook(count_call)
+        try:
+            encoder(
+                torch.tensor(((1, 4, 2),), dtype=torch.int64),
+                torch.tensor((3,), dtype=torch.int64),
+            )
+        finally:
+            handle.remove()
+
+        self.assertEqual(call_count, 1)
+
     def test_uses_frozen_embedding_and_gru_dimensions_without_custom_reinitialization(self):
         seed = 20261024
         torch.manual_seed(seed)
@@ -81,6 +119,8 @@ class CLEVRQuestionEncoderTests(unittest.TestCase):
         valid_tokens = torch.tensor(((1, 2), (1, 2)), dtype=torch.int64)
         valid_lengths = torch.tensor((2, 2), dtype=torch.int64)
         invalid_calls = (
+            ("non-tensor tokens", [[1, 2], [1, 2]], valid_lengths, TypeError),
+            ("non-tensor lengths", valid_tokens, [2, 2], TypeError),
             (
                 "non-int64 tokens",
                 valid_tokens.to(torch.int32),
@@ -120,8 +160,13 @@ class CLEVRQuestionEncoderTests(unittest.TestCase):
             ),
         )
         for name, tokens, lengths, exception in invalid_calls:
-            with self.subTest(name=name), self.assertRaises(exception):
-                encoder(tokens, lengths)
+            with self.subTest(name=name):
+                try:
+                    encoder(tokens, lengths)
+                except Exception as error:
+                    self.assertIs(type(error), exception)
+                else:
+                    self.fail(f"{name} was not rejected")
 
 
 if __name__ == "__main__":
