@@ -232,7 +232,11 @@ def _validate_summary_fields(
 ) -> tuple[str, tuple[int, ...], tuple[float, ...], float, float, tuple[float, float]]:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("summary name must be a non-empty string")
-    if not isinstance(seeds, tuple) or seeds != SEEDS:
+    if (
+        not isinstance(seeds, tuple)
+        or any(type(seed) is not int for seed in seeds)
+        or seeds != SEEDS
+    ):
         raise ValueError("summary seeds must be the formal seed tuple")
     if not isinstance(values, tuple) or len(values) != len(SEEDS):
         raise ValueError("summary values must be a five-value tuple")
@@ -489,12 +493,16 @@ def _classification_metrics(
         if any(value is None for value in cell_accuracies)
         else sum(value for value in cell_accuracies if value is not None) / 8
     )
-    cross_entropy = (
-        None
-        if losses is None
-        else math.fsum(losses[target.question_index] for target in targets)
-        / len(targets)
-    )
+    cross_entropy = None
+    if losses is not None:
+        ordered_losses = tuple(losses[target.question_index] for target in targets)
+        scale = max(ordered_losses)
+        cross_entropy = (
+            0.0
+            if scale == 0.0
+            else scale
+            * (math.fsum(loss / scale for loss in ordered_losses) / len(targets))
+        )
     return ClassificationMetrics(
         question_count=len(targets),
         correct_count=correct_count,

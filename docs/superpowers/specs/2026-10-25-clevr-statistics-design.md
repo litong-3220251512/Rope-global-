@@ -1,7 +1,7 @@
 # CLEVR PUB-R1.1 统计核心设计
 
-**状态：** 已冻结供实现；用户已授权代理按已验收计划持续推进，不逐项等待确认。  
-**协议权威：** `docs/rope_public_data_experiment_plan.md`（PUB-R1.1），尤其第 7、10 节。  
+**状态：** 已冻结供实现；用户已授权代理按已验收计划持续推进，不逐项等待确认。
+**协议权威：** `docs/rope_public_data_experiment_plan.md`（PUB-R1.1），尤其第 7、10 节。
 **本单元目的：** 从未经挑选的基础测试逐问题预测，独立复算每 run 指标、五 seed 汇总、预注册配对差与按图像聚类 bootstrap。它不读取模型、checkpoint、RGB 或 scene，不启动训练或评估。
 
 ## 1. 意图、成功条件与边界

@@ -451,6 +451,34 @@ class RunMetricTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cross_entropy"):
             evaluate_run(targets, run)
 
+    def test_mean_cross_entropy_avoids_intermediate_sum_overflow(self) -> None:
+        targets = (
+            _target(
+                partition="train",
+                official_split="train",
+                image_index=1,
+                question_index=1,
+            ),
+            _target(image_index=2, question_index=2, relation="left", label=0),
+            _target(image_index=3, question_index=3, relation="right", label=0),
+        )
+        run = RunPredictions(
+            "G",
+            101,
+            (
+                _prediction(
+                    question_index=2, label=0, logits=(0.0, 1e308)
+                ),
+                _prediction(
+                    question_index=3, label=0, logits=(0.0, 1e308)
+                ),
+            ),
+        )
+
+        metrics = evaluate_run(targets, run).metrics
+
+        self.assertEqual(metrics.cross_entropy, 1e308)
+
 
 class MajorityBaselineTests(unittest.TestCase):
     def test_tied_train_labels_predict_no_and_do_not_manufacture_cross_entropy(self) -> None:
@@ -597,6 +625,36 @@ class SeedSummaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "seed"):
             summarize_paired_differences("B-G", complete, incomplete)
 
+    def test_direct_summary_records_reject_float_seed_aliases(self) -> None:
+        seed_summary = summarize_seed_values(
+            "G accuracy", {seed: 0.5 for seed in SEEDS}
+        )
+        paired_summary = summarize_paired_differences(
+            "B-G",
+            {seed: 0.5 for seed in SEEDS},
+            {seed: 0.5 for seed in SEEDS},
+        )
+        float_seeds = tuple(float(seed) for seed in SEEDS)
+
+        with self.assertRaisesRegex(ValueError, "seed"):
+            SeedSummary(
+                seed_summary.name,
+                float_seeds,
+                seed_summary.values,
+                seed_summary.mean,
+                seed_summary.sample_sd,
+                seed_summary.interval,
+            )
+        with self.assertRaisesRegex(ValueError, "seed"):
+            PairedSummary(
+                paired_summary.name,
+                float_seeds,
+                paired_summary.values,
+                paired_summary.mean,
+                paired_summary.sample_sd,
+                paired_summary.interval,
+            )
+
 
 class FormalStatisticsTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -642,6 +700,8 @@ class FormalStatisticsTests(unittest.TestCase):
 
 
 class ClusterBootstrapTests(unittest.TestCase):
+    maxDiff = 1000
+
     def _unequal_image_fixture(
         self,
     ) -> tuple[tuple[TargetRow, ...], tuple[RunPredictions, ...]]:
@@ -737,6 +797,92 @@ class ClusterBootstrapTests(unittest.TestCase):
             self.assertEqual(observed[0], state_before[0])
             self.assertTrue(np.array_equal(observed[1], state_before[1]))
             self.assertEqual(observed[2:], state_before[2:])
+
+    def test_replicates_average_distinct_predictions_from_all_five_seeds(self) -> None:
+        targets, _ = self._unequal_image_fixture()
+        labels = {100: 0, 101: 0, 102: 0, 103: 0}
+        g_by_seed = {
+            101: {100: 0, 101: 1, 102: 1, 103: 1},
+            102: {100: 0, 101: 0, 102: 0, 103: 0},
+            103: {100: 1, 101: 1, 102: 1, 103: 1},
+            104: {100: 1, 101: 0, 102: 1, 103: 1},
+            105: {100: 0, 101: 0, 102: 0, 103: 1},
+        }
+        b_by_seed = {
+            101: {100: 1, 101: 0, 102: 0, 103: 0},
+            102: {100: 1, 101: 1, 102: 1, 103: 1},
+            103: {100: 0, 101: 0, 102: 0, 103: 0},
+            104: {100: 0, 101: 1, 102: 0, 103: 1},
+            105: {100: 1, 101: 1, 102: 1, 103: 0},
+        }
+        base_test = tuple(
+            target for target in targets if target.partition == "base_test"
+        )
+        runs = tuple(
+            RunPredictions(
+                method,
+                seed,
+                tuple(
+                    PredictionRow(
+                        target.question_index,
+                        target.label,
+                        (1.0, 0.0)
+                        if (
+                            g_by_seed[seed]
+                            if method == "G"
+                            else b_by_seed[seed]
+                            if method == "B"
+                            else labels
+                        )[target.question_index]
+                        == 0
+                        else (0.0, 1.0),
+                    )
+                    for target in base_test
+                ),
+            )
+            for method in METHODS
+            for seed in SEEDS
+        )
+
+        result = compute_clevr_statistics(targets, runs)
+
+        weights = np.random.Generator(np.random.PCG64(31001)).multinomial(
+            2, (0.5, 0.5), size=2000
+        )
+        self.assertEqual(
+            {tuple(int(value) for value in row) for row in weights},
+            {(0, 2), (1, 1), (2, 0)},
+        )
+        questions_by_image = ((100,), (101, 102, 103))
+        expected_replicates = []
+        for image_weights in weights:
+            sampled_questions = tuple(
+                question_index
+                for image_position, question_indices in enumerate(questions_by_image)
+                for _ in range(int(image_weights[image_position]))
+                for question_index in question_indices
+            )
+            seed_differences = []
+            for seed in SEEDS:
+                g_accuracy = sum(
+                    g_by_seed[seed][question_index] == labels[question_index]
+                    for question_index in sampled_questions
+                ) / len(sampled_questions)
+                b_accuracy = sum(
+                    b_by_seed[seed][question_index] == labels[question_index]
+                    for question_index in sampled_questions
+                ) / len(sampled_questions)
+                seed_differences.append(b_accuracy - g_accuracy)
+            expected_replicates.append(sum(seed_differences) / 5)
+
+        for index, (observed, expected) in enumerate(
+            zip(result.bootstrap.replicates, expected_replicates, strict=True)
+        ):
+            self.assertAlmostEqual(
+                observed,
+                expected,
+                msg=f"bootstrap replicate {index} ignored a formal seed",
+            )
 
 
 if __name__ == "__main__":

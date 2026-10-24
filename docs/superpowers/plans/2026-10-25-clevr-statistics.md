@@ -56,7 +56,7 @@ Add `RecordContractTests` proving records are frozen and reject: boolean/negativ
 
 - [ ] **Step 2: Run the record tests and verify RED**
 
-Run: `python -m unittest tests.test_clevr_statistics.RecordContractTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.RecordContractTests -v`
 Expected: ERROR importing missing `src.clevr_statistics`.
 
 - [ ] **Step 3: Implement immutable input/output records and scalar validation**
@@ -73,7 +73,7 @@ Define the produced dataclasses with tuple fields and strict `type(value) is int
 
 - [ ] **Step 4: Run record tests and verify GREEN**
 
-Run: `python -m unittest tests.test_clevr_statistics.RecordContractTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.RecordContractTests -v`
 Expected: PASS.
 
 - [ ] **Step 5: Write per-run metric tests**
@@ -89,7 +89,7 @@ Add `RunMetricTests` with literal fixtures and assertions for:
 
 - [ ] **Step 6: Run per-run metric tests and verify RED**
 
-Run: `python -m unittest tests.test_clevr_statistics.RunMetricTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.RunMetricTests -v`
 Expected: FAIL because `evaluate_run` is missing.
 
 - [ ] **Step 7: Implement target anchoring and `evaluate_run`**
@@ -98,10 +98,10 @@ Canonicalize targets by `(partition, question_index)` and predictions by `questi
 
 - [ ] **Step 8: Run Task 1 tests and non-PyTorch regressions**
 
-Run: `python -m unittest tests.test_clevr_statistics.RecordContractTests tests.test_clevr_statistics.RunMetricTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.RecordContractTests tests.test_clevr_statistics.RunMetricTests -v`
 Expected: PASS.
 
-Run: `python -m unittest tests.test_clevr_programs tests.test_clevr_partitions tests.test_clevr_text tests.test_clevr_audit tests.test_clevr_statistics -v`  
+Run: `python -m unittest tests.test_clevr_programs tests.test_clevr_partitions tests.test_clevr_text tests.test_clevr_audit tests.test_clevr_statistics -v`
 Expected: PASS with zero failures/errors.
 
 - [ ] **Step 9: Commit Task 1**
@@ -127,7 +127,7 @@ Add `MajorityBaselineTests` proving a 2/2 train tie predicts 0 on every base-tes
 
 - [ ] **Step 2: Run majority tests and verify RED**
 
-Run: `python -m unittest tests.test_clevr_statistics.MajorityBaselineTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.MajorityBaselineTests -v`
 Expected: FAIL because `evaluate_train_majority` is missing.
 
 - [ ] **Step 3: Implement `evaluate_train_majority`**
@@ -136,7 +136,7 @@ Reuse authoritative target validation and the Task 1 classification aggregation 
 
 - [ ] **Step 4: Run majority tests and verify GREEN**
 
-Run: `python -m unittest tests.test_clevr_statistics.MajorityBaselineTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.MajorityBaselineTests -v`
 Expected: PASS.
 
 - [ ] **Step 5: Write seed and paired-summary tests**
@@ -150,7 +150,7 @@ Add `SeedSummaryTests` asserting for seeds 101..105 and values `(-0.02,-0.01,0,0
 
 - [ ] **Step 6: Run seed tests and verify RED**
 
-Run: `python -m unittest tests.test_clevr_statistics.SeedSummaryTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.SeedSummaryTests -v`
 Expected: FAIL because summary functions are missing.
 
 - [ ] **Step 7: Implement five-seed summaries**
@@ -159,10 +159,10 @@ Use `statistics.fmean`, `statistics.stdev`, `math.sqrt(5)`, and the named t cons
 
 - [ ] **Step 8: Run Task 2 tests and non-PyTorch regressions**
 
-Run: `python -m unittest tests.test_clevr_statistics.MajorityBaselineTests tests.test_clevr_statistics.SeedSummaryTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.MajorityBaselineTests tests.test_clevr_statistics.SeedSummaryTests -v`
 Expected: PASS.
 
-Run: `python -m unittest tests.test_clevr_programs tests.test_clevr_partitions tests.test_clevr_text tests.test_clevr_audit tests.test_clevr_statistics -v`  
+Run: `python -m unittest tests.test_clevr_programs tests.test_clevr_partitions tests.test_clevr_text tests.test_clevr_audit tests.test_clevr_statistics -v`
 Expected: PASS with zero failures/errors.
 
 - [ ] **Step 9: Commit Task 2**
@@ -196,7 +196,7 @@ Add `ClusterBootstrapTests` proving:
 
 - [ ] **Step 2: Run Task 3 tests and verify RED**
 
-Run: `python -m unittest tests.test_clevr_statistics.FormalStatisticsTests tests.test_clevr_statistics.ClusterBootstrapTests -v`  
+Run: `python -m unittest tests.test_clevr_statistics.FormalStatisticsTests tests.test_clevr_statistics.ClusterBootstrapTests -v`
 Expected: FAIL because `compute_clevr_statistics` is missing.
 
 - [ ] **Step 3: Implement formal-grid orchestration and one common bootstrap weight matrix**
@@ -205,23 +205,23 @@ Canonicalize runs by `(METHODS index, seed)` and require the exact Cartesian pro
 
 - [ ] **Step 4: Run all statistics tests and non-PyTorch regressions**
 
-Run: `python -m unittest tests.test_clevr_statistics -v`  
+Run: `python -m unittest tests.test_clevr_statistics -v`
 Expected: PASS with zero failures/errors.
 
-Run: `python -m unittest tests.test_clevr_programs tests.test_clevr_partitions tests.test_clevr_text tests.test_clevr_audit tests.test_clevr_statistics -v`  
+Run: `python -m unittest tests.test_clevr_programs tests.test_clevr_partitions tests.test_clevr_text tests.test_clevr_audit tests.test_clevr_statistics -v`
 Expected: PASS with zero failures/errors.
 
 - [ ] **Step 5: Run full discovery and verify only the baseline environment errors remain**
 
-Run: `python -m unittest discover -s tests -v`  
+Run: `python -m unittest discover -s tests -v`
 Expected: the new statistics tests and all non-PyTorch tests PASS; exactly the same seven pre-existing modules fail collection with `ModuleNotFoundError: No module named 'torch'`. Any new failure is a Task 3 failure.
 
 - [ ] **Step 6: Run static repository checks**
 
-Run: `python -m compileall -q src/clevr_statistics.py tests/test_clevr_statistics.py`  
+Run: `python -m compileall -q src/clevr_statistics.py tests/test_clevr_statistics.py`
 Expected: exit 0.
 
-Run: `git diff --check`  
+Run: `git diff --check`
 Expected: exit 0 with no output.
 
 - [ ] **Step 7: Commit Task 3**
@@ -242,15 +242,15 @@ git commit -m "feat: add CLEVR image-cluster bootstrap"
 
 - [ ] **Step 1: Verify plan/spec diff scope and full non-PyTorch suite**
 
-Run: `git diff --check`  
+Run: `git diff --check`
 Expected: exit 0.
 
-Run: `python -m unittest tests.test_clevr_programs tests.test_clevr_partitions tests.test_clevr_text tests.test_clevr_audit tests.test_clevr_statistics -v`  
+Run: `python -m unittest tests.test_clevr_programs tests.test_clevr_partitions tests.test_clevr_text tests.test_clevr_audit tests.test_clevr_statistics -v`
 Expected: PASS with zero failures/errors.
 
 - [ ] **Step 2: Run full discovery and record the known dependency boundary**
 
-Run: `python -m unittest discover -s tests -v`  
+Run: `python -m unittest discover -s tests -v`
 Expected: statistics/non-PyTorch tests PASS and only the seven baseline `torch` import errors remain. Do not claim the full suite passes.
 
 - [ ] **Step 3: Create the executing-plans review package and obtain a fresh whole-branch review**
@@ -259,7 +259,7 @@ Review against `docs/superpowers/specs/2026-10-25-clevr-statistics-design.md`, t
 
 - [ ] **Step 4: Re-run verification after any fix and commit**
 
-Run Task 4 Steps 1–2 and `python -m compileall -q src/clevr_statistics.py tests/test_clevr_statistics.py`.  
+Run Task 4 Steps 1–2 and `python -m compileall -q src/clevr_statistics.py tests/test_clevr_statistics.py`.
 Expected: same verified state, with no new failures.
 
 - [ ] **Step 5: Prepare and attempt the real PR**
