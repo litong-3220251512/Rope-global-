@@ -4,13 +4,30 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import stat
+from collections.abc import Sequence
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
 from src.clevr_partitions import ImageIdentity
-from src.clevr_statistics import TargetRow
+from src.clevr_statistics import (
+    CLEVRStatistics,
+    METHODS,
+    SEEDS,
+    CellMetrics,
+    ClassificationMetrics,
+    ClusterBootstrapSummary,
+    PairedSummary,
+    PredictionRow,
+    RunPredictions,
+    RunMetrics,
+    SeedSummary,
+    TargetRow,
+    compute_clevr_statistics,
+)
 
 
 PROTOCOL_VERSION = "PUB-R1.1"
@@ -53,6 +70,14 @@ _MANIFEST_KEYS = (
     "encoded_tokens",
     "answer",
     "relation",
+)
+_PREDICTION_KEYS = (
+    "protocol_version",
+    "method",
+    "seed",
+    "question_index",
+    "label",
+    "logits",
 )
 
 
@@ -97,6 +122,170 @@ class PartitionCounts:
             _require_nonnegative_int(
                 getattr(self, partition), f"{partition} manifest count"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionSource:
+    path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, Path):
+            raise ValueError("prediction source path must be a pathlib.Path")
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionEvidence:
+    method: str
+    seed: int
+    source_path: str
+    size_bytes: int
+    row_count: int
+    canonical_path: str
+
+    def __post_init__(self) -> None:
+        if type(self.method) is not str or self.method not in METHODS:
+            raise ValueError("prediction evidence method is not formal")
+        if type(self.seed) is not int or self.seed not in SEEDS:
+            raise ValueError("prediction evidence seed is not formal")
+        if (
+            type(self.source_path) is not str
+            or not self.source_path.strip()
+            or not Path(self.source_path).is_absolute()
+        ):
+            raise ValueError(
+                "prediction evidence source_path must be a non-empty absolute string"
+            )
+        _require_nonnegative_int(
+            self.size_bytes, "prediction evidence size_bytes"
+        )
+        if type(self.row_count) is not int or self.row_count <= 0:
+            raise ValueError("prediction evidence row_count must be a positive integer")
+        expected_path = f"predictions/{self.method}_seed_{self.seed}.jsonl"
+        if self.canonical_path != expected_path:
+            raise ValueError(
+                "prediction evidence canonical_path does not match method and seed"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentEvidence:
+    python: str
+    numpy: str
+
+    def __post_init__(self) -> None:
+        if type(self.python) is not str or not self.python.strip():
+            raise ValueError("environment python version must be a non-empty string")
+        if type(self.numpy) is not str or not self.numpy.strip():
+            raise ValueError("environment numpy version must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticsReport:
+    protocol_version: str
+    report_schema_version: int
+    audit_sources: tuple[ArtifactEvidence, ...]
+    targets_path: str
+    manifest_partition_counts: PartitionCounts
+    predictions: tuple[PredictionEvidence, ...]
+    statistics: CLEVRStatistics
+    environment: EnvironmentEvidence
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.protocol_version) is not str
+            or self.protocol_version != PROTOCOL_VERSION
+        ):
+            raise ValueError(
+                f"report protocol_version must be exactly {PROTOCOL_VERSION!r}"
+            )
+        if (
+            type(self.report_schema_version) is not int
+            or self.report_schema_version != 1
+        ):
+            raise ValueError("report_schema_version must be exactly 1")
+        if (
+            not isinstance(self.audit_sources, tuple)
+            or len(self.audit_sources) != 3
+            or any(
+                not isinstance(item, ArtifactEvidence)
+                for item in self.audit_sources
+            )
+        ):
+            raise ValueError(
+                "audit_sources must be the three immutable artifact records"
+            )
+        if self.targets_path != "targets.jsonl":
+            raise ValueError("targets_path must be exactly 'targets.jsonl'")
+        if not isinstance(self.manifest_partition_counts, PartitionCounts):
+            raise ValueError(
+                "manifest_partition_counts must be PartitionCounts"
+            )
+        expected_keys = tuple(
+            (method, seed) for method in METHODS for seed in SEEDS
+        )
+        if (
+            not isinstance(self.predictions, tuple)
+            or tuple(
+                (item.method, item.seed)
+                for item in self.predictions
+                if isinstance(item, PredictionEvidence)
+            )
+            != expected_keys
+        ):
+            raise ValueError(
+                "predictions must contain the ordered formal evidence grid"
+            )
+        if not isinstance(self.statistics, CLEVRStatistics):
+            raise ValueError("statistics must be CLEVRStatistics")
+        if not isinstance(self.environment, EnvironmentEvidence):
+            raise ValueError("environment must be EnvironmentEvidence")
+
+
+@dataclass(frozen=True, slots=True)
+class StatisticsBundle:
+    report: StatisticsReport
+    targets: tuple[TargetRow, ...]
+    runs: tuple[RunPredictions, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.report, StatisticsReport):
+            raise ValueError("report must be StatisticsReport")
+        if (
+            not isinstance(self.targets, tuple)
+            or not self.targets
+            or any(not isinstance(item, TargetRow) for item in self.targets)
+        ):
+            raise ValueError("targets must be a non-empty TargetRow tuple")
+        partition_rank = {"train": 0, "base_test": 1}
+        expected_targets = tuple(
+            sorted(
+                self.targets,
+                key=lambda row: (
+                    partition_rank[row.partition],
+                    row.question_index,
+                ),
+            )
+        )
+        if self.targets != expected_targets:
+            raise ValueError("targets must use canonical partition/question order")
+        expected_keys = tuple(
+            (method, seed) for method in METHODS for seed in SEEDS
+        )
+        if (
+            not isinstance(self.runs, tuple)
+            or tuple(
+                (run.method, run.seed)
+                for run in self.runs
+                if isinstance(run, RunPredictions)
+            )
+            != expected_keys
+        ):
+            raise ValueError("runs must contain the ordered formal run grid")
+        evidence_keys = tuple(
+            (item.method, item.seed) for item in self.report.predictions
+        )
+        if evidence_keys != expected_keys:
+            raise ValueError("report prediction evidence does not match runs")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -522,3 +711,313 @@ def load_audit_targets(
         ArtifactEvidence(str(report_path), report_size, 1),
     )
     return targets, evidence, partition_counts
+
+
+def load_prediction_run(
+    source: PredictionSource,
+) -> tuple[RunPredictions, PredictionEvidence]:
+    """Load one explicit self-described PUB-R1.1 prediction file."""
+    if not isinstance(source, PredictionSource):
+        raise CLEVRReportError("source must be a PredictionSource")
+
+    raw_rows, size_bytes, resolved_path = _read_json_lines(source.path)
+    parsed_rows: list[PredictionRow] = []
+    seen_question_ids: set[int] = set()
+    declared_identity: tuple[str, int] | None = None
+
+    for line_number, value in raw_rows:
+        try:
+            row = _require_exact_keys(
+                value, _PREDICTION_KEYS, "prediction row"
+            )
+            _require_protocol(row["protocol_version"])
+            method = row["method"]
+            seed = row["seed"]
+            if type(method) is not str or method not in METHODS:
+                raise ValueError(
+                    "method is not part of the frozen formal comparison"
+                )
+            if type(seed) is not int or seed not in SEEDS:
+                raise ValueError(
+                    "seed is not part of the frozen formal comparison"
+                )
+            identity = (method, seed)
+            if declared_identity is None:
+                declared_identity = identity
+            elif identity != declared_identity:
+                raise ValueError(
+                    "method and seed must agree across every row in the file"
+                )
+
+            logits = row["logits"]
+            if type(logits) is not list:
+                raise ValueError("logits must be a JSON array")
+            prediction = PredictionRow(
+                question_index=row["question_index"],
+                label=row["label"],
+                logits=tuple(logits),
+            )
+            if prediction.question_index in seen_question_ids:
+                raise ValueError(
+                    f"duplicate prediction question ID: {prediction.question_index}"
+                )
+            seen_question_ids.add(prediction.question_index)
+            parsed_rows.append(prediction)
+        except (TypeError, ValueError) as exc:
+            raise _context_error(
+                resolved_path, str(exc), line=line_number
+            ) from exc
+
+    if declared_identity is None:
+        raise _context_error(resolved_path, "prediction file must not be empty")
+    method, seed = declared_identity
+    run = RunPredictions(
+        method=method,
+        seed=seed,
+        rows=tuple(sorted(parsed_rows, key=lambda row: row.question_index)),
+    )
+    evidence = PredictionEvidence(
+        method=method,
+        seed=seed,
+        source_path=str(resolved_path),
+        size_bytes=size_bytes,
+        row_count=len(parsed_rows),
+        canonical_path=f"predictions/{method}_seed_{seed}.jsonl",
+    )
+    return run, evidence
+
+
+def _validated_prediction_sources(
+    prediction_sources: Sequence[PredictionSource],
+) -> tuple[PredictionSource, ...]:
+    if (
+        not isinstance(prediction_sources, Sequence)
+        or isinstance(prediction_sources, (str, bytes, bytearray))
+    ):
+        raise CLEVRReportError(
+            "prediction_sources must be a sequence of PredictionSource records"
+        )
+    sources = tuple(prediction_sources)
+    if len(sources) != len(METHODS) * len(SEEDS):
+        raise CLEVRReportError("prediction_sources must contain exactly 20 records")
+    if any(not isinstance(source, PredictionSource) for source in sources):
+        raise CLEVRReportError(
+            "prediction_sources must contain only PredictionSource records"
+        )
+
+    resolved_paths: list[Path] = []
+    for source in sources:
+        try:
+            resolved_paths.append(source.path.expanduser().resolve())
+        except (OSError, RuntimeError) as exc:
+            raise CLEVRReportError(
+                f"cannot resolve prediction source {source.path}: {exc}"
+            ) from exc
+    if len(set(resolved_paths)) != len(resolved_paths):
+        raise CLEVRReportError(
+            "prediction_sources must have 20 distinct resolved paths"
+        )
+    return sources
+
+
+def build_statistics_bundle(
+    audit_dir: Path,
+    prediction_sources: Sequence[PredictionSource],
+) -> StatisticsBundle:
+    """Build one typed report from explicit audit and prediction sources."""
+    sources = _validated_prediction_sources(prediction_sources)
+    targets, audit_sources, partition_counts = load_audit_targets(audit_dir)
+
+    loaded = tuple(load_prediction_run(source) for source in sources)
+    identity_counts: dict[tuple[str, int], int] = {}
+    for run, _ in loaded:
+        key = (run.method, run.seed)
+        identity_counts[key] = identity_counts.get(key, 0) + 1
+    expected_keys = tuple(
+        (method, seed) for method in METHODS for seed in SEEDS
+    )
+    duplicates = tuple(
+        key for key, count in identity_counts.items() if count > 1
+    )
+    missing = tuple(key for key in expected_keys if key not in identity_counts)
+    if duplicates or missing or len(identity_counts) != len(expected_keys):
+        raise CLEVRReportError(
+            "prediction sources do not form the exact formal grid; "
+            f"duplicate={duplicates}, missing={missing}"
+        )
+
+    by_key = {
+        (run.method, run.seed): (run, evidence)
+        for run, evidence in loaded
+    }
+    runs = tuple(by_key[key][0] for key in expected_keys)
+    prediction_evidence = tuple(by_key[key][1] for key in expected_keys)
+    try:
+        statistics = compute_clevr_statistics(targets, runs)
+    except ValueError as exc:
+        raise CLEVRReportError(f"statistics validation failed: {exc}") from exc
+
+    report = StatisticsReport(
+        protocol_version=PROTOCOL_VERSION,
+        report_schema_version=1,
+        audit_sources=audit_sources,
+        targets_path="targets.jsonl",
+        manifest_partition_counts=partition_counts,
+        predictions=prediction_evidence,
+        statistics=statistics,
+        environment=EnvironmentEvidence(
+            python=platform.python_version(),
+            numpy=metadata.version("numpy"),
+        ),
+    )
+    return StatisticsBundle(report=report, targets=targets, runs=runs)
+
+
+def _artifact_evidence_payload(evidence: ArtifactEvidence) -> dict[str, object]:
+    return {
+        "path": evidence.path,
+        "size_bytes": evidence.size_bytes,
+        "record_count": evidence.record_count,
+    }
+
+
+def _partition_counts_payload(counts: PartitionCounts) -> dict[str, object]:
+    return {
+        "train": counts.train,
+        "dev": counts.dev,
+        "base_test": counts.base_test,
+        "confirmation": counts.confirmation,
+    }
+
+
+def _prediction_evidence_payload(
+    evidence: PredictionEvidence,
+) -> dict[str, object]:
+    return {
+        "method": evidence.method,
+        "seed": evidence.seed,
+        "source_path": evidence.source_path,
+        "size_bytes": evidence.size_bytes,
+        "row_count": evidence.row_count,
+        "canonical_path": evidence.canonical_path,
+    }
+
+
+def _environment_payload(environment: EnvironmentEvidence) -> dict[str, object]:
+    return {"python": environment.python, "numpy": environment.numpy}
+
+
+def _cell_metrics_payload(metrics: CellMetrics) -> dict[str, object]:
+    accuracy: float | str = (
+        "NA" if metrics.accuracy is None else metrics.accuracy
+    )
+    return {
+        "relation": metrics.relation,
+        "label": metrics.label,
+        "count": metrics.count,
+        "correct_count": metrics.correct_count,
+        "accuracy": accuracy,
+    }
+
+
+def _classification_metrics_payload(
+    metrics: ClassificationMetrics,
+) -> dict[str, object]:
+    cross_entropy: float | str = (
+        "NA" if metrics.cross_entropy is None else metrics.cross_entropy
+    )
+    macro_accuracy: float | str = (
+        "NA" if metrics.macro_accuracy is None else metrics.macro_accuracy
+    )
+    return {
+        "question_count": metrics.question_count,
+        "correct_count": metrics.correct_count,
+        "accuracy": metrics.accuracy,
+        "cross_entropy": cross_entropy,
+        "cells": [_cell_metrics_payload(cell) for cell in metrics.cells],
+        "macro_accuracy": macro_accuracy,
+    }
+
+
+def _run_metrics_payload(metrics: RunMetrics) -> dict[str, object]:
+    return {
+        "method": metrics.method,
+        "seed": metrics.seed,
+        "metrics": _classification_metrics_payload(metrics.metrics),
+    }
+
+
+def _seed_summary_payload(summary: SeedSummary) -> dict[str, object]:
+    return {
+        "name": summary.name,
+        "seeds": list(summary.seeds),
+        "values": list(summary.values),
+        "mean": summary.mean,
+        "sample_sd": summary.sample_sd,
+        "interval": list(summary.interval),
+    }
+
+
+def _paired_summary_payload(summary: PairedSummary) -> dict[str, object]:
+    return {
+        "name": summary.name,
+        "seeds": list(summary.seeds),
+        "values": list(summary.values),
+        "mean": summary.mean,
+        "sample_sd": summary.sample_sd,
+        "interval": list(summary.interval),
+    }
+
+
+def _cluster_bootstrap_payload(
+    summary: ClusterBootstrapSummary,
+) -> dict[str, object]:
+    return {
+        "seed": summary.seed,
+        "draws": summary.draws,
+        "quantile_method": summary.quantile_method,
+        "replicates": list(summary.replicates),
+        "interval": list(summary.interval),
+    }
+
+
+def _statistics_payload(statistics: CLEVRStatistics) -> dict[str, object]:
+    return {
+        "run_metrics": [
+            _run_metrics_payload(metrics) for metrics in statistics.run_metrics
+        ],
+        "method_summaries": [
+            _seed_summary_payload(summary)
+            for summary in statistics.method_summaries
+        ],
+        "b_minus_g": _paired_summary_payload(statistics.b_minus_g),
+        "m10_minus_g": _paired_summary_payload(statistics.m10_minus_g),
+        "train_majority": _classification_metrics_payload(
+            statistics.train_majority
+        ),
+        "bootstrap": _cluster_bootstrap_payload(statistics.bootstrap),
+    }
+
+
+def statistics_report_payload(report: StatisticsReport) -> dict[str, object]:
+    """Convert one validated report into the fixed JSON-compatible schema."""
+    if not isinstance(report, StatisticsReport):
+        raise ValueError("report must be StatisticsReport")
+    return {
+        "protocol_version": report.protocol_version,
+        "report_schema_version": report.report_schema_version,
+        "environment": _environment_payload(report.environment),
+        "audit_sources": [
+            _artifact_evidence_payload(evidence)
+            for evidence in report.audit_sources
+        ],
+        "targets_path": report.targets_path,
+        "manifest_partition_counts": _partition_counts_payload(
+            report.manifest_partition_counts
+        ),
+        "predictions": [
+            _prediction_evidence_payload(evidence)
+            for evidence in report.predictions
+        ],
+        "statistics": _statistics_payload(report.statistics),
+    }
