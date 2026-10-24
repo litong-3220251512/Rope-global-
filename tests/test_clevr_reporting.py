@@ -2245,6 +2245,96 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse(self._lock_path(output_dir).exists())
         self.assertEqual(self._staging_paths(output_dir), [])
 
+    def test_keyboard_interrupt_before_commit_cleans_owned_artifacts(self) -> None:
+        # Mutation caught: limiting the transaction cleanup scope to Exception.
+        output_dir = self.root / "keyboard-interrupt"
+
+        def interrupt_jsonl(path: Path, rows: object) -> None:
+            path.write_text("partial-before-interrupt\n", encoding="utf-8")
+            raise KeyboardInterrupt("injected publication interrupt")
+
+        with mock.patch.object(
+            clevr_reporting,
+            "_write_json_lines",
+            side_effect=interrupt_jsonl,
+        ):
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "publication interrupt",
+            ):
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+
+        self.assertFalse(output_dir.exists())
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertFalse(self._lock_path(output_dir).exists())
+
+    def test_replaced_lock_before_commit_is_preserved_and_reports_state(self) -> None:
+        # Mutation caught: cleanup unlinking a replacement lock solely by pathname.
+        output_dir = self.root / "precommit-replaced-lock"
+        lock_path = self._lock_path(output_dir)
+        replacement = b"replacement-publisher-before-commit"
+
+        def replace_lock_and_fail(path: Path, rows: object) -> None:
+            lock_path.unlink()
+            lock_path.write_bytes(replacement)
+            path.write_text("partial-before-replacement-failure\n", encoding="utf-8")
+            raise OSError("injected writer failure after lock replacement")
+
+        with mock.patch.object(
+            clevr_reporting,
+            "_write_json_lines",
+            side_effect=replace_lock_and_fail,
+        ):
+            with self.assertRaises(clevr_reporting.ReportPublicationError) as caught:
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+
+        self.assertIs(caught.exception.committed, False)
+        self.assertIn("not committed", str(caught.exception))
+        self.assertIn("writer failure", str(caught.exception))
+        self.assertIsNotNone(caught.exception.__cause__)
+        self.assertIn("ownership", str(caught.exception.__cause__))
+        self.assertFalse(output_dir.exists())
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertEqual(lock_path.read_bytes(), replacement)
+
+    def test_replaced_lock_after_commit_is_preserved_and_reports_state(self) -> None:
+        # Mutation caught: post-rename cleanup unlinking another publisher's lock.
+        output_dir = self.root / "postcommit-replaced-lock"
+        lock_path = self._lock_path(output_dir)
+        replacement = b"replacement-publisher-after-commit"
+        real_rename = clevr_reporting.os.rename
+
+        def rename_then_replace_lock(source: Path, target: Path) -> None:
+            real_rename(source, target)
+            lock_path.unlink()
+            lock_path.write_bytes(replacement)
+
+        with mock.patch.object(
+            clevr_reporting.os,
+            "rename",
+            side_effect=rename_then_replace_lock,
+        ):
+            with self.assertRaises(clevr_reporting.ReportPublicationError) as caught:
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+
+        self.assertIs(caught.exception.committed, True)
+        self.assertIn("committed", str(caught.exception))
+        self.assertNotIn("not committed", str(caught.exception))
+        self.assertIsNotNone(caught.exception.__cause__)
+        self.assertIn("ownership", str(caught.exception.__cause__))
+        self._assert_complete_output(output_dir)
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertEqual(lock_path.read_bytes(), replacement)
+
     def test_lock_unlink_failure_before_commit_reports_not_committed(self) -> None:
         # Mutation caught: losing the primary failure or misreporting pre-rename state.
         output_dir = self.root / "precommit-unlink-failure"

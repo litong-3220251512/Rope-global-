@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import secrets
 import shutil
 import stat
 import tempfile
@@ -1137,6 +1138,86 @@ def _write_json_document(path: Path, payload: dict[str, object]) -> None:
         output_file.write("\n")
 
 
+def _write_lock_token(lock_fd: int, token: bytes) -> None:
+    remaining = memoryview(token)
+    while remaining:
+        written = os.write(lock_fd, remaining)
+        if written <= 0:
+            raise OSError("publication lock token write made no progress")
+        remaining = remaining[written:]
+
+
+def _unlink_owned_lock(
+    lock_path: Path,
+    lock_identity: tuple[int, int] | None,
+    lock_token: bytes,
+) -> None:
+    if lock_identity is None:
+        raise OSError(
+            f"publication lock ownership is unavailable for {lock_path}"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        current_fd = os.open(lock_path, flags)
+    except OSError as exc:
+        raise OSError(
+            f"publication lock ownership cannot be verified for {lock_path}: {exc}"
+        ) from exc
+    try:
+        with os.fdopen(current_fd, "rb") as current_file:
+            current_stat = os.fstat(current_file.fileno())
+            current_token = current_file.read(len(lock_token) + 1)
+    except OSError as exc:
+        raise OSError(
+            f"publication lock ownership cannot be verified for {lock_path}: {exc}"
+        ) from exc
+
+    current_identity = (current_stat.st_dev, current_stat.st_ino)
+    if current_identity != lock_identity or current_token != lock_token:
+        raise OSError(
+            "publication lock ownership changed; refusing to unlink "
+            f"{lock_path}"
+        )
+    try:
+        latest_stat = lock_path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise OSError(
+            f"publication lock ownership cannot be verified for {lock_path}: {exc}"
+        ) from exc
+    latest_identity = (latest_stat.st_dev, latest_stat.st_ino)
+    if latest_identity != lock_identity:
+        raise OSError(
+            "publication lock ownership changed; refusing to unlink "
+            f"{lock_path}"
+        )
+    lock_path.unlink()
+
+
+def _release_publication_lock(
+    lock_path: Path,
+    lock_fd: int,
+    lock_identity: tuple[int, int] | None,
+    lock_token: bytes,
+) -> None:
+    cleanup_error: BaseException | None = None
+    try:
+        _unlink_owned_lock(lock_path, lock_identity, lock_token)
+    except BaseException as exc:
+        cleanup_error = exc
+    try:
+        os.close(lock_fd)
+    except BaseException as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
+        else:
+            cleanup_error.add_note(
+                f"publication lock descriptor close also failed: {exc}"
+            )
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 def publish_statistics_bundle(
     output_dir: Path,
     bundle: StatisticsBundle,
@@ -1167,6 +1248,7 @@ def publish_statistics_bundle(
         ) from exc
 
     lock_path = resolved_output.parent / f".{resolved_output.name}.lock"
+    lock_token = secrets.token_hex(32).encode("ascii")
     try:
         lock_fd = os.open(
             lock_path,
@@ -1180,8 +1262,11 @@ def publish_statistics_bundle(
 
     committed = False
     staging_dir: Path | None = None
+    lock_identity: tuple[int, int] | None = None
     try:
-        os.close(lock_fd)
+        lock_stat = os.fstat(lock_fd)
+        lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
+        _write_lock_token(lock_fd, lock_token)
         staging_dir = Path(
             tempfile.mkdtemp(
                 prefix=f".{resolved_output.name}.staging-",
@@ -1221,16 +1306,21 @@ def publish_statistics_bundle(
         os.rename(staging_dir, resolved_output)
         committed = True
         staging_dir = None
-    except Exception as primary_error:
-        staging_cleanup_error: OSError | None = None
+    except BaseException as primary_error:
+        staging_cleanup_error: BaseException | None = None
         if staging_dir is not None:
             try:
                 shutil.rmtree(staging_dir)
-            except OSError as exc:
+            except BaseException as exc:
                 staging_cleanup_error = exc
         try:
-            lock_path.unlink()
-        except OSError as cleanup_error:
+            _release_publication_lock(
+                lock_path,
+                lock_fd,
+                lock_identity,
+                lock_token,
+            )
+        except BaseException as cleanup_error:
             cleanup_details = f"unable to remove publication lock: {cleanup_error}"
             if staging_cleanup_error is not None:
                 cleanup_details += (
@@ -1252,8 +1342,13 @@ def publish_statistics_bundle(
         raise
 
     try:
-        lock_path.unlink()
-    except OSError as cleanup_error:
+        _release_publication_lock(
+            lock_path,
+            lock_fd,
+            lock_identity,
+            lock_token,
+        )
+    except BaseException as cleanup_error:
         raise ReportPublicationError(
             "statistics bundle committed, but unable to remove publication lock: "
             f"{cleanup_error}",
