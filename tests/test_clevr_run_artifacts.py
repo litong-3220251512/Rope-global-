@@ -667,3 +667,251 @@ class CommonShortWriteTests(ArtifactFixture):
         path = self.run_dir().parent / "common_state.pt"
         self.assertFalse(path.exists(), "a truncated torch archive must never reach the final path")
         self.assertEqual(list(path.parent.glob(".*staging-*")), [])
+
+
+class InodeLifetimeFixTests(ArtifactFixture):
+    def prediction(self, run):
+        return run.publish_predictions(
+            partition="dev", completed_updates=1000,
+            rows=[artifacts.CLEVRPredictionRecord(0, 0, (1.0, 0.0))])
+
+    def test_closed_staging_replacement_without_retention_cannot_commit_foreign_bytes(self):
+        run = self.open_run()
+        real_fdopen = os.fdopen
+        foreign = []
+        original_identity = []
+        def fdopen(fd, mode):
+            output = _FaultFile(real_fdopen(fd, mode), None)
+            entry = os.fstat(fd)
+            original_identity.append((entry.st_dev, entry.st_ino))
+            close = output.close
+            def replace_after_close():
+                close()
+                parent = self.run_dir() / "predictions" / "dev"
+                staging = next(parent.glob(".*staging-*"))
+                staging.unlink()  # No test-held descriptor or retention hard link.
+                staging.write_bytes(b"foreign evidence")
+                foreign.append(staging)
+            output.close = replace_after_close
+            return output
+        with mock.patch.object(artifacts.os, "fdopen", side_effect=fdopen):
+            with self.assertRaises(artifacts.CLEVRRunArtifactError) as caught:
+                self.prediction(run)
+        self.assertIs(caught.exception.committed, False)
+        self.assertEqual(foreign[0].read_bytes(), b"foreign evidence")
+        entry = foreign[0].stat()
+        self.assertNotEqual((entry.st_dev, entry.st_ino), original_identity[0])
+        self.assertFalse((foreign[0].parent / "update_1000.jsonl").exists())
+        self.assertTrue(any("ownership" in note for note in caught.exception.__notes__))
+        self.assertFalse((foreign[0].parent / "owned-retained").exists())
+
+    def test_independent_reference_spans_stream_close_reconciliation_and_cleanup(self):
+        for outcome in ("success", "link_after", "write_error"):
+            with self.subTest(outcome=outcome):
+                self.root = Path(self.temp.name) / outcome
+                run = self.open_run()
+                real_dup, real_link, real_unlink, real_fdopen = os.dup, os.link, os.unlink, os.fdopen
+                references, streams, observed = [], [], []
+                def dup(fd):
+                    reference = real_dup(fd)
+                    references.append(reference)
+                    return reference
+                def fdopen(fd, mode):
+                    output = _FaultFile(real_fdopen(fd, mode), "write" if outcome == "write_error" else None)
+                    streams.append(output)
+                    return output
+                def require_live_reference():
+                    self.assertEqual(len(references), 1, "publication needs an independent inode reference")
+                    self.assertTrue(streams[0].closed, "stream close must precede commit/cleanup")
+                    self.assertTrue(stat.S_ISREG(os.fstat(references[0]).st_mode))
+                def link(source, target):
+                    require_live_reference()
+                    observed.append("link")
+                    real_link(source, target)
+                    if outcome == "link_after":
+                        raise OSError("link after commit")
+                def unlink(path):
+                    require_live_reference()
+                    observed.append("cleanup")
+                    real_unlink(path)
+                with mock.patch.object(artifacts.os, "dup", side_effect=dup), \
+                     mock.patch.object(artifacts.os, "fdopen", side_effect=fdopen), \
+                     mock.patch.object(artifacts.os, "link", side_effect=link), \
+                     mock.patch.object(artifacts.os, "unlink", side_effect=unlink):
+                    if outcome == "success":
+                        self.prediction(run)
+                    else:
+                        with self.assertRaises(artifacts.CLEVRRunArtifactError) as caught:
+                            self.prediction(run)
+                        self.assertIs(caught.exception.committed, outcome == "link_after")
+                self.assertIn("cleanup", observed)
+                self.assertEqual(len(references), 1)
+                with self.assertRaises(OSError):
+                    os.fstat(references[0])
+
+    def test_reference_acquisition_failure_cleans_staging_without_commit(self):
+        run = self.open_run()
+        failure = OSError("inode reference acquisition")
+        with mock.patch.object(artifacts.os, "dup", side_effect=failure):
+            with self.assertRaises(artifacts.CLEVRRunArtifactError) as caught:
+                self.prediction(run)
+        self.assertIs(caught.exception.committed, False)
+        self.assertIs(caught.exception.__cause__, failure)
+        parent = self.run_dir() / "predictions" / "dev"
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_reference_release_failures_preserve_commit_and_primary_failure(self):
+        for commit, closes_before_error in ((True, False), (True, True), (False, False)):
+            with self.subTest(commit=commit, closes_before_error=closes_before_error):
+                self.root = Path(self.temp.name) / f"{commit}_{closes_before_error}"
+                run = self.open_run()
+                real_dup, real_close, real_fdopen = os.dup, os.close, os.fdopen
+                references, release_calls = [], []
+                release_error = OSError("inode reference release")
+                def dup(fd):
+                    reference = real_dup(fd)
+                    references.append(reference)
+                    return reference
+                def close(fd):
+                    if fd in references:
+                        release_calls.append(fd)
+                        if closes_before_error:
+                            real_close(fd)
+                        raise release_error
+                    return real_close(fd)
+                def fdopen(fd, mode):
+                    return _FaultFile(real_fdopen(fd, mode), None if commit else "write")
+                try:
+                    with mock.patch.object(artifacts.os, "dup", side_effect=dup), \
+                         mock.patch.object(artifacts.os, "close", side_effect=close), \
+                         mock.patch.object(artifacts.os, "fdopen", side_effect=fdopen):
+                        with self.assertRaises(artifacts.CLEVRRunArtifactError) as caught:
+                            self.prediction(run)
+                    self.assertIs(caught.exception.committed, commit)
+                    self.assertEqual(release_calls, references)
+                    self.assertEqual(len(references), 1)
+                    if commit:
+                        self.assertIs(caught.exception.__cause__, release_error)
+                    else:
+                        self.assertIn("partial write", str(caught.exception.__cause__))
+                        self.assertTrue(any("reference" in note for note in caught.exception.__notes__))
+                    parent = self.run_dir() / "predictions" / "dev"
+                    self.assertEqual((parent / "update_1000.jsonl").exists(), commit)
+                    self.assertEqual(list(parent.glob(".*staging-*")), [])
+                finally:
+                    # The pre-effect injected failure leaves a real fd open; its
+                    # disposition is known by this fixture, not safely by production.
+                    if not closes_before_error:
+                        for reference in references:
+                            real_close(reference)
+
+
+class SpecSubclassFixTests(ArtifactFixture):
+    def test_budget_and_role_override_subclasses_fail_before_fresh_mutation(self):
+        class ExtendedSpec(artifacts.CLEVRRunSpec):
+            @property
+            def target_updates(self):
+                return 9000
+        class AlteredRole(artifacts.CLEVRRunSpec):
+            @property
+            def evidence_role(self):
+                return "caller-controlled"
+        class UnvalidatedSpec(artifacts.CLEVRRunSpec):
+            def __post_init__(self):
+                pass
+        cases = [ExtendedSpec("formal", "G", 101), AlteredRole("formal", "G", 101),
+                 UnvalidatedSpec("formal", "G", 101)]
+        for index, spec in enumerate(cases):
+            with self.subTest(subclass=type(spec).__name__):
+                self.root = Path(self.temp.name) / str(index)
+                with self.assertRaises(artifacts.CLEVRRunArtifactError):
+                    self.open_run(spec=spec)
+                self.assertFalse(self.root.exists())
+
+    def test_resume_subclass_does_not_allocate_an_attempt_or_change_config(self):
+        class ExtendedSpec(artifacts.CLEVRRunSpec):
+            @property
+            def target_updates(self):
+                return 9000
+        self.open_run()
+        config = (self.run_dir() / "run_config.json").read_bytes()
+        attempts = sorted((self.run_dir() / "attempts").iterdir())
+        # Match the malicious metadata so rejection cannot rely only on a
+        # mismatch with an ordinary existing 8000-update config.
+        altered = json.loads(config)
+        altered["target_updates"] = 9000
+        path = self.run_dir() / "run_config.json"
+        path.write_text(json.dumps(altered))
+        before = path.read_bytes()
+        with self.assertRaises(artifacts.CLEVRRunArtifactError):
+            self.open_run(spec=ExtendedSpec("formal", "G", 101), resume=True)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(sorted((self.run_dir() / "attempts").iterdir()), attempts)
+
+
+class CommonCommitFixTests(ArtifactFixture):
+    def test_fresh_postcommit_read_and_schema_errors_report_true_keep_final(self):
+        for failure in ("read", "schema"):
+            with self.subTest(failure=failure):
+                self.root = Path(self.temp.name) / failure
+                run = self.open_run()
+                target = self.run_dir().parent / "common_state.pt"
+                real_load = torch.load
+                def load(path, **kwargs):
+                    self.assertTrue(target.is_file())
+                    if failure == "read":
+                        raise PermissionError("restricted read denied after commit")
+                    return {}
+                with mock.patch.object(artifacts.torch, "load", side_effect=load):
+                    with self.assertRaises(artifacts.CLEVRRunArtifactError) as caught:
+                        run.ensure_common_state({"weight": torch.tensor([1.0])})
+                self.assertIs(caught.exception.committed, True)
+                payload = real_load(target, map_location="cpu", weights_only=True)
+                self.assertTrue(torch.equal(payload["common_state"]["weight"], torch.tensor([1.0])))
+                self.assertEqual(list(target.parent.glob(".*staging-*")), [])
+
+    def test_nonreflexive_tensor_is_rejected_before_publish_and_valid_retry_works(self):
+        run = self.open_run()
+        target = self.run_dir().parent / "common_state.pt"
+        for value in (torch.tensor([float("nan")]),
+                      torch.tensor([complex(1, float("nan"))])):
+            with self.subTest(dtype=value.dtype):
+                with self.assertRaises(artifacts.CLEVRRunArtifactError) as caught:
+                    run.ensure_common_state({"weight": value})
+                self.assertIs(caught.exception.committed, False)
+                self.assertFalse(target.exists(), "non-reflexive snapshots must not poison seed evidence")
+                self.assertEqual(list(target.parent.glob(".*staging-*")), [])
+        # Infinity and empty tensors are reflexive; do not substitute a broader
+        # finite-only rule or a tolerance for the required exact equality.
+        state = OrderedDict([("weight", torch.tensor([float("inf"), -float("inf")])),
+                             ("empty", torch.empty(0))])
+        self.assertEqual(run.ensure_common_state(state), target)
+        self.assertEqual(run.ensure_common_state(state), target)
+
+    def test_reuse_and_competing_winner_read_errors_report_false_keep_final(self):
+        for mode in ("reuse", "winner"):
+            with self.subTest(mode=mode):
+                self.root = Path(self.temp.name) / mode
+                run = self.open_run()
+                target = self.run_dir().parent / "common_state.pt"
+                state = {"weight": torch.tensor([1.0])}
+                if mode == "reuse":
+                    run.ensure_common_state(state)
+                real_link = os.link
+                winner_bytes = []
+                def link(source, destination):
+                    if Path(destination) == target:
+                        # Simulate another publisher winning the no-overwrite
+                        # link race with the complete bytes already staged here.
+                        target.write_bytes(Path(source).read_bytes())
+                        winner_bytes.append(target.read_bytes())
+                        raise FileExistsError("another invocation won")
+                    return real_link(source, destination)
+                before = target.read_bytes() if mode == "reuse" else None
+                with mock.patch.object(artifacts.os, "link", side_effect=link), \
+                     mock.patch.object(artifacts.torch, "load", side_effect=PermissionError("read denied")):
+                    with self.assertRaises(artifacts.CLEVRRunArtifactError) as caught:
+                        run.ensure_common_state(state)
+                self.assertIs(caught.exception.committed, False)
+                self.assertEqual(target.read_bytes(), before if mode == "reuse" else winner_bytes[0])
+                self.assertEqual(list(target.parent.glob(".*staging-*")), [])

@@ -155,13 +155,16 @@ class _CompleteTensorWriter:
 def _publish(path: Path, writer: Callable[[BinaryIO], object]) -> Path:
     """Commit complete bytes with link; never remove a final target on failure.
 
-    Staging cleanup requires direct inode ownership. A link that raises after
-    committing is reconciled against the owned inode, not exception wording.
+    A separate descriptor pins the inode through stream close and cleanup.
+    A link that raises after committing is reconciled against that live inode,
+    not exception wording.
     """
     descriptor = None
     output = None
     staging = None
     owned = None
+    reference = None
+    reference_release_started = False
     link_started = False
     committed: bool | None = False
     cleanup_started = False
@@ -170,6 +173,7 @@ def _publish(path: Path, writer: Callable[[BinaryIO], object]) -> Path:
         staging = Path(name)
         entry = os.fstat(descriptor)
         owned = (entry.st_dev, entry.st_ino)
+        reference = os.dup(descriptor)
         os.fchmod(descriptor, 0o600)
         output = os.fdopen(descriptor, "wb")
         descriptor = None
@@ -185,6 +189,9 @@ def _publish(path: Path, writer: Callable[[BinaryIO], object]) -> Path:
             raise CLEVRRunArtifactError("staging inode changed before cleanup")
         cleanup_started = True
         os.unlink(staging)
+        reference_release_started = True
+        os.close(reference)
+        reference = None
         return path
     except BaseException as primary:
         failures = []
@@ -197,8 +204,6 @@ def _publish(path: Path, writer: Callable[[BinaryIO], object]) -> Path:
         try:
             if output is not None and not output.closed:
                 output.close()
-            elif descriptor is not None:
-                os.close(descriptor)
         except BaseException as exc:
             failures.append(("close", exc))
         if link_started and committed is not True:
@@ -218,6 +223,25 @@ def _publish(path: Path, writer: Callable[[BinaryIO], object]) -> Path:
                 pass
             except BaseException as exc:
                 failures.append(("staging cleanup", exc))
+        # If dup failed, the original descriptor must still pin the inode until
+        # staging cleanup finishes. Otherwise the independent reference does.
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                failures.append(("descriptor close", exc))
+        if reference is not None:
+            if reference_release_started:
+                # close may have released the fd before raising. Retrying could
+                # close a descriptor since reused by another thread.
+                failures.append(("inode reference release", CLEVRRunArtifactError(
+                    f"fd {reference} release was attempted; disposition unknown")))
+            else:
+                try:
+                    os.close(reference)
+                except BaseException as exc:
+                    exc.add_note(f"inode reference fd {reference}; close will not be retried")
+                    failures.append(("inode reference release", exc))
         error_type = (_TargetExists if isinstance(primary, FileExistsError)
                       and committed is False and not failures else CLEVRRunArtifactError)
         error = error_type(f"publication failed: {path} (committed={committed})",
@@ -241,7 +265,14 @@ def _snapshot_common(common_state: Mapping[str, torch.Tensor]) -> OrderedDict:
             raise CLEVRRunArtifactError("common_state requires string keys and plain tensors")
         if value.device.type == "meta" or value.layout != torch.strided:
             raise CLEVRRunArtifactError("common_state requires materialized strided tensors")
-        snapshot[key] = value.detach().cpu().clone()
+        cloned = value.detach().cpu().clone()
+        try:
+            reflexive = torch.equal(cloned, cloned)
+        except RuntimeError as exc:
+            raise CLEVRRunArtifactError(f"common-state exact equality is unsupported: {key}") from exc
+        if not reflexive:
+            raise CLEVRRunArtifactError(f"common-state exact equality is not reflexive: {key}")
+        snapshot[key] = cloned
     return snapshot
 
 
@@ -280,8 +311,8 @@ class CLEVRRunArtifacts:
         cls, *, output_root: Path, spec: CLEVRRunSpec,
         expanded_config: Mapping[str, object], resume: bool,
     ) -> CLEVRRunArtifacts:
-        if not isinstance(output_root, Path) or not isinstance(spec, CLEVRRunSpec):
-            raise CLEVRRunArtifactError("explicit Path and CLEVRRunSpec are required")
+        if not isinstance(output_root, Path) or type(spec) is not CLEVRRunSpec:
+            raise CLEVRRunArtifactError("explicit Path and exact CLEVRRunSpec are required")
         if type(resume) is not bool or not isinstance(expanded_config, Mapping):
             raise CLEVRRunArtifactError("resume must be bool and expanded_config a mapping")
         frozen = {"protocol_version": PROTOCOL_VERSION, "phase": spec.phase,
@@ -393,12 +424,20 @@ class CLEVRRunArtifacts:
                    "environment": _environment(), "common_state": _snapshot_common(common_state)}
         path = self.run_dir.parent / "common_state.pt"
         _directory(path.parent, create=False)
+        committed = False
         if not path.exists() and not path.is_symlink():
             try:
                 _publish(path, lambda output: torch.save(payload, _CompleteTensorWriter(output)))
             except _TargetExists:
                 pass  # A concurrent winner must pass the same strict read below.
-        _verify_common(path, payload)
+            else:
+                committed = True
+        try:
+            _verify_common(path, payload)
+        except CLEVRRunArtifactError as exc:
+            exc.committed = committed
+            exc.add_note(f"common-state verification failed (this invocation committed={committed})")
+            raise
         return path
 
     def publish_predictions(
