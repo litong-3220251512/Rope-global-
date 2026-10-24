@@ -8,7 +8,9 @@
 
 **Tech Stack:** Python 3.11, PyTorch 2.6.0, timm 1.0.24, vendored `naver-ai/rope-vit` commit `48d8df5`, `unittest`.
 
-**Spec:** `docs/rope_public_data_experiment_plan.md` (PUB-R1.1), especially §§3, 4.1–4.3, 6, and 10. Mathematical/library prerequisite: `docs/stage1_clevr_math_and_library_review.md`.
+**Spec:** `docs/rope_public_data_experiment_plan.md` (PUB-R1.1), especially §§3, 4.1–4.3, 6, and 10. Actual mathematical/library prerequisite for this unit: `docs/clevr_gb_backbone_math_and_library_review.md` (CGB-BACKBONE-R1.0).
+
+> **Late chronology correction (2026-10-24):** the applicable prerequisite above was added only after implementation reached reviewed commit `ff01ba7651ed713a48bddbfbb90fcf3a087e34c0`, when whole-branch review found the mismatch. It is a retrospective contract and code/test re-audit, not a claim that the review preceded coding. `docs/stage1_clevr_math_and_library_review.md` remains unchanged as the historical prerequisite for the withdrawn 4/5-channel marker task and is non-applicable to this RGB+question unit.
 
 ## Global Constraints
 
@@ -176,7 +178,7 @@ git commit -m "feat: add PUB-R1.1 G and B question answerer"
 
 ## Final Verification and PR Contract
 
-- [ ] Confirm `git diff --check <merge-base>..HEAD` and that changed paths are only this plan, `src/clevr_model.py`, and `tests/test_clevr_model.py`.
+- [ ] Confirm `git diff --check <merge-base>..HEAD` and that changed paths are only this plan, `docs/clevr_gb_backbone_math_and_library_review.md`, `src/clevr_model.py`, and `tests/test_clevr_model.py`.
 - [ ] Confirm no command accessed real CLEVR, downloaded data/weights, ran training, or exposed a GPU.
 - [ ] Generate a whole-branch review package and request one independent read-only review focused on the five Review Focus cases.
 - [ ] Fix any Critical/Important finding in one RED→GREEN pass, rerun the focused tests and full CPU suite, and commit the fix.
