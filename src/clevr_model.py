@@ -5,6 +5,9 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
+from src.classification import RoPEClassifier
+from src.local_rope import Lambda
+
 
 class CLEVRQuestionEncoder(nn.Module):
     """Encode padded CLEVR questions at each example's final valid token."""
@@ -48,3 +51,94 @@ class CLEVRQuestionEncoder(nn.Module):
             question_tokens.shape[0], device=question_tokens.device
         )
         return gru_output[batch_indices, question_length - 1]
+
+
+class CLEVRQuestionAnswerer(nn.Module):
+    """Frozen PUB-R1.1 RGB/question architecture with G or B axial RoPE."""
+
+    def __init__(self, vocab_size: int, *, mode: str = "G") -> None:
+        super().__init__()
+        if mode not in {"G", "B"}:
+            raise ValueError("mode must be G or B")
+
+        classifier = RoPEClassifier(
+            mode=mode,
+            fixed_lambda=1.0,
+            image_size=224,
+            patch_size=16,
+            embed_dim=192,
+            depth=6,
+            heads=3,
+            num_classes=2,
+            attention_backend="manual",
+            init_scale=1e-4,
+            drop_path_rate=0.0,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            theta=100.0,
+        )
+        self.backbone = classifier.backbone
+        self.position = classifier.position
+        self.question_encoder = CLEVRQuestionEncoder(vocab_size)
+
+    @staticmethod
+    def _validate_batch(
+        image: Tensor, question_tokens: Tensor, question_length: Tensor
+    ) -> None:
+        if not isinstance(image, Tensor):
+            raise TypeError("image must be a tensor")
+        if image.ndim != 4:
+            raise ValueError("image must have shape [N, 3, 224, 224]")
+        if image.shape[0] == 0:
+            raise ValueError("image batch must not be empty")
+        if tuple(image.shape[1:]) != (3, 224, 224):
+            raise ValueError("image must have shape [N, 3, 224, 224]")
+        if image.shape[0] != question_tokens.shape[0]:
+            raise ValueError("image and question token batches must match")
+        if image.shape[0] != question_length.shape[0]:
+            raise ValueError("image and question length batches must match")
+
+    def forward_tokens(
+        self,
+        image: Tensor,
+        question_tokens: Tensor,
+        question_length: Tensor,
+        *,
+        lam: Lambda | None = None,
+    ) -> Tensor:
+        """Return all normalized CLS and patch tokens."""
+        self._validate_batch(image, question_tokens, question_length)
+        patches = self.backbone.patch_embed(image)
+        question = self.question_encoder(question_tokens, question_length)
+        cls = self.backbone.cls_token.expand(image.shape[0], -1, -1)
+        cls = cls + question.unsqueeze(1)
+        tokens = torch.cat((cls, patches), dim=1)
+        phases = self.position(14, 14, lam=lam, device=image.device)
+        for block in self.backbone.blocks:
+            tokens = block(tokens, freqs_cis=phases)
+        return self.backbone.norm(tokens)
+
+    def forward_features(
+        self,
+        image: Tensor,
+        question_tokens: Tensor,
+        question_length: Tensor,
+        *,
+        lam: Lambda | None = None,
+    ) -> Tensor:
+        return self.forward_tokens(
+            image, question_tokens, question_length, lam=lam
+        )[:, 0]
+
+    def forward(
+        self,
+        image: Tensor,
+        question_tokens: Tensor,
+        question_length: Tensor,
+        *,
+        lam: Lambda | None = None,
+    ) -> Tensor:
+        features = self.forward_features(
+            image, question_tokens, question_length, lam=lam
+        )
+        return self.backbone.head(features)
