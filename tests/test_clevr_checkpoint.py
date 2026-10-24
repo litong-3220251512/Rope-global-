@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import FrozenInstanceError
 import os
@@ -1802,6 +1803,256 @@ class CheckpointLoadTests(unittest.TestCase):
         self.assertEqual(self.load(path), metadata)
         for component in ("model", "optimizer", "scheduler", "sampler"):
             self.assert_state_equal(getattr(f, component).state_dict(), payload[component + "_state"])
+
+
+class _VersionedLinear(nn.Linear):
+    """A native state-dict loader whose persistent metadata includes tensors."""
+
+    _version = 2
+
+    def __init__(self):
+        super().__init__(3, 2)
+        self.metadata_state = {"history": [torch.tensor([2, 3])], "label": "saved"}
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        destination._metadata[prefix[:-1]]["payload"] = self.metadata_state
+
+    def _load_from_state_dict(self, state, prefix, metadata, *args):
+        if metadata.get("version") != self._version:
+            raise RuntimeError("version metadata missing")
+        self.metadata_state = copy.deepcopy(metadata["payload"])
+        super()._load_from_state_dict(state, prefix, metadata, *args)
+
+
+class CheckpointFinalFixTests(unittest.TestCase):
+    assert_state_equal = CheckpointSaveTests.assert_state_equal
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "final-fix.pt"
+        self.model = nn.Sequential(_VersionedLinear())
+        named = list(self.model.named_parameters())
+        self.optimizer = AdamW([dict(
+            params=[p for _, p in named], param_names=[n for n, _ in named],
+            group_name="all",
+        )])
+        self.scheduler = LambdaLR(self.optimizer, lambda _: 1.0)
+        self.sampler = CLEVRIndexStream(dataset_size=5, run_seed=101)
+        self.live = dict(model=self.model, optimizer=self.optimizer,
+                         scheduler=self.scheduler, sampler=self.sampler,
+                         cuda_devices=())
+
+    def save(self, k=0):
+        return save_clevr_checkpoint(self.path, method="G", run_seed=101,
+                                     completed_updates=k, **self.live)
+
+    def load(self):
+        return checkpoint_module.load_clevr_checkpoint(
+            self.path, expected_method="G", expected_run_seed=101, **self.live
+        )
+
+    def assert_model_equal(self, expected):
+        actual = self.model.state_dict()
+        self.assert_state_equal(actual, expected)
+        self.assert_state_equal(actual._metadata, expected._metadata)
+
+    def materialize_optimizer(self):
+        # Structural fixture only: no forward/backward/optimizer update.
+        for parameter in self.model.parameters():
+            self.optimizer.state[parameter] = dict(
+                step=torch.tensor(1.0), exp_avg=torch.ones_like(parameter),
+                exp_avg_sq=torch.full_like(parameter, 2.0),
+            )
+
+    def test_version_metadata_round_trip_and_snapshot_independence(self):
+        expected = copy.deepcopy(self.model.state_dict())
+        self.model.load_state_dict(copy.deepcopy(expected))  # native control
+        real_save = torch.save
+
+        def mutate_live_after_capture(payload, output):
+            self.model[0].metadata_state["history"][0].add_(10)
+            real_save(payload, output)
+
+        with mock.patch.object(checkpoint_module.torch, "save",
+                               side_effect=mutate_live_after_capture):
+            self.save()
+        payload = torch.load(self.path, map_location="cpu", weights_only=True)
+        self.assertTrue(hasattr(payload["model_state"], "_metadata"))
+        self.assertIs(type(payload["model_state"]._metadata), OrderedDict)
+        self.assert_state_equal(payload["model_state"]._metadata, expected._metadata)
+        with torch.no_grad():
+            self.model[0].weight.add_(7)
+        native_load = self.model[0]._load_from_state_dict
+
+        def mutate_loader_input(state, prefix, metadata, *args):
+            native_load(state, prefix, metadata, *args)
+            metadata["payload"]["history"][0].add_(20)
+
+        with mock.patch.object(self.model[0], "_load_from_state_dict",
+                               side_effect=mutate_loader_input):
+            self.load()
+        self.assert_model_equal(expected)
+
+    def test_version_metadata_and_tensors_restore_after_application_fault(self):
+        self.save()
+        for primary in (RuntimeError("apply fault"), KeyboardInterrupt("apply fault")):
+            with self.subTest(primary=type(primary).__name__):
+                with torch.no_grad():
+                    self.model[0].weight.add_(7)
+                self.model[0].metadata_state["history"][0].add_(5)
+                entry = copy.deepcopy(self.model.state_dict())
+                native_load = self.model.load_state_dict
+                calls = []
+
+                def fault_once(state, **kwargs):
+                    calls.append(copy.deepcopy(getattr(state, "_metadata", None)))
+                    result = native_load(state, **kwargs)
+                    # Poison the supplied copy after native loading. Rollback
+                    # must have its own independent metadata and tensor snapshot.
+                    state._metadata["0"]["payload"]["history"][0].add_(99)
+                    if len(calls) == 1:
+                        raise primary
+                    return result
+
+                with mock.patch.object(self.model, "load_state_dict", side_effect=fault_once):
+                    with self.assertRaises(type(primary)) as caught:
+                        self.load()
+                self.assertIs(caught.exception, primary)
+                self.assertEqual(len(calls), 2)
+                self.assert_state_equal(calls[1], entry._metadata)
+                self.assert_model_equal(entry)
+
+    def test_metadata_silent_corruption_is_detected_and_rolled_back(self):
+        self.save()
+        self.model[0].metadata_state["label"] = "entry"
+        entry = copy.deepcopy(self.model.state_dict())
+        native_load = self.model.load_state_dict
+        calls = 0
+
+        def corrupt_once(state, **kwargs):
+            nonlocal calls
+            result = native_load(state, **kwargs)
+            calls += 1
+            if calls == 1:
+                self.model[0].metadata_state["label"] = "corrupt"
+            return result
+
+        with mock.patch.object(self.model, "load_state_dict", side_effect=corrupt_once):
+            with self.assertRaisesRegex(CLEVRCheckpointError, "state values disagree"):
+                self.load()
+        self.assert_model_equal(entry)
+
+    def test_metadata_schema_and_attribute_validation_before_mutation(self):
+        self.save()
+        payload = torch.load(self.path, map_location="cpu", weights_only=True)
+        # Construct expected native metadata even on the pre-fix implementation.
+        payload["model_state"]._metadata = copy.deepcopy(self.model.state_dict()._metadata)
+        entry = copy.deepcopy(self.model.state_dict())
+        for defect in ("missing", "wrong_type", "nested_type", "extra_attribute"):
+            with self.subTest(defect=defect):
+                bad = copy.deepcopy(payload)
+                state = bad["model_state"]
+                if defect == "missing":
+                    del state._metadata
+                elif defect == "wrong_type":
+                    state._metadata = []
+                elif defect == "nested_type":
+                    state._metadata["0"]["version"] = "2"
+                else:
+                    state.unrecognized = "not a state-dict attribute"
+                torch.save(bad, self.path)
+                with mock.patch.object(self.model, "load_state_dict",
+                                       side_effect=AssertionError("live mutation reached")) as loader:
+                    with self.assertRaises(CLEVRCheckpointError):
+                        self.load()
+                    loader.assert_not_called()
+                self.assert_model_equal(entry)
+        for defect in ("unsupported_metadata", "extra_attribute"):
+            with self.subTest(save_defect=defect):
+                state = copy.deepcopy(entry)
+                if defect == "unsupported_metadata":
+                    state._metadata["0"]["unsupported"] = object()
+                else:
+                    state.unrecognized = "forbidden"
+                with mock.patch.object(self.model, "state_dict", return_value=state), \
+                     mock.patch.object(checkpoint_module.tempfile, "mkstemp",
+                                       side_effect=AssertionError("staging reached")):
+                    self.path.unlink(missing_ok=True)
+                    with self.assertRaises(CLEVRCheckpointError):
+                        self.save()
+
+    def assert_empty_optimizer_round_trip(self, mixed):
+        # Use an ordinary model so I2 fails independently of metadata-aware loading.
+        self.model[0] = nn.Linear(3, 2)
+        named = list(self.model.named_parameters())
+        self.optimizer = AdamW([dict(params=[p for _, p in named],
+                                    param_names=[n for n, _ in named], group_name="all")])
+        self.scheduler = LambdaLR(self.optimizer, lambda _: 1.0)
+        self.live.update(optimizer=self.optimizer, scheduler=self.scheduler)
+        if mixed:
+            self.materialize_optimizer()
+            del self.optimizer.state[named[0][1]]
+            self.scheduler.last_epoch = 1
+            self.scheduler._step_count = 2
+            self.sampler.commit(self.sampler.preview(128))
+        self.assertEqual(self.optimizer.state[named[0][1]], {})
+        expected = copy.deepcopy(self.optimizer.state_dict())
+        self.optimizer.load_state_dict(copy.deepcopy(expected))  # native control
+        self.assert_state_equal(self.optimizer.state_dict(), expected)
+        self.save(k=int(mixed))
+        self.materialize_optimizer()
+        self.assertTrue(all(self.optimizer.state.values()))
+        self.load()
+        self.assert_state_equal(self.optimizer.state_dict(), expected)
+        self.assertIn(0, self.optimizer.state_dict()["state"])
+        self.assertEqual(self.optimizer.state_dict()["state"][0], {})
+
+    def test_zero_update_empty_optimizer_entry_round_trip(self):
+        self.assert_empty_optimizer_round_trip(mixed=False)
+
+    def test_mixed_empty_materialized_optimizer_entries_round_trip(self):
+        self.assert_empty_optimizer_round_trip(mixed=True)
+
+    def test_writer_or_flush_primary_survives_close_failure(self):
+        real_fdopen = os.fdopen
+        real_save = torch.save
+        for phase in ("writer", "flush", "flush_after_save"):
+            for error_type in (OSError, KeyboardInterrupt):
+                with self.subTest(phase=phase, primary=error_type.__name__):
+                    primary = error_type(f"{phase} primary")
+                    cleanup = OSError("close secondary")
+                    descriptors = []
+
+                    def fdopen(descriptor, mode):
+                        descriptors.append(descriptor)
+                        return _FileProxy(real_fdopen(descriptor, mode),
+                                          flush_error=primary if phase != "writer" else None,
+                                          close_error=cleanup)
+
+                    with ExitStack() as stack:
+                        stack.enter_context(mock.patch.object(checkpoint_module.os, "fdopen",
+                                                              side_effect=fdopen))
+                        if phase == "writer":
+                            stack.enter_context(mock.patch.object(checkpoint_module.torch, "save",
+                                                                  side_effect=primary))
+                        elif phase == "flush_after_save":
+                            stack.enter_context(mock.patch.object(
+                                checkpoint_module.torch, "save",
+                                side_effect=lambda payload, output: real_save(payload, output.wrapped),
+                            ))
+                        with self.assertRaises(CLEVRCheckpointPublicationError) as caught:
+                            self.save()
+                    self.assertFalse(caught.exception.committed)
+                    self.assertIs(caught.exception.__cause__, primary)
+                    self.assertTrue(any("descriptor close" in note and "close secondary" in note
+                                        for note in caught.exception.__notes__))
+                    self.assertFalse(self.path.exists())
+                    self.assertEqual(list(self.path.parent.iterdir()), [])
+                    for descriptor in descriptors:
+                        with self.assertRaises(OSError):
+                            os.fstat(descriptor)
 
 
 class _ForbiddenCUDA:

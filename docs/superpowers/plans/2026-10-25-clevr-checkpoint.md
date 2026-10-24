@@ -260,4 +260,3 @@ Expected diff contains only the checkpoint design, plan, module, and test file. 
 - [ ] **Step 4: Push and create the real stacked PR when possible**
 
 Push `feat/clevr-checkpoint`; create a non-draft PR with base `feat/clevr-paired-sampler`. PR body includes: trigger; state-vector and complete-boundary equation; official/local library evidence and licenses; exact changes; TDD/review/test evidence; CPU-only/CUDA-unverified status; hard-link/no-fsync/SIGKILL/DoS/cross-version limits; and explicit later-runner integration gates. Verify remote/local head equality and PR state/base/head. Do not merge, tag, or claim CI. If the PR interface remains unavailable, retain the pushed branch and exact stacked compare URL and continue under the user's skip-blocker instruction.
-

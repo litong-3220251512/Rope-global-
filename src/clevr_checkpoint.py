@@ -313,6 +313,8 @@ def _validate_state_schema(value: object, reference: object, field: str) -> None
     elif isinstance(reference, Mapping):
         if set(value) != set(reference):
             raise CLEVRCheckpointError(f"{field}: invalid fields")
+        if type(reference) is OrderedDict:
+            _validate_state_schema(vars(value), vars(reference), f"{field} attributes")
         for key in reference:
             _validate_state_schema(value[key], reference[key], f"{field}.{key}")
     elif type(reference) in (list, tuple):
@@ -353,6 +355,8 @@ def _validate_load_optimizer(
     if type(states) is not dict or not set(states).issubset(templates):
         raise CLEVRCheckpointError("optimizer state parameter identifiers disagree")
     for identifier, state in states.items():
+        if type(state) is dict and not state:
+            continue  # Public defaultdict access can create unmaterialized state.
         _validate_state_schema(state, templates[identifier], f"optimizer state {identifier}")
     return saved["param_groups"]
 
@@ -421,6 +425,8 @@ def _require_state_equal(actual: object, expected: object, field: str) -> None:
     elif isinstance(expected, Mapping):
         if set(actual) != set(expected):
             raise CLEVRCheckpointError(f"{field}: state fields disagree")
+        if type(expected) is OrderedDict:
+            _require_state_equal(vars(actual), vars(expected), f"{field} attributes")
         for key in expected:
             _require_state_equal(actual[key], expected[key], f"{field}.{key}")
         return
@@ -704,10 +710,17 @@ def _snapshot_value(value: object, field: str) -> object:
     if type(value) is torch.Tensor:
         return value.detach().cpu().clone()
     if type(value) is OrderedDict:
-        return OrderedDict(
+        if set(vars(value)) - {"_metadata"}:
+            raise CLEVRCheckpointError(f"{field} contains unsupported OrderedDict attributes")
+        result = OrderedDict(
             (_snapshot_key(key, field), _snapshot_value(item, field))
             for key, item in value.items()
         )
+        if "_metadata" in vars(value):
+            if type(value._metadata) not in (dict, OrderedDict):
+                raise CLEVRCheckpointError(f"{field}._metadata must be a mapping")
+            result._metadata = _snapshot_value(value._metadata, f"{field}._metadata")
+        return result
     if type(value) is dict:
         return {
             _snapshot_key(key, field): _snapshot_value(item, field)
@@ -828,9 +841,11 @@ def _publish_new_file(
         os.fchmod(descriptor, 0o600)
         output = os.fdopen(descriptor, "wb")
         descriptor = None
-        with output:
-            torch.save(payload, output)
-            output.flush()
+        # Capture writer/flush failures in the outer handler before closing;
+        # a simultaneous close failure belongs to cleanup, not the primary.
+        torch.save(payload, output)
+        output.flush()
+        output.close()
         staging_stat = os.stat(staging, follow_symlinks=False)
         if not stat.S_ISREG(staging_stat.st_mode):
             raise CLEVRCheckpointError("checkpoint staging path is not a regular file")
