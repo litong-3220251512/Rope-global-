@@ -7,10 +7,12 @@ import pickle
 import shutil
 import tempfile
 import unittest
+from dataclasses import FrozenInstanceError, astuple, fields
 from pathlib import Path
 from unittest import mock
 
 import torch
+import src.clevr_dataset as dataset_module
 from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision.transforms import InterpolationMode
@@ -128,6 +130,132 @@ class RuntimeDatasetFixture:
 
     def close(self) -> None:
         self.temporary.cleanup()
+
+
+class CLEVRSampleIdentityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = RuntimeDatasetFixture()
+        self.addCleanup(self.fixture.close)
+
+    def datasets(self, partition: str = "train"):
+        return (
+            CLEVRQuestionDataset(
+                data_root=self.fixture.data_root,
+                audit_dir=self.fixture.audit_dir,
+                partition=partition,
+            ),
+            CLEVRQuestionOnlyDataset(
+                audit_dir=self.fixture.audit_dir, partition=partition,
+            ),
+        )
+
+    def test_vocabulary_size_is_an_equal_plain_integer(self) -> None:
+        for dataset in self.datasets():
+            self.assertIs(type(dataset.vocab_size), int)
+            self.assertEqual(dataset.vocab_size, 6)
+
+    def test_identity_is_exact_frozen_projection_in_sorted_order(self) -> None:
+        self.assertTrue(hasattr(dataset_module, "CLEVRSampleIdentity"))
+        identity_type = dataset_module.CLEVRSampleIdentity
+        self.assertEqual(
+            tuple(field.name for field in fields(identity_type)),
+            ("partition", "official_split", "image_index", "image_filename",
+             "question_index", "source_position"),
+        )
+        # Same-image questions distinguish question ordering from manifest order;
+        # source positions deliberately differ from question IDs.
+        self.fixture.rows[2]["source_position"] = 90
+        self.fixture.rows.append(self.fixture._row(
+            "train", "train", 1, 9, 91, "There?", [1, 5, 2], 1, "left",
+        ))
+        self.fixture.write_artifacts()
+        expected = (
+            ("train", "train", 1, "CLEVR_train_000001.png", 9, 91),
+            ("train", "train", 1, "CLEVR_train_000001.png", 10, 90),
+            ("train", "train", 2, "CLEVR_train_000002.png", 20, 20),
+        )
+        rgb, question_only = self.datasets()
+        for index, values in enumerate(expected):
+            identity = rgb.sample_identity(index)
+            self.assertIsInstance(identity, identity_type)
+            self.assertEqual(astuple(identity), values)
+            self.assertEqual(identity, question_only.sample_identity(index))
+            self.assertIsNot(identity, rgb.sample_identity(index))
+            self.assertFalse(hasattr(identity, "__dict__"))
+            for field in fields(identity):
+                with self.subTest(index=index, field=field.name):
+                    with self.assertRaises(FrozenInstanceError):
+                        setattr(identity, field.name, "changed")
+                    with self.assertRaises(FrozenInstanceError):
+                        delattr(identity, field.name)
+            self.assertEqual(astuple(rgb.sample_identity(index)), values)
+
+    def test_identity_and_sample_share_tuple_index_semantics(self) -> None:
+        class Index:
+            def __index__(self):
+                return 1
+
+        for dataset in self.datasets():
+            for index, expected_index in ((-1, 1), (-2, 0), (False, 0),
+                                          (True, 1), (Index(), 1)):
+                with self.subTest(dataset=type(dataset).__name__, index=index):
+                    self.assertEqual(dataset.sample_identity(index),
+                                     dataset.sample_identity(expected_index))
+                    actual = dataset[index]
+                    expected = dataset[expected_index]
+                    self.assertEqual(set(actual), set(expected))
+                    for key in actual:
+                        self.assertTrue(torch.equal(actual[key], expected[key]))
+            for index, error_type in ((2, IndexError), (-3, IndexError),
+                                      (1.0, TypeError), ("0", TypeError),
+                                      (None, TypeError), (object(), TypeError)):
+                with self.subTest(dataset=type(dataset).__name__, index=index):
+                    with self.assertRaises(error_type) as identity_error:
+                        dataset.sample_identity(index)
+                    with self.assertRaises(error_type) as sample_error:
+                        dataset[index]
+                    self.assertEqual(str(identity_error.exception),
+                                     str(sample_error.exception))
+
+    def test_identity_never_resolves_or_opens_images(self) -> None:
+        datasets = self.datasets()
+        shutil.rmtree(self.fixture.data_root)
+        with (
+            mock.patch("src.clevr_dataset.Image.open",
+                       side_effect=AssertionError("identity opened an image")),
+            mock.patch("src.clevr_dataset._resolve_image_file",
+                       side_effect=AssertionError("identity resolved an image")),
+            mock.patch.object(Path, "resolve",
+                              side_effect=AssertionError("identity resolved a path")),
+        ):
+            for dataset in datasets:
+                self.assertEqual(astuple(dataset.sample_identity(0)),
+                                 ("train", "train", 1,
+                                  "CLEVR_train_000001.png", 10, 10))
+
+    def test_identity_access_keeps_exact_sample_and_collate_keys(self) -> None:
+        for dataset, collate, expected_keys in (
+            (self.datasets()[0], collate_clevr_questions,
+             {"image", "question_tokens", "question_length", "answer"}),
+            (self.datasets()[1], collate_clevr_question_only,
+             {"question_tokens", "question_length", "answer"}),
+        ):
+            samples = []
+            for index in range(len(dataset)):
+                dataset.sample_identity(index)
+                sample = dataset[index]
+                self.assertEqual(set(sample), expected_keys)
+                samples.append(sample)
+            self.assertEqual(set(collate(samples)), expected_keys)
+
+    def test_identity_preserves_each_partition_and_official_split(self) -> None:
+        for partition, values in (
+            ("dev", ("dev", "train", 3, "CLEVR_train_000003.png", 30, 30)),
+            ("base_test", ("base_test", "val", 0, "CLEVR_val_000000.png", 0, 0)),
+            ("confirmation", ("confirmation", "val", 1, "CLEVR_val_000001.png", 1, 1)),
+        ):
+            for dataset in self.datasets(partition):
+                self.assertEqual(astuple(dataset.sample_identity(0)), values)
 
 
 class RuntimeDatasetTests(unittest.TestCase):

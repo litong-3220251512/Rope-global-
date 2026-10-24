@@ -51,7 +51,22 @@ class CLEVRDatasetError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class CLEVRSampleIdentity:
+    """Audit-only provenance; never included in model samples or batches."""
+
+    partition: str
+    official_split: str
+    image_index: int
+    image_filename: str
+    question_index: int
+    source_position: int
+
+
+@dataclass(frozen=True, slots=True)
 class _RuntimeRecord:
+    partition: str
+    official_split: str
+    image_filename: str
     image_path: Path | None
     image_index: int
     question_index: int
@@ -244,6 +259,9 @@ def _parse_row(
         question_index,
         source_position,
         _RuntimeRecord(
+            partition=partition,
+            official_split=official_split,
+            image_filename=image_filename,
             image_path=image_path,
             image_index=image_index,
             question_index=question_index,
@@ -358,6 +376,7 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
             raise CLEVRDatasetError(f"unknown CLEVR partition: {partition!r}")
 
         vocabulary = _load_vocabulary(self.audit_dir / "vocabulary.json")
+        self.vocab_size = len(vocabulary.id_to_token)
         report_counts = _load_report_counts(self.audit_dir / "audit_report.json")
         self._records = _load_records(
             self.audit_dir / "selected_questions.jsonl",
@@ -369,6 +388,18 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
 
     def __len__(self) -> int:
         return len(self._records)
+
+    def sample_identity(self, index: int) -> CLEVRSampleIdentity:
+        """Project validated provenance without accessing the image filesystem."""
+        record = self._records[index]
+        return CLEVRSampleIdentity(
+            partition=record.partition,
+            official_split=record.official_split,
+            image_index=record.image_index,
+            image_filename=record.image_filename,
+            question_index=record.question_index,
+            source_position=record.source_position,
+        )
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         record = self._records[index]
@@ -437,6 +468,7 @@ class CLEVRQuestionOnlyDataset(Dataset[dict[str, Tensor]]):
             raise CLEVRDatasetError(f"unknown CLEVR partition: {partition!r}")
 
         vocabulary = _load_vocabulary(self.audit_dir / "vocabulary.json")
+        self.vocab_size = len(vocabulary.id_to_token)
         report_counts = _load_report_counts(self.audit_dir / "audit_report.json")
         self._records = _load_records(
             self.audit_dir / "selected_questions.jsonl",
@@ -448,6 +480,18 @@ class CLEVRQuestionOnlyDataset(Dataset[dict[str, Tensor]]):
 
     def __len__(self) -> int:
         return len(self._records)
+
+    def sample_identity(self, index: int) -> CLEVRSampleIdentity:
+        """Project validated provenance without accessing the image filesystem."""
+        record = self._records[index]
+        return CLEVRSampleIdentity(
+            partition=record.partition,
+            official_split=record.official_split,
+            image_index=record.image_index,
+            image_filename=record.image_filename,
+            question_index=record.question_index,
+            source_position=record.source_position,
+        )
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         record = self._records[index]
