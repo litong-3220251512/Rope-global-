@@ -2084,6 +2084,29 @@ class PublicationTests(unittest.TestCase):
             ).encode("utf-8") + b"\n",
         )
 
+    def test_publisher_canonicalizes_valid_bundle_run_rows(self) -> None:
+        # Mutation caught: assuming every valid direct bundle has loader-sorted rows.
+        bundle = self._build_bundle()
+        reversed_bundle = replace(
+            bundle,
+            runs=tuple(
+                replace(run, rows=tuple(reversed(run.rows)))
+                for run in bundle.runs
+            ),
+        )
+        output_dir = self.root / "direct-bundle-output"
+
+        clevr_reporting.publish_statistics_bundle(output_dir, reversed_bundle)
+
+        for method, seed in _FORMAL_RUN_KEYS:
+            rows = self._strict_jsonl(
+                output_dir / "predictions" / f"{method}_seed_{seed}.jsonl"
+            )
+            self.assertEqual(
+                tuple(row["question_index"] for row in rows),
+                (100, 101, 102, 103, 104, 105, 106, 107),
+            )
+
     def test_refuses_existing_file_directories_and_symlink_without_changes(self) -> None:
         # Mutation caught: overwriting or cleaning a target this invocation does not own.
         bundle = self._build_bundle()

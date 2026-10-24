@@ -1201,7 +1201,13 @@ def publish_statistics_bundle(
         ):
             _write_json_lines(
                 staging_dir / evidence.canonical_path,
-                tuple(_prediction_payload(run, row) for row in run.rows),
+                tuple(
+                    _prediction_payload(run, row)
+                    for row in sorted(
+                        run.rows,
+                        key=lambda item: item.question_index,
+                    )
+                ),
             )
         _write_json_document(
             staging_dir / "statistics_report.json",
