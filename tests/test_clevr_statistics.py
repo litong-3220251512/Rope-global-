@@ -4,15 +4,22 @@ import math
 import unittest
 from dataclasses import FrozenInstanceError
 
+import numpy as np
+
 from src.clevr_statistics import (
+    CLEVRStatistics,
     CellMetrics,
     ClassificationMetrics,
+    ClusterBootstrapSummary,
+    METHODS,
     PairedSummary,
     PredictionRow,
     RunMetrics,
     RunPredictions,
+    SEEDS,
     SeedSummary,
     TargetRow,
+    compute_clevr_statistics,
     evaluate_run,
     evaluate_train_majority,
     summarize_paired_differences,
@@ -115,6 +122,51 @@ def _targets_with_train_labels(labels: tuple[int, ...]) -> tuple[TargetRow, ...]
         target for target in _complete_targets() if target.partition == "base_test"
     )
     return train + base_test
+
+
+def _formal_runs(
+    targets: tuple[TargetRow, ...],
+    predictions: dict[str, dict[int, int]],
+) -> tuple[RunPredictions, ...]:
+    base_test = tuple(
+        target for target in targets if target.partition == "base_test"
+    )
+    return tuple(
+        RunPredictions(
+            method=method,
+            seed=seed,
+            rows=tuple(
+                PredictionRow(
+                    question_index=target.question_index,
+                    label=target.label,
+                    logits=(1.0, 0.0)
+                    if predictions[method][target.question_index] == 0
+                    else (0.0, 1.0),
+                )
+                for target in base_test
+            ),
+        )
+        for method in METHODS
+        for seed in SEEDS
+    )
+
+
+def _predictions_by_method(
+    targets: tuple[TargetRow, ...],
+    *,
+    g: dict[int, int] | None = None,
+    b: dict[int, int] | None = None,
+) -> dict[str, dict[int, int]]:
+    base_test = tuple(
+        target for target in targets if target.partition == "base_test"
+    )
+    labels = {target.question_index: target.label for target in base_test}
+    return {
+        "G": labels if g is None else g,
+        "B": {key: 1 - label for key, label in labels.items()} if b is None else b,
+        "M10": {key: 0 for key in labels},
+        "Q-only": {key: 0 for key in labels},
+    }
 
 
 class RecordContractTests(unittest.TestCase):
@@ -544,6 +596,147 @@ class SeedSummaryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "seed"):
             summarize_paired_differences("B-G", complete, incomplete)
+
+
+class FormalStatisticsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.targets = _targets_with_train_labels((0, 0, 1, 1))
+        self.runs = _formal_runs(
+            self.targets, _predictions_by_method(self.targets)
+        )
+
+    def test_builds_fixed_run_grid_method_summaries_and_paired_differences(self) -> None:
+        result = compute_clevr_statistics(self.targets, self.runs)
+
+        self.assertIsInstance(result, CLEVRStatistics)
+        self.assertEqual(len(result.run_metrics), 20)
+        self.assertEqual(
+            tuple((run.method, run.seed) for run in result.run_metrics),
+            tuple((method, seed) for method in METHODS for seed in SEEDS),
+        )
+        self.assertEqual(
+            tuple(summary.name for summary in result.method_summaries),
+            ("G accuracy", "B accuracy", "M10 accuracy", "Q-only accuracy"),
+        )
+        self.assertEqual(
+            tuple(summary.values for summary in result.method_summaries),
+            ((1.0,) * 5, (0.0,) * 5, (0.5,) * 5, (0.5,) * 5),
+        )
+        self.assertEqual(result.b_minus_g.values, (-1.0,) * 5)
+        self.assertEqual(result.m10_minus_g.values, (-0.5,) * 5)
+        self.assertEqual(result.train_majority.accuracy, 0.5)
+        with self.assertRaises(FrozenInstanceError):
+            result.run_metrics = ()
+
+    def test_rejects_missing_duplicate_extra_and_nonrun_grid_entries(self) -> None:
+        cases = (
+            (self.runs[:-1], "missing"),
+            (self.runs + (self.runs[0],), "duplicate"),
+            (self.runs + (object(),), "RunPredictions"),
+        )
+        for runs, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                compute_clevr_statistics(self.targets, runs)
+
+
+class ClusterBootstrapTests(unittest.TestCase):
+    def _unequal_image_fixture(
+        self,
+    ) -> tuple[tuple[TargetRow, ...], tuple[RunPredictions, ...]]:
+        targets = (
+            _target(
+                partition="train",
+                official_split="train",
+                image_index=1,
+                question_index=1,
+                label=0,
+            ),
+            _target(image_index=10, question_index=100, label=0),
+            _target(image_index=20, question_index=101, label=0),
+            _target(image_index=20, question_index=102, label=0),
+            _target(image_index=20, question_index=103, label=0),
+        )
+        g = {100: 0, 101: 1, 102: 1, 103: 1}
+        b = {100: 1, 101: 0, 102: 0, 103: 0}
+        runs = _formal_runs(
+            targets, _predictions_by_method(targets, g=g, b=b)
+        )
+        return targets, runs
+
+    def test_common_image_weights_preserve_all_questions_and_match_literals(self) -> None:
+        targets, runs = self._unequal_image_fixture()
+
+        result = compute_clevr_statistics(targets, runs)
+
+        self.assertIsInstance(result.bootstrap, ClusterBootstrapSummary)
+        self.assertEqual(result.bootstrap.seed, 31001)
+        self.assertEqual(result.bootstrap.draws, 2000)
+        self.assertEqual(result.bootstrap.quantile_method, "linear")
+        self.assertEqual(len(result.bootstrap.replicates), 2000)
+        self.assertEqual(result.bootstrap.replicates[:5], (1.0, 0.5, 1.0, 0.5, 1.0))
+        expected_interval = np.quantile(
+            np.asarray(result.bootstrap.replicates),
+            (0.025, 0.975),
+            method="linear",
+        )
+        self.assertEqual(
+            result.bootstrap.interval,
+            (float(expected_interval[0]), float(expected_interval[1])),
+        )
+        self.assertEqual(result.b_minus_g.mean, 0.5)
+        incorrect_equal_image_difference = ((0.0 + 1.0) / 2) - (
+            (1.0 + 0.0) / 2
+        )
+        self.assertEqual(incorrect_equal_image_difference, 0.0)
+        self.assertNotEqual(result.b_minus_g.mean, incorrect_equal_image_difference)
+
+    def test_single_image_makes_every_replicate_equal_the_main_difference(self) -> None:
+        targets = (
+            _target(
+                partition="train",
+                official_split="train",
+                image_index=1,
+                question_index=1,
+                label=0,
+            ),
+            _target(image_index=10, question_index=100, label=0),
+            _target(image_index=10, question_index=101, label=1),
+        )
+        g = {100: 0, 101: 1}
+        b = {100: 1, 101: 0}
+        runs = _formal_runs(
+            targets, _predictions_by_method(targets, g=g, b=b)
+        )
+
+        result = compute_clevr_statistics(targets, runs)
+
+        self.assertEqual(result.b_minus_g.mean, -1.0)
+        self.assertEqual(set(result.bootstrap.replicates), {-1.0})
+        self.assertEqual(result.bootstrap.interval, (-1.0, -1.0))
+
+    def test_all_input_reordering_is_invariant_and_global_rng_is_untouched(self) -> None:
+        targets, runs = self._unequal_image_fixture()
+        np.random.seed(8675309)
+        state_before = np.random.get_state()
+
+        forward = compute_clevr_statistics(targets, runs)
+        state_after_forward = np.random.get_state()
+        reversed_runs = tuple(
+            RunPredictions(run.method, run.seed, tuple(reversed(run.rows)))
+            for run in reversed(runs)
+        )
+        reversed_result = compute_clevr_statistics(
+            tuple(reversed(targets)), reversed_runs
+        )
+        state_after_reversed = np.random.get_state()
+
+        self.assertEqual(reversed_result, forward)
+        for observed in (state_after_forward, state_after_reversed):
+            self.assertEqual(observed[0], state_before[0])
+            self.assertTrue(np.array_equal(observed[1], state_before[1]))
+            self.assertEqual(observed[2:], state_before[2:])
 
 
 if __name__ == "__main__":

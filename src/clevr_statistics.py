@@ -9,12 +9,16 @@ from dataclasses import dataclass
 from numbers import Real
 
 import numpy as np
+from numpy.random import Generator, PCG64
 
 
 METHODS = ("G", "B", "M10", "Q-only")
 SEEDS = (101, 102, 103, 104, 105)
 RELATIONS = ("left", "right", "front", "behind")
 T4_975 = 2.7764451051977987
+BOOTSTRAP_SEED = 31001
+BOOTSTRAP_DRAWS = 2000
+BOOTSTRAP_QUANTILE_METHOD = "linear"
 
 
 def _require_nonnegative_int(value: object, field: str) -> int:
@@ -318,6 +322,106 @@ class PairedSummary:
             object.__setattr__(self, field, value)
 
 
+@dataclass(frozen=True, slots=True)
+class ClusterBootstrapSummary:
+    seed: int
+    draws: int
+    quantile_method: str
+    replicates: tuple[float, ...]
+    interval: tuple[float, float]
+
+    def __post_init__(self) -> None:
+        if type(self.seed) is not int or self.seed != BOOTSTRAP_SEED:
+            raise ValueError("bootstrap seed must be 31001")
+        if type(self.draws) is not int or self.draws != BOOTSTRAP_DRAWS:
+            raise ValueError("bootstrap draws must be 2000")
+        if self.quantile_method != BOOTSTRAP_QUANTILE_METHOD:
+            raise ValueError("bootstrap quantile method must be linear")
+        if not isinstance(self.replicates, tuple) or len(self.replicates) != self.draws:
+            raise ValueError("bootstrap replicates must be a 2000-value tuple")
+        normalized_replicates = tuple(
+            _require_finite_real(value, f"replicates[{index}]")
+            for index, value in enumerate(self.replicates)
+        )
+        if any(value < -1 or value > 1 for value in normalized_replicates):
+            raise ValueError("bootstrap B-G differences must lie in [-1, 1]")
+        if not isinstance(self.interval, tuple) or len(self.interval) != 2:
+            raise ValueError("bootstrap interval must be a two-value tuple")
+        normalized_interval = tuple(
+            _require_finite_real(value, f"bootstrap interval[{index}]")
+            for index, value in enumerate(self.interval)
+        )
+        expected = np.quantile(
+            np.asarray(normalized_replicates, dtype=np.float64),
+            (0.025, 0.975),
+            method=BOOTSTRAP_QUANTILE_METHOD,
+        )
+        expected_interval = (float(expected[0]), float(expected[1]))
+        if normalized_interval != expected_interval:
+            raise ValueError("bootstrap interval does not match its replicates")
+        object.__setattr__(self, "replicates", normalized_replicates)
+        object.__setattr__(self, "interval", normalized_interval)
+
+
+@dataclass(frozen=True, slots=True)
+class CLEVRStatistics:
+    run_metrics: tuple[RunMetrics, ...]
+    method_summaries: tuple[SeedSummary, ...]
+    b_minus_g: PairedSummary
+    m10_minus_g: PairedSummary
+    train_majority: ClassificationMetrics
+    bootstrap: ClusterBootstrapSummary
+
+    def __post_init__(self) -> None:
+        expected_keys = tuple((method, seed) for method in METHODS for seed in SEEDS)
+        if not isinstance(self.run_metrics, tuple) or tuple(
+            (run.method, run.seed)
+            for run in self.run_metrics
+            if isinstance(run, RunMetrics)
+        ) != expected_keys:
+            raise ValueError("run_metrics must contain the ordered formal run grid")
+        expected_names = tuple(f"{method} accuracy" for method in METHODS)
+        if not isinstance(self.method_summaries, tuple) or tuple(
+            summary.name
+            for summary in self.method_summaries
+            if isinstance(summary, SeedSummary)
+        ) != expected_names:
+            raise ValueError("method_summaries must contain the four ordered methods")
+        accuracy_by_key = {
+            (run.method, run.seed): run.metrics.accuracy for run in self.run_metrics
+        }
+        for method, summary in zip(
+            METHODS, self.method_summaries, strict=True
+        ):
+            expected_values = tuple(
+                accuracy_by_key[(method, seed)] for seed in SEEDS
+            )
+            if summary.values != expected_values:
+                raise ValueError("method summary values do not match run metrics")
+        if not isinstance(self.b_minus_g, PairedSummary) or self.b_minus_g.name != "B-G":
+            raise ValueError("b_minus_g must be the B-G paired summary")
+        if not isinstance(self.m10_minus_g, PairedSummary) or self.m10_minus_g.name != "M10-G":
+            raise ValueError("m10_minus_g must be the M10-G paired summary")
+        expected_b_g = tuple(
+            accuracy_by_key[("B", seed)] - accuracy_by_key[("G", seed)]
+            for seed in SEEDS
+        )
+        expected_m10_g = tuple(
+            accuracy_by_key[("M10", seed)] - accuracy_by_key[("G", seed)]
+            for seed in SEEDS
+        )
+        if self.b_minus_g.values != expected_b_g:
+            raise ValueError("B-G values do not match run metrics")
+        if self.m10_minus_g.values != expected_m10_g:
+            raise ValueError("M10-G values do not match run metrics")
+        if not isinstance(self.train_majority, ClassificationMetrics):
+            raise ValueError("train_majority must be ClassificationMetrics")
+        if self.train_majority.cross_entropy is not None:
+            raise ValueError("train_majority cross_entropy must be None")
+        if not isinstance(self.bootstrap, ClusterBootstrapSummary):
+            raise ValueError("bootstrap must be ClusterBootstrapSummary")
+
+
 def _validated_targets(
     targets: Sequence[TargetRow],
 ) -> tuple[tuple[TargetRow, ...], tuple[TargetRow, ...]]:
@@ -518,3 +622,119 @@ def summarize_paired_differences(
     )
     mean, sample_sd, interval = _summary_numbers(differences)
     return PairedSummary(name, SEEDS, differences, mean, sample_sd, interval)
+
+
+def _validated_formal_runs(
+    runs: Sequence[RunPredictions],
+) -> tuple[RunPredictions, ...]:
+    if not isinstance(runs, Sequence):
+        raise ValueError("runs must be a sequence of RunPredictions")
+    by_key: dict[tuple[str, int], RunPredictions] = {}
+    for run in runs:
+        if not isinstance(run, RunPredictions):
+            raise ValueError("runs must contain RunPredictions records")
+        key = (run.method, run.seed)
+        if key in by_key:
+            raise ValueError(f"duplicate formal run: {key}")
+        by_key[key] = run
+    expected_keys = tuple((method, seed) for method in METHODS for seed in SEEDS)
+    missing = tuple(key for key in expected_keys if key not in by_key)
+    if missing:
+        raise ValueError(f"missing formal runs: {missing}")
+    if len(by_key) != len(expected_keys):
+        extra = tuple(key for key in by_key if key not in set(expected_keys))
+        raise ValueError(f"extra formal runs: {extra}")
+    return tuple(by_key[key] for key in expected_keys)
+
+
+def _cluster_bootstrap(
+    base_test: tuple[TargetRow, ...],
+    runs_by_key: Mapping[tuple[str, int], RunPredictions],
+) -> ClusterBootstrapSummary:
+    image_keys = tuple(
+        sorted({(target.image_index, target.image_filename) for target in base_test})
+    )
+    image_positions = {key: index for index, key in enumerate(image_keys)}
+    question_counts = np.zeros(len(image_keys), dtype=np.int64)
+    target_by_id = {target.question_index: target for target in base_test}
+    for target in base_test:
+        question_counts[
+            image_positions[(target.image_index, target.image_filename)]
+        ] += 1
+
+    correct_by_method = {
+        method: np.zeros((len(SEEDS), len(image_keys)), dtype=np.int64)
+        for method in ("G", "B")
+    }
+    for method in ("G", "B"):
+        for seed_position, seed in enumerate(SEEDS):
+            run = runs_by_key[(method, seed)]
+            for prediction in run.rows:
+                target = target_by_id[prediction.question_index]
+                predicted = int(prediction.logits[1] > prediction.logits[0])
+                correct_by_method[method][
+                    seed_position,
+                    image_positions[(target.image_index, target.image_filename)],
+                ] += int(predicted == target.label)
+
+    image_count = len(image_keys)
+    probabilities = np.full(image_count, 1.0 / image_count, dtype=np.float64)
+    weights = Generator(PCG64(BOOTSTRAP_SEED)).multinomial(
+        image_count,
+        probabilities,
+        size=BOOTSTRAP_DRAWS,
+    )
+    denominators = weights @ question_counts
+    g_accuracy = (weights @ correct_by_method["G"].T) / denominators[:, None]
+    b_accuracy = (weights @ correct_by_method["B"].T) / denominators[:, None]
+    replicate_array = np.mean(b_accuracy - g_accuracy, axis=1)
+    replicates = tuple(float(value) for value in replicate_array)
+    quantiles = np.quantile(
+        replicate_array,
+        (0.025, 0.975),
+        method=BOOTSTRAP_QUANTILE_METHOD,
+    )
+    return ClusterBootstrapSummary(
+        seed=BOOTSTRAP_SEED,
+        draws=BOOTSTRAP_DRAWS,
+        quantile_method=BOOTSTRAP_QUANTILE_METHOD,
+        replicates=replicates,
+        interval=(float(quantiles[0]), float(quantiles[1])),
+    )
+
+
+def compute_clevr_statistics(
+    targets: Sequence[TargetRow],
+    runs: Sequence[RunPredictions],
+) -> CLEVRStatistics:
+    """Compute the complete frozen PUB-R1.1 formal statistics object."""
+    _, base_test = _validated_targets(targets)
+    ordered_runs = _validated_formal_runs(runs)
+    run_metrics = tuple(evaluate_run(targets, run) for run in ordered_runs)
+    accuracy_by_method = {
+        method: {
+            run.seed: metric.metrics.accuracy
+            for run, metric in zip(ordered_runs, run_metrics, strict=True)
+            if run.method == method
+        }
+        for method in METHODS
+    }
+    method_summaries = tuple(
+        summarize_seed_values(
+            f"{method} accuracy", accuracy_by_method[method]
+        )
+        for method in METHODS
+    )
+    runs_by_key = {(run.method, run.seed): run for run in ordered_runs}
+    return CLEVRStatistics(
+        run_metrics=run_metrics,
+        method_summaries=method_summaries,
+        b_minus_g=summarize_paired_differences(
+            "B-G", accuracy_by_method["B"], accuracy_by_method["G"]
+        ),
+        m10_minus_g=summarize_paired_differences(
+            "M10-G", accuracy_by_method["M10"], accuracy_by_method["G"]
+        ),
+        train_majority=evaluate_train_majority(targets),
+        bootstrap=_cluster_bootstrap(base_test, runs_by_key),
+    )
