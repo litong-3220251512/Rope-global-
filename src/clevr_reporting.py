@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import stat
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import metadata
@@ -83,6 +85,21 @@ _PREDICTION_KEYS = (
 
 class CLEVRReportError(ValueError):
     """A reporting input violates the frozen file contract."""
+
+
+class ReportPublicationError(CLEVRReportError):
+    """A publication cleanup failed, with explicit rename commit status.
+
+    The lock protects cooperating publishers. A noncooperating process that
+    creates the target between the final check and POSIX rename is outside
+    this guarantee.
+    """
+
+    def __init__(self, message: str, *, committed: bool) -> None:
+        if type(committed) is not bool:
+            raise ValueError("committed must be a bool")
+        super().__init__(message)
+        self.committed = committed
 
 
 def _require_nonnegative_int(value: object, field: str) -> int:
@@ -1066,3 +1083,173 @@ def statistics_report_payload(report: StatisticsReport) -> dict[str, object]:
         ],
         "statistics": _statistics_payload(report.statistics),
     }
+
+
+def _target_payload(target: TargetRow) -> dict[str, object]:
+    return {
+        "partition": target.partition,
+        "official_split": target.official_split,
+        "image_index": target.image_index,
+        "image_filename": target.image_filename,
+        "question_index": target.question_index,
+        "relation": target.relation,
+        "label": target.label,
+    }
+
+
+def _prediction_payload(
+    run: RunPredictions,
+    row: PredictionRow,
+) -> dict[str, object]:
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "method": run.method,
+        "seed": run.seed,
+        "question_index": row.question_index,
+        "label": row.label,
+        "logits": list(row.logits),
+    }
+
+
+def _write_json_lines(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as output_file:
+        for row in rows:
+            json.dump(
+                row,
+                output_file,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            output_file.write("\n")
+
+
+def _write_json_document(path: Path, payload: dict[str, object]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as output_file:
+        json.dump(
+            payload,
+            output_file,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+            indent=2,
+        )
+        output_file.write("\n")
+
+
+def publish_statistics_bundle(
+    output_dir: Path,
+    bundle: StatisticsBundle,
+) -> None:
+    """Atomically publish canonical files to one new output directory."""
+    if not isinstance(output_dir, Path):
+        raise CLEVRReportError("output_dir must be a pathlib.Path")
+    if not isinstance(bundle, StatisticsBundle):
+        raise CLEVRReportError("bundle must be a StatisticsBundle")
+
+    try:
+        absolute_output = output_dir.expanduser().absolute()
+        resolved_output = absolute_output.parent.resolve() / absolute_output.name
+    except (OSError, RuntimeError) as exc:
+        raise CLEVRReportError(
+            f"cannot resolve output directory {output_dir}: {exc}"
+        ) from exc
+
+    if resolved_output.exists() or resolved_output.is_symlink():
+        raise CLEVRReportError(
+            f"output directory already exists or is a symlink: {resolved_output}"
+        )
+    try:
+        resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CLEVRReportError(
+            f"cannot create output parent {resolved_output.parent}: {exc}"
+        ) from exc
+
+    lock_path = resolved_output.parent / f".{resolved_output.name}.lock"
+    try:
+        lock_fd = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except OSError as exc:
+        raise CLEVRReportError(
+            f"cannot acquire publication lock {lock_path}: {exc}"
+        ) from exc
+
+    committed = False
+    staging_dir: Path | None = None
+    try:
+        os.close(lock_fd)
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f".{resolved_output.name}.staging-",
+                dir=resolved_output.parent,
+            )
+        )
+        prediction_dir = staging_dir / "predictions"
+        prediction_dir.mkdir()
+        _write_json_lines(
+            staging_dir / bundle.report.targets_path,
+            tuple(_target_payload(target) for target in bundle.targets),
+        )
+        for run, evidence in zip(
+            bundle.runs,
+            bundle.report.predictions,
+            strict=True,
+        ):
+            _write_json_lines(
+                staging_dir / evidence.canonical_path,
+                tuple(_prediction_payload(run, row) for row in run.rows),
+            )
+        _write_json_document(
+            staging_dir / "statistics_report.json",
+            statistics_report_payload(bundle.report),
+        )
+        if resolved_output.exists() or resolved_output.is_symlink():
+            raise CLEVRReportError(
+                "output directory appeared after publication lock acquisition: "
+                f"{resolved_output}"
+            )
+        os.rename(staging_dir, resolved_output)
+        committed = True
+        staging_dir = None
+    except Exception as primary_error:
+        staging_cleanup_error: OSError | None = None
+        if staging_dir is not None:
+            try:
+                shutil.rmtree(staging_dir)
+            except OSError as exc:
+                staging_cleanup_error = exc
+        try:
+            lock_path.unlink()
+        except OSError as cleanup_error:
+            cleanup_details = f"unable to remove publication lock: {cleanup_error}"
+            if staging_cleanup_error is not None:
+                cleanup_details += (
+                    "; unable to remove publication staging directory: "
+                    f"{staging_cleanup_error}"
+                )
+            raise ReportPublicationError(
+                "statistics bundle not committed after publication failed: "
+                f"{primary_error}; {cleanup_details}",
+                committed=False,
+            ) from cleanup_error
+        if staging_cleanup_error is not None:
+            raise ReportPublicationError(
+                "statistics bundle not committed after publication failed: "
+                f"{primary_error}; unable to remove publication staging directory: "
+                f"{staging_cleanup_error}",
+                committed=False,
+            ) from staging_cleanup_error
+        raise
+
+    try:
+        lock_path.unlink()
+    except OSError as cleanup_error:
+        raise ReportPublicationError(
+            "statistics bundle committed, but unable to remove publication lock: "
+            f"{cleanup_error}",
+            committed=committed,
+        ) from cleanup_error

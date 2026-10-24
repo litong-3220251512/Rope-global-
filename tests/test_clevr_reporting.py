@@ -5,11 +5,15 @@ import importlib.metadata
 import json
 import math
 import platform
+import stat
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from unittest import mock
 
+import src.clevr_reporting as clevr_reporting
+from run_clevr_statistics import main as statistics_cli_main
 from src.clevr_reporting import (
     ArtifactEvidence,
     CLEVRReportError,
@@ -22,9 +26,15 @@ from src.clevr_reporting import (
     build_statistics_bundle,
     load_audit_targets,
     load_prediction_run,
+    publish_statistics_bundle,
     statistics_report_payload,
 )
-from src.clevr_statistics import PredictionRow, RunPredictions, TargetRow
+from src.clevr_statistics import (
+    PredictionRow,
+    RunPredictions,
+    TargetRow,
+    compute_clevr_statistics,
+)
 
 
 _IMAGE_PARTITIONS = {
@@ -1563,6 +1573,716 @@ class StatisticsBundleTests(unittest.TestCase):
             bundle.runs[0].rows,
             bundle.runs[5].rows,
         )
+
+
+class PublicationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.audit_dir = self.root / "audit"
+        self.prediction_dir = self.root / "inputs"
+        self.audit_dir.mkdir()
+        self.prediction_dir.mkdir()
+        self._write_inputs(
+            self.audit_dir,
+            self.prediction_dir,
+            reverse_rows=False,
+        )
+
+    @staticmethod
+    def _write_inputs(
+        audit_dir: Path,
+        prediction_dir: Path,
+        *,
+        reverse_rows: bool,
+    ) -> None:
+        manifest_rows = copy.deepcopy(list(_REPORTING_MANIFEST_ROWS))
+        prediction_rows = copy.deepcopy(list(_BALANCED_PREDICTION_ROWS))
+        if reverse_rows:
+            manifest_rows.reverse()
+            prediction_rows.reverse()
+        (audit_dir / "image_partitions.json").write_text(
+            json.dumps(_IMAGE_PARTITIONS, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        (audit_dir / "selected_questions.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in manifest_rows),
+            encoding="utf-8",
+        )
+        (audit_dir / "audit_report.json").write_text(
+            json.dumps(_REPORTING_AUDIT_REPORT, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        for method, seed in _FORMAL_RUN_KEYS:
+            rows = [
+                {
+                    "protocol_version": "PUB-R1.1",
+                    "method": method,
+                    "seed": seed,
+                    "question_index": row["question_index"],
+                    "label": row["label"],
+                    "logits": row["logits"],
+                }
+                for row in prediction_rows
+            ]
+            (prediction_dir / f"input-{method}-{seed}.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+    @staticmethod
+    def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    @classmethod
+    def _strict_json(cls, text: str) -> object:
+        return json.loads(
+            text,
+            object_pairs_hook=cls._strict_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"nonstandard constant {value}")
+            ),
+        )
+
+    @classmethod
+    def _strict_jsonl(cls, path: Path) -> list[dict[str, object]]:
+        raw = path.read_bytes()
+        if not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+            raise AssertionError(f"{path} must have one terminal newline")
+        rows = [cls._strict_json(line) for line in raw.decode("utf-8").splitlines()]
+        if any(type(row) is not dict for row in rows):
+            raise AssertionError(f"{path} must contain only JSON objects")
+        return rows  # type: ignore[return-value]
+
+    @staticmethod
+    def _prediction_paths(prediction_dir: Path) -> list[Path]:
+        return [
+            prediction_dir / f"input-{method}-{seed}.jsonl"
+            for method, seed in _FORMAL_RUN_KEYS
+        ]
+
+    def _build_bundle(self) -> StatisticsBundle:
+        return build_statistics_bundle(
+            self.audit_dir,
+            tuple(
+                PredictionSource(path)
+                for path in self._prediction_paths(self.prediction_dir)
+            ),
+        )
+
+    @staticmethod
+    def _lock_path(output_dir: Path) -> Path:
+        return output_dir.parent / f".{output_dir.name}.lock"
+
+    @staticmethod
+    def _staging_paths(output_dir: Path) -> list[Path]:
+        return list(output_dir.parent.glob(f".{output_dir.name}.staging-*"))
+
+    def _assert_complete_output(self, output_dir: Path) -> None:
+        self.assertEqual(
+            {path.name for path in output_dir.iterdir()},
+            {"statistics_report.json", "targets.jsonl", "predictions"},
+        )
+        self.assertEqual(len(self._strict_jsonl(output_dir / "targets.jsonl")), 10)
+        prediction_dir = output_dir / "predictions"
+        self.assertEqual(
+            {path.name for path in prediction_dir.iterdir()},
+            {
+                f"{method}_seed_{seed}.jsonl"
+                for method, seed in _FORMAL_RUN_KEYS
+            },
+        )
+        for path in prediction_dir.iterdir():
+            self.assertEqual(len(self._strict_jsonl(path)), 8)
+        report = self._strict_json(
+            (output_dir / "statistics_report.json").read_text(encoding="utf-8")
+        )
+        self.assertIsInstance(report, dict)
+        self.assertEqual(len(report["predictions"]), 20)  # type: ignore[index]
+
+    @classmethod
+    def _cli_argv(
+        cls,
+        audit_dir: Path,
+        prediction_dir: Path,
+        output_dir: Path,
+        *,
+        reverse_sources: bool,
+    ) -> list[str]:
+        paths = cls._prediction_paths(prediction_dir)
+        if reverse_sources:
+            paths.reverse()
+        argv = ["--audit-dir", str(audit_dir)]
+        for path in paths:
+            argv.extend(("--prediction-file", str(path)))
+        argv.extend(("--output-dir", str(output_dir)))
+        return argv
+
+    @staticmethod
+    def _assert_no_null_or_digest_keys(test: unittest.TestCase, value: object) -> None:
+        digest_fragments = ("hash", "digest", "sha", "md5")
+
+        def visit(item: object) -> None:
+            test.assertIsNotNone(item)
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    test.assertFalse(
+                        any(fragment in key.lower() for fragment in digest_fragments),
+                        key,
+                    )
+                    visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+
+        visit(value)
+
+    @staticmethod
+    def _normalize_source_paths(payload: dict[str, object]) -> None:
+        for source in payload["audit_sources"]:  # type: ignore[union-attr]
+            source["path"] = f"/<audit>/{Path(source['path']).name}"
+        for source in payload["predictions"]:  # type: ignore[union-attr]
+            source["source_path"] = f"/<prediction>/{Path(source['source_path']).name}"
+
+    def test_cli_publishes_complete_recomputable_canonical_bundle(self) -> None:
+        # Mutation caught: incomplete/noncanonical output or CLI/input-order coupling.
+        output_dir = self.root / "published"
+        self.assertEqual(
+            statistics_cli_main(
+                self._cli_argv(
+                    self.audit_dir,
+                    self.prediction_dir,
+                    output_dir,
+                    reverse_sources=False,
+                )
+            ),
+            0,
+        )
+
+        self.assertEqual(
+            {path.name for path in output_dir.iterdir()},
+            {"statistics_report.json", "targets.jsonl", "predictions"},
+        )
+        prediction_output_dir = output_dir / "predictions"
+        expected_prediction_names = {
+            f"{method}_seed_{seed}.jsonl" for method, seed in _FORMAL_RUN_KEYS
+        }
+        self.assertTrue(prediction_output_dir.is_dir())
+        self.assertEqual(
+            {path.name for path in prediction_output_dir.iterdir()},
+            expected_prediction_names,
+        )
+
+        target_path = output_dir / "targets.jsonl"
+        target_payloads = self._strict_jsonl(target_path)
+        self._assert_no_null_or_digest_keys(self, target_payloads)
+        self.assertTrue(
+            all(
+                set(row)
+                == {
+                    "partition",
+                    "official_split",
+                    "image_index",
+                    "image_filename",
+                    "question_index",
+                    "relation",
+                    "label",
+                }
+                for row in target_payloads
+            )
+        )
+        self.assertEqual(
+            tuple(
+                (row["partition"], row["question_index"], row["label"])
+                for row in target_payloads
+            ),
+            (
+                ("train", 10, 0),
+                ("train", 20, 1),
+                ("base_test", 100, 0),
+                ("base_test", 101, 1),
+                ("base_test", 102, 0),
+                ("base_test", 103, 1),
+                ("base_test", 104, 0),
+                ("base_test", 105, 1),
+                ("base_test", 106, 0),
+                ("base_test", 107, 1),
+            ),
+        )
+
+        prediction_payloads: dict[tuple[str, int], list[dict[str, object]]] = {}
+        for method, seed in _FORMAL_RUN_KEYS:
+            path = prediction_output_dir / f"{method}_seed_{seed}.jsonl"
+            rows = self._strict_jsonl(path)
+            self._assert_no_null_or_digest_keys(self, rows)
+            self.assertTrue(
+                all(
+                    set(row)
+                    == {
+                        "protocol_version",
+                        "method",
+                        "seed",
+                        "question_index",
+                        "label",
+                        "logits",
+                    }
+                    for row in rows
+                )
+            )
+            self.assertEqual(
+                tuple(row["question_index"] for row in rows),
+                (100, 101, 102, 103, 104, 105, 106, 107),
+            )
+            self.assertTrue(
+                all(
+                    row["protocol_version"] == "PUB-R1.1"
+                    and row["method"] == method
+                    and row["seed"] == seed
+                    for row in rows
+                )
+            )
+            prediction_payloads[(method, seed)] = rows
+
+        report_path = output_dir / "statistics_report.json"
+        report_bytes = report_path.read_bytes()
+        self.assertTrue(report_bytes.endswith(b"\n"))
+        self.assertFalse(report_bytes.endswith(b"\n\n"))
+        report_payload = self._strict_json(report_bytes.decode("utf-8"))
+        self.assertIsInstance(report_payload, dict)
+        report_payload = report_payload  # type: ignore[assignment]
+        self._assert_no_null_or_digest_keys(self, report_payload)
+        self.assertEqual(
+            set(report_payload),
+            {
+                "protocol_version",
+                "report_schema_version",
+                "environment",
+                "audit_sources",
+                "targets_path",
+                "manifest_partition_counts",
+                "predictions",
+                "statistics",
+            },
+        )
+        self.assertEqual(report_payload["targets_path"], "targets.jsonl")
+        self.assertEqual(
+            tuple(
+                (
+                    source["path"],
+                    source["size_bytes"],
+                    source["record_count"],
+                )
+                for source in report_payload["audit_sources"]
+            ),
+            (
+                (
+                    str((self.audit_dir / "image_partitions.json").resolve()),
+                    (self.audit_dir / "image_partitions.json").stat().st_size,
+                    5,
+                ),
+                (
+                    str((self.audit_dir / "selected_questions.jsonl").resolve()),
+                    (self.audit_dir / "selected_questions.jsonl").stat().st_size,
+                    12,
+                ),
+                (
+                    str((self.audit_dir / "audit_report.json").resolve()),
+                    (self.audit_dir / "audit_report.json").stat().st_size,
+                    1,
+                ),
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                (
+                    source["method"],
+                    source["seed"],
+                    source["source_path"],
+                    source["size_bytes"],
+                    source["row_count"],
+                    source["canonical_path"],
+                )
+                for source in report_payload["predictions"]
+            ),
+            tuple(
+                (
+                    method,
+                    seed,
+                    str(
+                        (
+                            self.prediction_dir
+                            / f"input-{method}-{seed}.jsonl"
+                        ).resolve()
+                    ),
+                    (
+                        self.prediction_dir / f"input-{method}-{seed}.jsonl"
+                    ).stat().st_size,
+                    8,
+                    f"predictions/{method}_seed_{seed}.jsonl",
+                )
+                for method, seed in _FORMAL_RUN_KEYS
+            ),
+        )
+
+        targets = tuple(
+            TargetRow(
+                partition=row["partition"],
+                official_split=row["official_split"],
+                image_index=row["image_index"],
+                image_filename=row["image_filename"],
+                question_index=row["question_index"],
+                relation=row["relation"],
+                label=row["label"],
+            )
+            for row in target_payloads
+        )
+        runs = tuple(
+            RunPredictions(
+                method=method,
+                seed=seed,
+                rows=tuple(
+                    PredictionRow(
+                        question_index=row["question_index"],
+                        label=row["label"],
+                        logits=tuple(row["logits"]),
+                    )
+                    for row in prediction_payloads[(method, seed)]
+                ),
+            )
+            for method, seed in _FORMAL_RUN_KEYS
+        )
+        recomputed = compute_clevr_statistics(targets, runs)
+        published_statistics = report_payload["statistics"]
+        self.assertEqual(
+            tuple(
+                (
+                    item["method"],
+                    item["seed"],
+                    item["metrics"]["question_count"],
+                    item["metrics"]["correct_count"],
+                    item["metrics"]["accuracy"],
+                    item["metrics"]["macro_accuracy"],
+                )
+                for item in published_statistics["run_metrics"]
+            ),
+            tuple((method, seed, 8, 4, 0.5, 0.5) for method, seed in _FORMAL_RUN_KEYS),
+        )
+        for computed, published in zip(
+            recomputed.run_metrics,
+            published_statistics["run_metrics"],
+            strict=True,
+        ):
+            self.assertEqual(computed.method, published["method"])
+            self.assertEqual(computed.seed, published["seed"])
+            self.assertAlmostEqual(
+                published["metrics"]["cross_entropy"],
+                math.log(2.0),
+            )
+            self.assertEqual(
+                computed.metrics.cross_entropy,
+                published["metrics"]["cross_entropy"],
+            )
+            self.assertEqual(computed.metrics.accuracy, published["metrics"]["accuracy"])
+            self.assertEqual(
+                computed.metrics.macro_accuracy,
+                published["metrics"]["macro_accuracy"],
+            )
+            self.assertEqual(
+                tuple(
+                    (
+                        cell["relation"],
+                        cell["label"],
+                        cell["count"],
+                        cell["correct_count"],
+                        cell["accuracy"],
+                    )
+                    for cell in published["metrics"]["cells"]
+                ),
+                (
+                    ("left", 0, 1, 1, 1.0),
+                    ("left", 1, 1, 0, 0.0),
+                    ("right", 0, 1, 1, 1.0),
+                    ("right", 1, 1, 0, 0.0),
+                    ("front", 0, 1, 1, 1.0),
+                    ("front", 1, 1, 0, 0.0),
+                    ("behind", 0, 1, 1, 1.0),
+                    ("behind", 1, 1, 0, 0.0),
+                ),
+            )
+        self.assertEqual(
+            tuple(item["values"] for item in published_statistics["method_summaries"]),
+            ([0.5] * 5,) * 4,
+        )
+        self.assertEqual(published_statistics["b_minus_g"]["values"], [0.0] * 5)
+        self.assertEqual(published_statistics["m10_minus_g"]["values"], [0.0] * 5)
+        self.assertEqual(published_statistics["train_majority"]["cross_entropy"], "NA")
+        self.assertEqual(published_statistics["bootstrap"]["replicates"], [0.0] * 2000)
+        self.assertEqual(
+            list(recomputed.bootstrap.replicates),
+            published_statistics["bootstrap"]["replicates"],
+        )
+
+        reversed_audit = self.root / "audit-reversed"
+        reversed_predictions = self.root / "inputs-reversed"
+        reversed_audit.mkdir()
+        reversed_predictions.mkdir()
+        self._write_inputs(
+            reversed_audit,
+            reversed_predictions,
+            reverse_rows=True,
+        )
+        reversed_output = self.root / "published-reversed"
+        self.assertEqual(
+            statistics_cli_main(
+                self._cli_argv(
+                    reversed_audit,
+                    reversed_predictions,
+                    reversed_output,
+                    reverse_sources=True,
+                )
+            ),
+            0,
+        )
+
+        self.assertEqual(
+            target_path.read_bytes(),
+            (reversed_output / "targets.jsonl").read_bytes(),
+        )
+        for name in expected_prediction_names:
+            self.assertEqual(
+                (prediction_output_dir / name).read_bytes(),
+                (reversed_output / "predictions" / name).read_bytes(),
+            )
+        reversed_report = self._strict_json(
+            (reversed_output / "statistics_report.json").read_text(encoding="utf-8")
+        )
+        self.assertIsInstance(reversed_report, dict)
+        first_normalized = copy.deepcopy(report_payload)
+        second_normalized = copy.deepcopy(reversed_report)
+        self._normalize_source_paths(first_normalized)
+        self._normalize_source_paths(second_normalized)  # type: ignore[arg-type]
+        self.assertEqual(
+            json.dumps(
+                first_normalized,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+                indent=2,
+            ).encode("utf-8") + b"\n",
+            json.dumps(
+                second_normalized,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+                indent=2,
+            ).encode("utf-8") + b"\n",
+        )
+
+    def test_refuses_existing_file_directories_and_symlink_without_changes(self) -> None:
+        # Mutation caught: overwriting or cleaning a target this invocation does not own.
+        bundle = self._build_bundle()
+
+        existing_file = self.root / "existing-file"
+        existing_file.write_bytes(b"keep-file")
+        with self.assertRaises(CLEVRReportError):
+            clevr_reporting.publish_statistics_bundle(existing_file, bundle)
+        self.assertEqual(existing_file.read_bytes(), b"keep-file")
+        self.assertFalse(self._lock_path(existing_file).exists())
+        self.assertEqual(self._staging_paths(existing_file), [])
+
+        empty_dir = self.root / "existing-empty"
+        empty_dir.mkdir()
+        with self.assertRaises(CLEVRReportError):
+            clevr_reporting.publish_statistics_bundle(empty_dir, bundle)
+        self.assertEqual(list(empty_dir.iterdir()), [])
+        self.assertFalse(self._lock_path(empty_dir).exists())
+        self.assertEqual(self._staging_paths(empty_dir), [])
+
+        nonempty_dir = self.root / "existing-nonempty"
+        nonempty_dir.mkdir()
+        marker = nonempty_dir / "keep.txt"
+        marker.write_bytes(b"keep-directory")
+        with self.assertRaises(CLEVRReportError):
+            clevr_reporting.publish_statistics_bundle(nonempty_dir, bundle)
+        self.assertEqual(marker.read_bytes(), b"keep-directory")
+        self.assertFalse(self._lock_path(nonempty_dir).exists())
+        self.assertEqual(self._staging_paths(nonempty_dir), [])
+
+        symlink_target = self.root / "symlink-target"
+        symlink_target.mkdir()
+        symlink_marker = symlink_target / "keep.txt"
+        symlink_marker.write_bytes(b"keep-symlink-target")
+        output_symlink = self.root / "output-symlink"
+        output_symlink.symlink_to(symlink_target, target_is_directory=True)
+        with self.assertRaises(CLEVRReportError):
+            clevr_reporting.publish_statistics_bundle(output_symlink, bundle)
+        self.assertTrue(output_symlink.is_symlink())
+        self.assertEqual(symlink_marker.read_bytes(), b"keep-symlink-target")
+        self.assertFalse(self._lock_path(output_symlink).exists())
+        self.assertEqual(self._staging_paths(output_symlink), [])
+
+    def test_refuses_preexisting_lock_without_creating_output_or_staging(self) -> None:
+        # Mutation caught: ignoring another cooperating publisher's ownership marker.
+        output_dir = self.root / "locked-output"
+        lock_path = self._lock_path(output_dir)
+        lock_path.write_bytes(b"owned-by-another-publisher")
+
+        with self.assertRaises(CLEVRReportError):
+            clevr_reporting.publish_statistics_bundle(output_dir, self._build_bundle())
+
+        self.assertFalse(output_dir.exists())
+        self.assertEqual(lock_path.read_bytes(), b"owned-by-another-publisher")
+        self.assertEqual(self._staging_paths(output_dir), [])
+
+    def test_target_appearing_after_lock_is_preserved_and_aborts_commit(self) -> None:
+        # Mutation caught: replacing a noncooperating target seen at the final recheck.
+        output_dir = self.root / "late-output"
+        lock_path = self._lock_path(output_dir)
+        marker = output_dir / "keep.txt"
+        observed_lock_modes: list[int] = []
+        real_writer = clevr_reporting._write_json_lines
+        first_write = True
+
+        def create_late_target(path: Path, rows: object) -> None:
+            nonlocal first_write
+            if first_write:
+                first_write = False
+                observed_lock_modes.append(stat.S_IMODE(lock_path.stat().st_mode))
+                output_dir.mkdir()
+                marker.write_bytes(b"late-owner")
+            real_writer(path, rows)  # type: ignore[arg-type]
+
+        with mock.patch.object(
+            clevr_reporting,
+            "_write_json_lines",
+            side_effect=create_late_target,
+        ):
+            with self.assertRaises(CLEVRReportError):
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+
+        self.assertEqual(observed_lock_modes, [0o600])
+        self.assertEqual(marker.read_bytes(), b"late-owner")
+        self.assertFalse(lock_path.exists())
+        self.assertEqual(self._staging_paths(output_dir), [])
+
+    def test_precommit_writer_and_rename_failures_clean_owned_artifacts(self) -> None:
+        # Mutation caught: leaking partial final/staging/lock before the commit point.
+        bundle = self._build_bundle()
+
+        def fail_jsonl(path: Path, rows: object) -> None:
+            path.write_text("partial-jsonl\n", encoding="utf-8")
+            raise OSError("injected canonical JSONL failure")
+
+        output_dir = self.root / "jsonl-failure"
+        with mock.patch.object(
+            clevr_reporting,
+            "_write_json_lines",
+            side_effect=fail_jsonl,
+        ):
+            with self.assertRaisesRegex(OSError, "canonical JSONL"):
+                clevr_reporting.publish_statistics_bundle(output_dir, bundle)
+        self.assertFalse(output_dir.exists())
+        self.assertFalse(self._lock_path(output_dir).exists())
+        self.assertEqual(self._staging_paths(output_dir), [])
+
+        def fail_report(path: Path, payload: object) -> None:
+            path.write_text("{\"partial\": true}\n", encoding="utf-8")
+            raise OSError("injected report JSON failure")
+
+        output_dir = self.root / "report-failure"
+        with mock.patch.object(
+            clevr_reporting,
+            "_write_json_document",
+            side_effect=fail_report,
+        ):
+            with self.assertRaisesRegex(OSError, "report JSON"):
+                clevr_reporting.publish_statistics_bundle(output_dir, bundle)
+        self.assertFalse(output_dir.exists())
+        self.assertFalse(self._lock_path(output_dir).exists())
+        self.assertEqual(self._staging_paths(output_dir), [])
+
+        output_dir = self.root / "rename-failure"
+        with mock.patch.object(
+            clevr_reporting.os,
+            "rename",
+            side_effect=OSError("injected rename failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "rename"):
+                clevr_reporting.publish_statistics_bundle(output_dir, bundle)
+        self.assertFalse(output_dir.exists())
+        self.assertFalse(self._lock_path(output_dir).exists())
+        self.assertEqual(self._staging_paths(output_dir), [])
+
+    def test_lock_unlink_failure_before_commit_reports_not_committed(self) -> None:
+        # Mutation caught: losing the primary failure or misreporting pre-rename state.
+        output_dir = self.root / "precommit-unlink-failure"
+        lock_path = self._lock_path(output_dir)
+        real_unlink = Path.unlink
+
+        def fail_lock_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path == lock_path:
+                raise OSError("injected lock unlink failure")
+            real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        def fail_writer(path: Path, rows: object) -> None:
+            path.write_text("partial\n", encoding="utf-8")
+            raise OSError("injected writer failure")
+
+        with mock.patch.object(Path, "unlink", new=fail_lock_unlink), mock.patch.object(
+            clevr_reporting,
+            "_write_json_lines",
+            side_effect=fail_writer,
+        ):
+            with self.assertRaises(clevr_reporting.ReportPublicationError) as caught:
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+
+        self.assertIs(caught.exception.committed, False)
+        self.assertIn("not committed", str(caught.exception))
+        self.assertIn("writer failure", str(caught.exception))
+        self.assertIsNotNone(caught.exception.__cause__)
+        self.assertIn("lock unlink failure", str(caught.exception.__cause__))
+        self.assertFalse(output_dir.exists())
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertTrue(lock_path.is_file())
+
+    def test_lock_unlink_failure_after_commit_reports_committed_bundle(self) -> None:
+        # Mutation caught: rolling back a committed bundle or claiming it did not commit.
+        output_dir = self.root / "postcommit-unlink-failure"
+        lock_path = self._lock_path(output_dir)
+        real_unlink = Path.unlink
+
+        def fail_lock_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path == lock_path:
+                raise OSError("injected lock unlink failure")
+            real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        with mock.patch.object(Path, "unlink", new=fail_lock_unlink):
+            with self.assertRaises(clevr_reporting.ReportPublicationError) as caught:
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+
+        self.assertIs(caught.exception.committed, True)
+        self.assertIn("committed", str(caught.exception))
+        self.assertNotIn("not committed", str(caught.exception))
+        self.assertIsNotNone(caught.exception.__cause__)
+        self.assertIn("lock unlink failure", str(caught.exception.__cause__))
+        self._assert_complete_output(output_dir)
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertTrue(lock_path.is_file())
 
 
 if __name__ == "__main__":
