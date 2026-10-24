@@ -1150,7 +1150,7 @@ def _write_lock_token(lock_fd: int, token: bytes) -> None:
 def _unlink_owned_lock(
     lock_path: Path,
     lock_identity: tuple[int, int] | None,
-    lock_token: bytes,
+    lock_token: bytes | None,
 ) -> None:
     if lock_identity is None:
         raise OSError(
@@ -1164,17 +1164,38 @@ def _unlink_owned_lock(
         raise OSError(
             f"publication lock ownership cannot be verified for {lock_path}: {exc}"
         ) from exc
+    verification_error: BaseException | None = None
     try:
-        with os.fdopen(current_fd, "rb") as current_file:
-            current_stat = os.fstat(current_file.fileno())
-            current_token = current_file.read(len(lock_token) + 1)
-    except OSError as exc:
-        raise OSError(
-            f"publication lock ownership cannot be verified for {lock_path}: {exc}"
-        ) from exc
+        current_stat = os.fstat(current_fd)
+        current_token = (
+            os.read(current_fd, len(lock_token) + 1)
+            if lock_token is not None
+            else None
+        )
+    except BaseException as exc:
+        verification_error = exc
+    finally:
+        try:
+            os.close(current_fd)
+        except BaseException as close_error:
+            if verification_error is None:
+                raise
+            verification_error.add_note(
+                f"publication lock verification descriptor close also failed: "
+                f"{close_error}"
+            )
+    if verification_error is not None:
+        if isinstance(verification_error, OSError):
+            raise OSError(
+                "publication lock ownership cannot be verified for "
+                f"{lock_path}: {verification_error}"
+            ) from verification_error
+        raise verification_error
 
     current_identity = (current_stat.st_dev, current_stat.st_ino)
-    if current_identity != lock_identity or current_token != lock_token:
+    if current_identity != lock_identity or (
+        lock_token is not None and current_token != lock_token
+    ):
         raise OSError(
             "publication lock ownership changed; refusing to unlink "
             f"{lock_path}"
@@ -1198,7 +1219,7 @@ def _release_publication_lock(
     lock_path: Path,
     lock_fd: int,
     lock_identity: tuple[int, int] | None,
-    lock_token: bytes,
+    lock_token: bytes | None,
 ) -> None:
     cleanup_error: BaseException | None = None
     try:
@@ -1252,6 +1273,7 @@ def publish_statistics_bundle(
     committed = False
     staging_dir: Path | None = None
     lock_identity: tuple[int, int] | None = None
+    initialized_lock_token: bytes | None = None
     try:
         lock_fd = os.open(
             lock_path,
@@ -1267,6 +1289,7 @@ def publish_statistics_bundle(
         lock_stat = os.fstat(lock_fd)
         lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
         _write_lock_token(lock_fd, lock_token)
+        initialized_lock_token = lock_token
         staging_dir = Path(
             tempfile.mkdtemp(
                 prefix=f".{resolved_output.name}.staging-",
@@ -1318,7 +1341,7 @@ def publish_statistics_bundle(
                 lock_path,
                 lock_fd,
                 lock_identity,
-                lock_token,
+                initialized_lock_token,
             )
         except BaseException as cleanup_error:
             cleanup_details = f"unable to remove publication lock: {cleanup_error}"
@@ -1346,7 +1369,7 @@ def publish_statistics_bundle(
             lock_path,
             lock_fd,
             lock_identity,
-            lock_token,
+            initialized_lock_token,
         )
     except BaseException as cleanup_error:
         raise ReportPublicationError(

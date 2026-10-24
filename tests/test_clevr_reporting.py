@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import importlib.metadata
 import json
 import math
@@ -2270,6 +2271,89 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse(output_dir.exists())
         self.assertEqual(self._staging_paths(output_dir), [])
         self.assertFalse(self._lock_path(output_dir).exists())
+
+    def test_partial_lock_token_interrupt_cleans_identity_owned_lock(self) -> None:
+        # Mutation caught: requiring a complete token after token initialization failed.
+        output_dir = self.root / "partial-lock-token"
+        real_write = clevr_reporting.os.write
+        write_count = 0
+
+        def write_part_then_interrupt(fd: int, data: object) -> int:
+            nonlocal write_count
+            if write_count == 0:
+                write_count += 1
+                return real_write(fd, memoryview(data)[:7])  # type: ignore[arg-type]
+            raise KeyboardInterrupt("injected partial lock-token interrupt")
+
+        caught: BaseException | None = None
+        with mock.patch.object(
+            clevr_reporting.os,
+            "write",
+            side_effect=write_part_then_interrupt,
+        ):
+            try:
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+            except BaseException as exc:
+                caught = exc
+
+        self.assertIsInstance(caught, KeyboardInterrupt)
+        self.assertIn("partial lock-token interrupt", str(caught))
+        self.assertFalse(output_dir.exists())
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertFalse(self._lock_path(output_dir).exists())
+
+    def test_fdopen_failure_cannot_leak_verification_descriptor(self) -> None:
+        # Mutation caught: transferring descriptor ownership only after fdopen succeeds.
+        output_dir = self.root / "fdopen-construction-failure"
+        lock_path = self._lock_path(output_dir)
+        real_open = clevr_reporting.os.open
+        verification_fd: int | None = None
+
+        def track_open(path: object, flags: int, mode: int = 0o777) -> int:
+            nonlocal verification_fd
+            opened_fd = real_open(path, flags, mode)  # type: ignore[arg-type]
+            if not flags & clevr_reporting.os.O_CREAT and Path(path) == lock_path:
+                verification_fd = opened_fd
+            return opened_fd
+
+        caught: BaseException | None = None
+        with mock.patch.object(
+            clevr_reporting.os,
+            "open",
+            side_effect=track_open,
+        ), mock.patch.object(
+            clevr_reporting.os,
+            "fdopen",
+            side_effect=OSError("injected fdopen construction failure"),
+        ):
+            try:
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+            except BaseException as exc:
+                caught = exc
+
+        self.assertIsNotNone(verification_fd)
+        assert verification_fd is not None
+        descriptor_was_open = True
+        try:
+            clevr_reporting.os.fstat(verification_fd)
+        except OSError as exc:
+            self.assertEqual(exc.errno, errno.EBADF)
+            descriptor_was_open = False
+        finally:
+            if descriptor_was_open:
+                clevr_reporting.os.close(verification_fd)
+
+        self.assertFalse(descriptor_was_open)
+        self.assertIsNone(caught)
+        self._assert_complete_output(output_dir)
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertFalse(lock_path.exists())
 
     def test_replaced_lock_before_commit_is_preserved_and_reports_state(self) -> None:
         # Mutation caught: cleanup unlinking a replacement lock solely by pathname.
