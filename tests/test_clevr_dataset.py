@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import pickle
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 from PIL import Image
@@ -17,6 +19,7 @@ from torchvision.transforms import functional as tvf
 from src.clevr_dataset import (
     CLEVRDatasetError,
     CLEVRQuestionDataset,
+    CLEVRQuestionOnlyDataset,
     collate_clevr_questions,
 )
 
@@ -640,6 +643,116 @@ class RuntimeDatasetTests(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+
+class CLEVRQuestionOnlyDatasetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = RuntimeDatasetFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def assert_rejected(
+        self,
+        pattern: str,
+        *,
+        audit_dir: Path | None = None,
+        partition: str = "train",
+    ) -> None:
+        try:
+            CLEVRQuestionOnlyDataset(
+                audit_dir=(
+                    self.fixture.audit_dir if audit_dir is None else audit_dir
+                ),
+                partition=partition,
+            )
+        except Exception as error:
+            self.assertIsInstance(error, CLEVRDatasetError)
+            self.assertRegex(str(error), pattern)
+        else:
+            self.fail("invalid question-only runtime artifacts were accepted")
+
+    def test_needs_no_data_root_or_images_and_never_opens_png(self) -> None:
+        shutil.rmtree(self.fixture.data_root)
+
+        with mock.patch(
+            "src.clevr_dataset.Image.open",
+            side_effect=AssertionError("Q-only must not open a PNG"),
+        ) as image_open:
+            dataset = CLEVRQuestionOnlyDataset(
+                audit_dir=self.fixture.audit_dir,
+                partition="train",
+            )
+            sample = dataset[0]
+
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual(
+            set(sample), {"question_tokens", "question_length", "answer"}
+        )
+        torch.testing.assert_close(
+            sample["question_tokens"],
+            torch.tensor([1, 4, 2], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(sample["question_tokens"].dtype, torch.int64)
+        self.assertEqual(sample["question_length"].dtype, torch.int64)
+        self.assertEqual(tuple(sample["question_length"].shape), ())
+        self.assertEqual(sample["question_length"].item(), 3)
+        self.assertEqual(sample["answer"].dtype, torch.int64)
+        self.assertEqual(tuple(sample["answer"].shape), ())
+        self.assertEqual(sample["answer"].item(), 0)
+        image_open.assert_not_called()
+
+    def test_matches_rgb_question_projection_and_order(self) -> None:
+        rgb_dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+        question_dataset = CLEVRQuestionOnlyDataset(
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+
+        self.assertEqual(len(question_dataset), len(rgb_dataset))
+        for index in range(len(rgb_dataset)):
+            rgb_sample = rgb_dataset[index]
+            question_sample = question_dataset[index]
+            for field in ("question_tokens", "question_length", "answer"):
+                with self.subTest(index=index, field=field):
+                    self.assertTrue(
+                        torch.equal(question_sample[field], rgb_sample[field])
+                    )
+
+    def test_rejects_noncanonical_image_metadata_without_resolving_files(
+        self,
+    ) -> None:
+        self.fixture.rows[0]["image_path"] = (
+            "images/train/../train/CLEVR_train_000002.png"
+        )
+        self.fixture.write_artifacts()
+        shutil.rmtree(self.fixture.data_root)
+
+        self.assert_rejected(r"image_path|canonical")
+
+    def test_rejects_invalid_constructor_inputs_and_unrequested_bad_rows(
+        self,
+    ) -> None:
+        self.assert_rejected(r"partition", partition="unknown")
+        self.assert_rejected(
+            r"audit.*directory",
+            audit_dir=self.fixture.root / "missing-audit",
+        )
+
+        dev_row = next(
+            row for row in self.fixture.rows if row["partition"] == "dev"
+        )
+        dev_row["image_path"] = "images/train/not-the-image-identity.png"
+        self.fixture.write_artifacts()
+        shutil.rmtree(self.fixture.data_root)
+
+        self.assert_rejected(r"image_path|canonical", partition="train")
 
 
 class CLEVRQuestionCollateTests(unittest.TestCase):

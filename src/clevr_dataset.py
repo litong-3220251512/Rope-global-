@@ -51,7 +51,7 @@ class CLEVRDatasetError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class _RuntimeRecord:
-    image_path: Path
+    image_path: Path | None
     image_index: int
     question_index: int
     source_position: int
@@ -164,7 +164,7 @@ def _parse_row(
     raw_row: object,
     *,
     context: str,
-    data_root: Path,
+    data_root: Path | None,
     vocabulary: Vocabulary,
 ) -> tuple[str, str, int, int, _RuntimeRecord]:
     if not isinstance(raw_row, Mapping):
@@ -200,11 +200,13 @@ def _parse_row(
             f"{context} image_path must be the canonical relative POSIX path "
             f"{expected_image_path!r}"
         )
-    image_path = _resolve_image_file(
-        data_root / serialized_image_path,
-        data_root=data_root,
-        context=context,
-    )
+    image_path = None
+    if data_root is not None:
+        image_path = _resolve_image_file(
+            data_root / serialized_image_path,
+            data_root=data_root,
+            context=context,
+        )
 
     question = _require_string(raw_row, "question", context)
     relation = _require_string(raw_row, "relation", context)
@@ -254,7 +256,7 @@ def _parse_row(
 def _load_records(
     path: Path,
     *,
-    data_root: Path,
+    data_root: Path | None,
     vocabulary: Vocabulary,
     report_counts: Mapping[str, int],
     selected_partition: str,
@@ -369,6 +371,10 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         record = self._records[index]
+        if record.image_path is None:
+            raise CLEVRDatasetError(
+                f"selected RGB index {index} has no resolved image_path"
+            )
         image_path = _resolve_image_file(
             record.image_path,
             data_root=self.data_root,
@@ -411,6 +417,41 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
         tokens = torch.tensor(record.encoded_tokens, dtype=torch.int64)
         return {
             "image": image,
+            "question_tokens": tokens,
+            "question_length": torch.tensor(tokens.numel(), dtype=torch.int64),
+            "answer": torch.tensor(record.answer, dtype=torch.int64),
+        }
+
+
+class CLEVRQuestionOnlyDataset(Dataset[dict[str, Tensor]]):
+    """Indexable question-only samples from an explicit accepted audit."""
+
+    def __init__(self, *, audit_dir: Path, partition: str) -> None:
+        self.audit_dir = Path(audit_dir).resolve()
+        if not self.audit_dir.is_dir():
+            raise CLEVRDatasetError(
+                f"CLEVR audit directory is not a directory: {self.audit_dir}"
+            )
+        if partition not in _PARTITION_SPLITS:
+            raise CLEVRDatasetError(f"unknown CLEVR partition: {partition!r}")
+
+        vocabulary = _load_vocabulary(self.audit_dir / "vocabulary.json")
+        report_counts = _load_report_counts(self.audit_dir / "audit_report.json")
+        self._records = _load_records(
+            self.audit_dir / "selected_questions.jsonl",
+            data_root=None,
+            vocabulary=vocabulary,
+            report_counts=report_counts,
+            selected_partition=partition,
+        )
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, index: int) -> dict[str, Tensor]:
+        record = self._records[index]
+        tokens = torch.tensor(record.encoded_tokens, dtype=torch.int64)
+        return {
             "question_tokens": tokens,
             "question_length": torch.tensor(tokens.numel(), dtype=torch.int64),
             "answer": torch.tensor(record.answer, dtype=torch.int64),
