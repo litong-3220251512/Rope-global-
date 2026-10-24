@@ -489,6 +489,162 @@ class CLEVRQuestionAnswererM10Tests(unittest.TestCase):
         self.assertGreater(second_frequency_gradient.abs().sum().item(), 0.0)
 
 
+class CLEVRQuestionAnswererQuestionOnlyTests(unittest.TestCase):
+    def test_same_seed_state_matches_g_and_mode_specific_arguments_are_rejected(self):
+        seed = 20261025
+        torch.manual_seed(seed)
+        global_model = CLEVRQuestionAnswerer(vocab_size=8, mode="G").eval()
+        torch.manual_seed(seed)
+        question_only = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="Q-only"
+        ).eval()
+
+        global_state = global_model.state_dict()
+        question_only_state = question_only.state_dict()
+        self.assertEqual(tuple(global_state), tuple(question_only_state))
+        for name, global_value in global_state.items():
+            with self.subTest(state=name):
+                question_only_value = question_only_state[name]
+                self.assertEqual(global_value.shape, question_only_value.shape)
+                self.assertEqual(global_value.dtype, question_only_value.dtype)
+                self.assertTrue(torch.equal(global_value, question_only_value))
+
+        global_parameters = dict(global_model.named_parameters())
+        question_only_parameters = dict(question_only.named_parameters())
+        self.assertEqual(tuple(global_parameters), tuple(question_only_parameters))
+        self.assertEqual(
+            sum(parameter.numel() for parameter in global_parameters.values()),
+            sum(
+                parameter.numel()
+                for parameter in question_only_parameters.values()
+            ),
+        )
+
+        image, question_tokens, question_length = _valid_answerer_inputs()
+        for invalid_image in (image, object()):
+            with self.subTest(image=type(invalid_image).__name__), self.assertRaises(
+                ValueError
+            ):
+                question_only(invalid_image, question_tokens, question_length)
+        with self.assertRaises(ValueError):
+            question_only(None, question_tokens, question_length, lam=0.0)
+
+        torch.manual_seed(seed)
+        expected_next_random = torch.rand(4)
+        torch.manual_seed(seed)
+        with self.assertRaises(ValueError):
+            CLEVRQuestionAnswerer(
+                vocab_size=8, mode="Q-only", m10_seed=20007
+            )
+        self.assertTrue(torch.equal(torch.rand(4), expected_next_random))
+
+        rgb_modes = (
+            ("G", {}),
+            ("B", {}),
+            ("M10", {"m10_seed": 20007}),
+        )
+        for mode, kwargs in rgb_modes:
+            with self.subTest(mode=mode):
+                model = CLEVRQuestionAnswerer(
+                    vocab_size=8, mode=mode, **kwargs
+                ).eval()
+                with self.assertRaises(TypeError):
+                    model(None, question_tokens, question_length)
+
+    def test_zero_patch_tokens_use_g_phases_and_continue_through_all_blocks(self):
+        torch.manual_seed(20261025)
+        model = CLEVRQuestionAnswerer(vocab_size=8, mode="Q-only").eval()
+        _, question_tokens, question_length = _valid_answerer_inputs(2)
+        captured_tokens = []
+        captured_phases = []
+
+        def reject_projection(_module, _args):
+            raise AssertionError("Q-only called the RGB patch projection")
+
+        def capture_block(_module, args, kwargs):
+            captured_tokens.append(args[0].detach().clone())
+            captured_phases.append(kwargs["freqs_cis"])
+
+        projection_handle = model.backbone.patch_embed.register_forward_pre_hook(
+            reject_projection
+        )
+        block_handles = [
+            block.register_forward_pre_hook(capture_block, with_kwargs=True)
+            for block in model.backbone.blocks
+        ]
+        try:
+            with torch.no_grad():
+                expected_cls = model.backbone.cls_token.expand(2, -1, -1) + (
+                    model.question_encoder(
+                        question_tokens, question_length
+                    ).unsqueeze(1)
+                )
+                logits = model(None, question_tokens, question_length)
+        finally:
+            projection_handle.remove()
+            for handle in block_handles:
+                handle.remove()
+
+        self.assertEqual(tuple(logits.shape), (2, 2))
+        self.assertEqual(len(captured_tokens), 6)
+        self.assertEqual(tuple(captured_tokens[0].shape), (2, 197, 192))
+        self.assertTrue(torch.equal(captured_tokens[0][:, :1], expected_cls))
+        self.assertTrue(
+            torch.equal(
+                captured_tokens[0][:, 1:],
+                torch.zeros((2, 196, 192), dtype=captured_tokens[0].dtype),
+            )
+        )
+        self.assertGreater(captured_tokens[1][:, 1:].abs().sum().item(), 0.0)
+
+        expected_phase = build_axial_cis(
+            14, 14, mode="G", theta=100.0
+        )
+        self.assertEqual(len(captured_phases), 6)
+        for block_index, phase in enumerate(captured_phases):
+            with self.subTest(block=block_index):
+                self.assertIs(phase, captured_phases[0])
+                self.assertTrue(torch.equal(phase, expected_phase))
+
+    def test_answer_loss_skips_projection_and_reaches_nonvisual_components(self):
+        torch.manual_seed(20261025)
+        model = CLEVRQuestionAnswerer(vocab_size=8, mode="Q-only")
+        _, question_tokens, question_length = _valid_answerer_inputs(2)
+
+        logits = model(None, question_tokens, question_length)
+        nn.functional.cross_entropy(logits, torch.tensor((0, 1))).backward()
+
+        projection = model.backbone.patch_embed.proj
+        self.assertIsNone(projection.weight.grad)
+        self.assertIsNone(projection.bias.grad)
+        parameters = {
+            "embedding": model.question_encoder.embedding.weight,
+            "gru input weight": model.question_encoder.gru.weight_ih_l0,
+            "gru hidden weight": model.question_encoder.gru.weight_hh_l0,
+            "cls": model.backbone.cls_token,
+            "final norm": model.backbone.norm.weight,
+            "answer head": model.backbone.head.weight,
+        }
+        for block_index, block in enumerate(model.backbone.blocks):
+            parameters[f"block {block_index} qkv"] = block.attn.qkv.weight
+            parameters[f"block {block_index} mlp"] = block.mlp.fc1.weight
+        for name, parameter in parameters.items():
+            with self.subTest(parameter=name):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+                self.assertGreater(parameter.grad.abs().sum().item(), 0.0)
+
+    def test_rejects_empty_question_batch_without_an_image(self):
+        model = CLEVRQuestionAnswerer(vocab_size=8, mode="Q-only").eval()
+
+        with self.assertRaises(ValueError):
+            model(
+                None,
+                torch.empty((0, 2), dtype=torch.int64),
+                torch.empty((0,), dtype=torch.int64),
+            )
+
+
 class CLEVRQuestionAnswererArchitectureTests(unittest.TestCase):
     def test_constructs_the_exact_pub_r1_1_backbone(self):
         model = CLEVRQuestionAnswerer(vocab_size=8)
