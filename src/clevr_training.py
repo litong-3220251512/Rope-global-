@@ -6,6 +6,8 @@ from collections import OrderedDict
 
 import torch
 from torch import Tensor
+from torch.optim import AdamW
+from timm.optim import param_groups_weight_decay
 
 from src.clevr_model import CLEVRQuestionAnswerer
 
@@ -13,6 +15,8 @@ from src.clevr_model import CLEVRQuestionAnswerer
 _M10_SEED_OFFSET = 20_000
 _MAX_TORCH_SEED = (1 << 64) - 1
 _MODES = {"G", "B", "M10", "Q-only"}
+_BASE_LEARNING_RATE = 3e-4
+_WEIGHT_DECAY = 0.05
 
 
 class CLEVRTrainingConfigurationError(ValueError):
@@ -124,3 +128,84 @@ class CLEVRPairedInitialization:
             for name, value in model.state_dict().items()
             if not name.startswith("position.")
         )
+
+
+def build_clevr_adamw(model: CLEVRQuestionAnswerer) -> AdamW:
+    """Build the fixed AdamW groups with directly auditable parameter names."""
+    if not isinstance(model, CLEVRQuestionAnswerer):
+        raise CLEVRTrainingConfigurationError(
+            "model must be a CLEVRQuestionAnswerer"
+        )
+
+    named_parameters = OrderedDict(
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+    parameter_by_id = {
+        id(parameter): (name, parameter)
+        for name, parameter in named_parameters.items()
+    }
+    skip = {"backbone.cls_token"} | {
+        name for name in named_parameters if name.startswith("position.")
+    }
+    raw_groups = param_groups_weight_decay(
+        model,
+        weight_decay=_WEIGHT_DECAY,
+        no_weight_decay_list=skip,
+    )
+
+    decay_by_id: dict[int, float] = {}
+    for group in raw_groups:
+        weight_decay = float(group["weight_decay"])
+        if weight_decay not in {0.0, _WEIGHT_DECAY}:
+            raise CLEVRTrainingConfigurationError(
+                "timm returned an unexpected weight-decay group"
+            )
+        for parameter in group["params"]:
+            parameter_id = id(parameter)
+            if parameter_id not in parameter_by_id:
+                raise CLEVRTrainingConfigurationError(
+                    "timm returned an unknown or non-trainable parameter"
+                )
+            if parameter_id in decay_by_id:
+                raise CLEVRTrainingConfigurationError(
+                    "timm returned a parameter more than once"
+                )
+            decay_by_id[parameter_id] = weight_decay
+
+    if set(decay_by_id) != set(parameter_by_id):
+        raise CLEVRTrainingConfigurationError(
+            "timm parameter groups do not cover every trainable parameter"
+        )
+
+    optimizer_groups: list[dict[str, object]] = []
+    for group_name, weight_decay in (
+        ("decay", _WEIGHT_DECAY),
+        ("no_decay", 0.0),
+    ):
+        names = tuple(
+            name
+            for name, parameter in named_parameters.items()
+            if decay_by_id[id(parameter)] == weight_decay
+        )
+        parameters = [named_parameters[name] for name in names]
+        if not parameters:
+            raise CLEVRTrainingConfigurationError(
+                f"AdamW {group_name} parameter group must not be empty"
+            )
+        optimizer_groups.append(
+            {
+                "params": parameters,
+                "param_names": names,
+                "group_name": group_name,
+                "weight_decay": weight_decay,
+            }
+        )
+
+    return AdamW(
+        optimizer_groups,
+        lr=_BASE_LEARNING_RATE,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    )

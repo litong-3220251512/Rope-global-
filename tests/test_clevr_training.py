@@ -14,6 +14,7 @@ from src.clevr_model import CLEVRMixedPosition
 from src.clevr_training import (
     CLEVRPairedInitialization,
     CLEVRTrainingConfigurationError,
+    build_clevr_adamw,
 )
 
 
@@ -157,6 +158,162 @@ class CLEVRPairedInitializationTests(unittest.TestCase):
         self.assertTrue(np.array_equal(numpy_after[1], numpy_before[1]))
         self.assertEqual(numpy_after[2:], numpy_before[2:])
         self.assertTrue(torch.equal(torch.random.get_rng_state(), torch_before))
+
+
+class CLEVRAdamWTests(unittest.TestCase):
+    def test_groups_cover_every_trainable_parameter_once_with_names(self) -> None:
+        initialization = CLEVRPairedInitialization(vocab_size=8, run_seed=101)
+        expected_counts = {
+            "G": {"no_decay": 67, "decay": 29},
+            "M10": {"no_decay": 68, "decay": 29},
+            "Q-only": {"no_decay": 67, "decay": 29},
+        }
+
+        for mode, counts in expected_counts.items():
+            with self.subTest(mode=mode):
+                model = initialization.build(mode)
+                optimizer = build_clevr_adamw(model)
+                named = OrderedDict(
+                    (name, parameter)
+                    for name, parameter in model.named_parameters()
+                    if parameter.requires_grad
+                )
+                seen_ids: list[int] = []
+                groups = {
+                    group["group_name"]: group for group in optimizer.param_groups
+                }
+
+                self.assertEqual(set(groups), {"decay", "no_decay"})
+                for group_name, group in groups.items():
+                    parameters = group["params"]
+                    parameter_names = group["param_names"]
+                    parameter_ids = {id(parameter) for parameter in parameters}
+                    self.assertEqual(len(parameters), counts[group_name])
+                    self.assertEqual(len(parameters), len(parameter_names))
+                    for name, parameter in zip(parameter_names, parameters):
+                        self.assertIn(name, named)
+                        self.assertIs(parameter, named[name])
+                        seen_ids.append(id(parameter))
+                    expected_order = tuple(
+                        name
+                        for name, parameter in named.items()
+                        if id(parameter) in parameter_ids
+                    )
+                    self.assertEqual(tuple(parameter_names), expected_order)
+
+                self.assertEqual(len(seen_ids), len(set(seen_ids)))
+                self.assertEqual(
+                    set(seen_ids),
+                    {id(parameter) for parameter in named.values()},
+                )
+                saved_groups = {
+                    group["group_name"]: group
+                    for group in optimizer.state_dict()["param_groups"]
+                }
+                for group_name in groups:
+                    self.assertEqual(
+                        tuple(saved_groups[group_name]["param_names"]),
+                        tuple(groups[group_name]["param_names"]),
+                    )
+
+    def test_protocol_parameter_categories_have_exact_decay_and_hyperparameters(
+        self,
+    ) -> None:
+        initialization = CLEVRPairedInitialization(vocab_size=8, run_seed=101)
+        global_model = initialization.build("G")
+        optimizer = build_clevr_adamw(global_model)
+        decay_by_name = {
+            name: group["weight_decay"]
+            for group in optimizer.param_groups
+            for name in group["param_names"]
+        }
+
+        decay_names = (
+            "backbone.patch_embed.proj.weight",
+            "backbone.blocks.0.attn.qkv.weight",
+            "backbone.blocks.0.attn.proj.weight",
+            "backbone.blocks.0.mlp.fc1.weight",
+            "backbone.blocks.0.mlp.fc2.weight",
+            "backbone.head.weight",
+            "question_encoder.embedding.weight",
+            "question_encoder.gru.weight_ih_l0",
+            "question_encoder.gru.weight_hh_l0",
+        )
+        no_decay_names = (
+            "backbone.cls_token",
+            "backbone.patch_embed.proj.bias",
+            "backbone.blocks.0.gamma_1",
+            "backbone.blocks.0.gamma_2",
+            "backbone.blocks.0.norm1.weight",
+            "backbone.blocks.0.norm1.bias",
+            "backbone.blocks.0.attn.qkv.bias",
+            "backbone.blocks.0.attn.proj.bias",
+            "backbone.head.bias",
+            "question_encoder.gru.bias_ih_l0",
+            "question_encoder.gru.bias_hh_l0",
+        )
+        for name in decay_names:
+            with self.subTest(name=name):
+                self.assertEqual(decay_by_name[name], 0.05)
+        for name in no_decay_names:
+            with self.subTest(name=name):
+                self.assertEqual(decay_by_name[name], 0.0)
+        for name in global_model.state_dict():
+            if name.endswith(".bias") or ".bias_" in name:
+                with self.subTest(all_bias=name):
+                    self.assertEqual(decay_by_name[name], 0.0)
+
+        self.assertIsInstance(optimizer, torch.optim.AdamW)
+        self.assertEqual(optimizer.defaults["lr"], 3e-4)
+        self.assertEqual(optimizer.defaults["betas"], (0.9, 0.999))
+        self.assertEqual(optimizer.defaults["eps"], 1e-8)
+        self.assertEqual(
+            {group["weight_decay"] for group in optimizer.param_groups},
+            {0.0, 0.05},
+        )
+        for group in optimizer.param_groups:
+            self.assertEqual(group["lr"], 3e-4)
+            self.assertEqual(group["betas"], (0.9, 0.999))
+            self.assertEqual(group["eps"], 1e-8)
+
+        mixed = initialization.build("M10")
+        mixed_optimizer = build_clevr_adamw(mixed)
+        mixed_decay = {
+            name: group["weight_decay"]
+            for group in mixed_optimizer.param_groups
+            for name in group["param_names"]
+        }
+        self.assertEqual(mixed_decay["position.freqs"], 0.0)
+
+    def test_qonly_none_gradient_leaves_patch_projection_unchanged_and_untracked(
+        self,
+    ) -> None:
+        initialization = CLEVRPairedInitialization(vocab_size=8, run_seed=101)
+        model = initialization.build("Q-only")
+        optimizer = build_clevr_adamw(model)
+        projection = model.backbone.patch_embed.proj
+        weight_before = projection.weight.detach().clone()
+        bias_before = projection.bias.detach().clone()
+        question_tokens = torch.tensor(((1, 4, 2, 0),), dtype=torch.int64)
+        question_length = torch.tensor((3,), dtype=torch.int64)
+
+        logits = model(None, question_tokens, question_length)
+        torch.nn.functional.cross_entropy(logits, torch.tensor((1,))).backward()
+        self.assertIsNone(projection.weight.grad)
+        self.assertIsNone(projection.bias.grad)
+
+        optimizer.step()
+
+        self.assertTrue(torch.equal(projection.weight, weight_before))
+        self.assertTrue(torch.equal(projection.bias, bias_before))
+        self.assertNotIn(projection.weight, optimizer.state)
+        self.assertNotIn(projection.bias, optimizer.state)
+
+    def test_rejects_non_answerer_input(self) -> None:
+        for value in (None, object(), torch.nn.Linear(2, 2)):
+            with self.subTest(value_type=type(value).__name__):
+                with self.assertRaises(CLEVRTrainingConfigurationError):
+                    build_clevr_adamw(value)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
