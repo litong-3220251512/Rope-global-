@@ -487,27 +487,9 @@ def _record_boundary_evaluation(
         model=model, dataset=dataset, collate_fn=collate_fn,
         method=method, partition=partition, device=device,
     )
-    try:
-        _publish_evaluation(
-            artifacts=artifacts, result=result, completed_updates=completed_updates,
-        )
-    except Exception as publication_failure:
-        if not (path.exists() or path.is_symlink()):
-            raise
-        try:
-            recovered = _read_boundary_evaluation(
-                path=path, dataset=dataset, partition=partition, method=method, seed=seed,
-            )
-            _append_evaluation_event(
-                artifacts=artifacts, result=recovered,
-                completed_updates=completed_updates, path=path,
-            )
-        except Exception as recovery_failure:
-            publication_failure.add_note(
-                "prediction collision recovery failed: "
-                f"{type(recovery_failure).__name__}: {recovery_failure}"
-            )
-            raise publication_failure
+    _publish_evaluation(
+        artifacts=artifacts, result=result, completed_updates=completed_updates,
+    )
 
 
 def _complete_training_boundary(

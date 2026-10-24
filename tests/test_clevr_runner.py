@@ -1268,6 +1268,48 @@ class ProductionTrainingTests(unittest.TestCase):
         self.assertEqual([event[1] for event in artifact.events],
                          ["resume", "evaluation", "complete"])
 
+    def test_publish_commit_then_failure_propagates_and_later_resume_reuses_file(self):
+        publication_failure = RuntimeError("post-commit publication failure")
+
+        class CommitThenFailArtifacts(_OrchestrationArtifacts):
+            def publish_predictions(self, **kwargs):
+                super().publish_predictions(**kwargs)
+                raise publication_failure
+
+        with self._patches(
+            phase="pilot", methods=("G",), seed=9001,
+            artifact_class=CommitThenFailArtifacts,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                self._train(
+                    phase="pilot", seed=9001, methods=("G",), resumes={},
+                )
+        self.assertIs(caught.exception, publication_failure)
+        first_attempt = _OrchestrationArtifacts.opened[0][0]
+        self.assertEqual(first_attempt.events[-1][1], "failure")
+        self.assertNotIn("complete", [event[1] for event in first_attempt.events])
+        prediction = (self.output / "pilot" / "seed_9001" / "G" /
+                      "predictions" / "dev" / "update_0800.jsonl")
+        self.assertTrue(prediction.is_file())
+
+        checkpoint = self._checkpoint(
+            phase="pilot", seed=9001, method="G", update=800,
+        )
+        with self._patches(
+            phase="pilot", methods=("G",), seed=9001,
+            load=self._load_at(800, method="G", seed=9001),
+            artifact_class=CommitThenFailArtifacts,
+        ):
+            self._train(
+                phase="pilot", seed=9001, methods=("G",),
+                resumes={"G": checkpoint},
+            )
+        self.assertEqual(len(self.eval_calls), 1)
+        second_attempt = _OrchestrationArtifacts.opened[1][0]
+        self.assertFalse(second_attempt.predictions)
+        self.assertEqual([event[1] for event in second_attempt.events],
+                         ["resume", "evaluation", "complete"])
+
     def test_resume_rejects_published_prediction_with_changed_label(self):
         checkpoint = self._checkpoint(
             phase="pilot", seed=9001, method="G", update=800,
