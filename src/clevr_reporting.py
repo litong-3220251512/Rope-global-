@@ -1158,32 +1158,35 @@ def _unlink_owned_lock(
         )
 
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        current_fd = os.open(lock_path, flags)
-    except OSError as exc:
-        raise OSError(
-            f"publication lock ownership cannot be verified for {lock_path}: {exc}"
-        ) from exc
+    current_fd: int | None = None
+    current_stat: os.stat_result | None = None
+    current_token: bytes | None = None
     verification_error: BaseException | None = None
     try:
+        current_fd = os.open(lock_path, flags)
         current_stat = os.fstat(current_fd)
-        current_token = (
-            os.read(current_fd, len(lock_token) + 1)
-            if lock_token is not None
-            else None
-        )
+        if lock_token is not None:
+            token_buffer = bytearray()
+            read_limit = len(lock_token) + 1
+            while len(token_buffer) < read_limit:
+                chunk = os.read(current_fd, read_limit - len(token_buffer))
+                if not chunk:
+                    break
+                token_buffer.extend(chunk)
+            current_token = bytes(token_buffer)
     except BaseException as exc:
         verification_error = exc
     finally:
-        try:
-            os.close(current_fd)
-        except BaseException as close_error:
-            if verification_error is None:
-                raise
-            verification_error.add_note(
-                f"publication lock verification descriptor close also failed: "
-                f"{close_error}"
-            )
+        if current_fd is not None:
+            try:
+                os.close(current_fd)
+            except BaseException as close_error:
+                if verification_error is None:
+                    raise
+                verification_error.add_note(
+                    f"publication lock verification descriptor close also failed: "
+                    f"{close_error}"
+                )
     if verification_error is not None:
         if isinstance(verification_error, OSError):
             raise OSError(
@@ -1191,6 +1194,10 @@ def _unlink_owned_lock(
                 f"{lock_path}: {verification_error}"
             ) from verification_error
         raise verification_error
+    if current_stat is None:
+        raise OSError(
+            f"publication lock ownership is unavailable for {lock_path}"
+        )
 
     current_identity = (current_stat.st_dev, current_stat.st_ino)
     if current_identity != lock_identity or (

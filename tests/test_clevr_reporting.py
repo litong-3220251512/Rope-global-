@@ -7,6 +7,7 @@ import json
 import math
 import platform
 import stat
+import sys
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError, replace
@@ -2305,38 +2306,61 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self._staging_paths(output_dir), [])
         self.assertFalse(self._lock_path(output_dir).exists())
 
-    def test_fdopen_failure_cannot_leak_verification_descriptor(self) -> None:
-        # Mutation caught: transferring descriptor ownership only after fdopen succeeds.
-        output_dir = self.root / "fdopen-construction-failure"
+    def test_interrupt_after_verification_open_closes_descriptor(self) -> None:
+        # Mutation caught: acquiring the verification fd before its cleanup scope.
+        output_dir = self.root / "verification-open-interrupt"
         lock_path = self._lock_path(output_dir)
         real_open = clevr_reporting.os.open
         verification_fd: int | None = None
+        interrupt_armed = False
 
         def track_open(path: object, flags: int, mode: int = 0o777) -> int:
-            nonlocal verification_fd
+            nonlocal interrupt_armed, verification_fd
             opened_fd = real_open(path, flags, mode)  # type: ignore[arg-type]
             if not flags & clevr_reporting.os.O_CREAT and Path(path) == lock_path:
                 verification_fd = opened_fd
+                interrupt_armed = True
             return opened_fd
 
-        caught: BaseException | None = None
-        with mock.patch.object(
-            clevr_reporting.os,
-            "open",
-            side_effect=track_open,
-        ), mock.patch.object(
-            clevr_reporting.os,
-            "fdopen",
-            side_effect=OSError("injected fdopen construction failure"),
-        ):
-            try:
-                clevr_reporting.publish_statistics_bundle(
-                    output_dir,
-                    self._build_bundle(),
-                )
-            except BaseException as exc:
-                caught = exc
+        def interrupt_next_unlink_line(
+            frame: object,
+            event: str,
+            argument: object,
+        ) -> object:
+            del argument
+            nonlocal interrupt_armed
+            if (
+                interrupt_armed
+                and event == "line"
+                and getattr(frame, "f_code").co_name == "_unlink_owned_lock"
+            ):
+                interrupt_armed = False
+                raise KeyboardInterrupt("injected after verification open")
+            return interrupt_next_unlink_line
 
+        caught: BaseException | None = None
+        sys.settrace(interrupt_next_unlink_line)
+        try:
+            with mock.patch.object(
+                clevr_reporting.os,
+                "open",
+                side_effect=track_open,
+            ):
+                try:
+                    clevr_reporting.publish_statistics_bundle(
+                        output_dir,
+                        self._build_bundle(),
+                    )
+                except BaseException as exc:
+                    caught = exc
+        finally:
+            sys.settrace(None)
+
+        self.assertIsInstance(caught, clevr_reporting.ReportPublicationError)
+        assert isinstance(caught, clevr_reporting.ReportPublicationError)
+        self.assertIs(caught.committed, True)
+        self.assertIsInstance(caught.__cause__, KeyboardInterrupt)
+        self.assertIn("after verification open", str(caught.__cause__))
         self.assertIsNotNone(verification_fd)
         assert verification_fd is not None
         descriptor_was_open = True
@@ -2350,6 +2374,33 @@ class PublicationTests(unittest.TestCase):
                 clevr_reporting.os.close(verification_fd)
 
         self.assertFalse(descriptor_was_open)
+        self._assert_complete_output(output_dir)
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertTrue(lock_path.is_file())
+
+    def test_short_verification_reads_accept_intact_lock_token(self) -> None:
+        # Mutation caught: assuming one os.read fills the requested token buffer.
+        output_dir = self.root / "short-verification-reads"
+        lock_path = self._lock_path(output_dir)
+        real_read = clevr_reporting.os.read
+
+        def short_read(fd: int, byte_count: int) -> bytes:
+            return real_read(fd, min(byte_count, 7))
+
+        caught: BaseException | None = None
+        with mock.patch.object(
+            clevr_reporting.os,
+            "read",
+            side_effect=short_read,
+        ):
+            try:
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+            except BaseException as exc:
+                caught = exc
+
         self.assertIsNone(caught)
         self._assert_complete_output(output_dir)
         self.assertEqual(self._staging_paths(output_dir), [])
