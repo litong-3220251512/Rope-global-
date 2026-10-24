@@ -165,6 +165,7 @@ Run Step 2 again. Expected: PASS.
 Create independent files with `torch.save` from a valid payload, mutate one field at a time, and assert rejection before live state/RNG changes for:
 
 - absent/not-file input, unrestricted/custom-class payload, top-level and every nested missing/extra key;
+- target model carrying any non-`None` gradient, proving a half accumulation window is rejected before any live mutation;
 - wrong protocol/schema/environment; caller method/seed mismatch; bool/NumPy scalar numeric fields;
 - wrong model key/shape/dtype/non-tensor;
 - optimizer group count/name/`param_names`/order mismatch, including a same-shaped cross-splice;

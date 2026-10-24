@@ -156,6 +156,8 @@ C(I_k)=eD+c=Bk=128k.
 
 `load_clevr_checkpoint` 先以 `map_location="cpu", weights_only=True` 完整读取，再验证 exact schema、普通整数（拒绝 bool/NumPy scalar）、环境、run identity、所有 state 结构和 sampler/完整更新不变量；验证失败时 live 对象和全局 RNG 不得变化。
 
+目标 model 的全部 parameter 在 load 入口也必须满足 `.grad is None`。恢复契约不携带梯度，因此带有半个累积窗口的 live 对象不能被静默覆盖成“完整更新边界”。
+
 进入应用阶段前，函数深拷贝 live model/optimizer/scheduler/sampler 与全部指定 RNG。应用顺序为 model → scheduler → optimizer → sampler → Python/NumPy/PyTorch CPU/CUDA RNG。任一 `BaseException` 触发反向恢复；恢复后逐项直接比较。若主错误与 rollback 错误同时发生，抛出 `CLEVRCheckpointError`，保留主错误为 cause，并把 rollback 错误附在异常 note；不得声称状态完整恢复。成功后也逐项与 checkpoint 直接比较，再返回 metadata。
 
 这提供进程内“成功全部恢复，失败保持进入函数前状态”的事务目标，但不能对进程被 SIGKILL、CUDA driver 崩溃或硬件错误作保证。故障注入测试必须覆盖 model/optimizer/scheduler/sampler/RNG 应用失败与 rollback；只断言 mock 调用次数不算证据。
