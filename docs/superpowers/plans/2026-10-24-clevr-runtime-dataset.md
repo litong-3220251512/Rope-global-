@@ -53,7 +53,7 @@ class RuntimeDatasetTests(unittest.TestCase):
     def test_rgb_transform_matches_the_frozen_torchvision_reference(self): ...
 ```
 
-Use distinguishable constant image colors to prove ordering by `(image_index, question_index, source_position)` without returning IDs. Assert the exact four keys, image float32 `[3,224,224]` in `[0,1]`, int64 question/scalars, exact values, and direct equality to the explicit functional transform. A constant `(255,128,0,alpha)` fixture remains `(1.0,128/255,0.0)`.
+Use distinguishable constant image colors to prove ordering by `(image_index, question_index, source_position)` without returning IDs. Assert the exact four keys, image float32 `[3,224,224]` within the epsilon-derived numerical tolerance of `[0,1]` defined by the design, int64 question/scalars, exact values, and direct equality to the explicit functional transform. A constant `(255,128,0,alpha)` fixture remains `(1.0,128/255,0.0)`.
 
 - [ ] **Step 2: Run happy-path tests and observe RED**
 

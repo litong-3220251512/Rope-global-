@@ -28,6 +28,7 @@ _PARTITION_SPLITS = {
     "confirmation": "val",
 }
 _RELATIONS = {"left", "right", "front", "behind"}
+_FLOAT32_UNIT_INTERVAL_TOLERANCE = 4 * torch.finfo(torch.float32).eps
 _ROW_FIELDS = {
     "partition",
     "official_split",
@@ -143,6 +144,22 @@ def _require_index(row: Mapping[str, object], field: str, context: str) -> int:
     return value
 
 
+def _resolve_image_file(path: Path, *, data_root: Path, context: str) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CLEVRDatasetError(
+            f"{context} image_path does not identify an existing file: {path}"
+        ) from exc
+    if not resolved.is_relative_to(data_root):
+        raise CLEVRDatasetError(
+            f"{context} image_path escapes the explicit data root: {path}"
+        )
+    if not resolved.is_file():
+        raise CLEVRDatasetError(f"{context} image_path is not a regular file: {path}")
+    return resolved
+
+
 def _parse_row(
     raw_row: object,
     *,
@@ -183,22 +200,11 @@ def _parse_row(
             f"{context} image_path must be the canonical relative POSIX path "
             f"{expected_image_path!r}"
         )
-    try:
-        image_path = (data_root / serialized_image_path).resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise CLEVRDatasetError(
-            f"{context} image_path does not identify an existing file: "
-            f"{serialized_image_path!r}"
-        ) from exc
-    if not image_path.is_relative_to(data_root):
-        raise CLEVRDatasetError(
-            f"{context} image_path escapes the explicit data root: "
-            f"{serialized_image_path!r}"
-        )
-    if not image_path.is_file():
-        raise CLEVRDatasetError(
-            f"{context} image_path is not a regular file: {serialized_image_path!r}"
-        )
+    image_path = _resolve_image_file(
+        data_root / serialized_image_path,
+        data_root=data_root,
+        context=context,
+    )
 
     question = _require_string(raw_row, "question", context)
     relation = _require_string(raw_row, "relation", context)
@@ -258,6 +264,7 @@ def _load_records(
     observed_counts: Counter[str] = Counter()
     question_ids: set[tuple[str, int]] = set()
     source_ids: set[tuple[str, int]] = set()
+    partition_by_image: dict[tuple[str, int], str] = {}
     selected: list[_RuntimeRecord] = []
     try:
         with path.open("r", encoding="utf-8") as source:
@@ -285,8 +292,19 @@ def _load_records(
                     raise CLEVRDatasetError(
                         f"{context} has duplicate source_position for split {split}"
                     )
+                image_key = (split, record.image_index)
+                previous_partition = partition_by_image.get(image_key)
+                if (
+                    previous_partition is not None
+                    and previous_partition != partition
+                ):
+                    raise CLEVRDatasetError(
+                        f"{context} assigns {split} image {record.image_index} to "
+                        f"multiple partitions: {previous_partition} and {partition}"
+                    )
                 question_ids.add(question_key)
                 source_ids.add(source_key)
+                partition_by_image[image_key] = partition
                 observed_counts[partition] += 1
                 if partition == selected_partition:
                     selected.append(record)
@@ -336,12 +354,12 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
         if partition not in _PARTITION_SPLITS:
             raise CLEVRDatasetError(f"unknown CLEVR partition: {partition!r}")
 
-        self.vocabulary = _load_vocabulary(self.audit_dir / "vocabulary.json")
+        vocabulary = _load_vocabulary(self.audit_dir / "vocabulary.json")
         report_counts = _load_report_counts(self.audit_dir / "audit_report.json")
         self._records = _load_records(
             self.audit_dir / "selected_questions.jsonl",
             data_root=self.data_root,
-            vocabulary=self.vocabulary,
+            vocabulary=vocabulary,
             report_counts=report_counts,
             selected_partition=partition,
         )
@@ -351,8 +369,13 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         record = self._records[index]
+        image_path = _resolve_image_file(
+            record.image_path,
+            data_root=self.data_root,
+            context=f"selected index {index}",
+        )
         try:
-            with Image.open(record.image_path, formats=("PNG",)) as source:
+            with Image.open(image_path, formats=("PNG",)) as source:
                 image = (
                     tvf.pil_to_tensor(source.convert("RGB")).to(torch.float32)
                     / 255.0
@@ -365,22 +388,25 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
             )
         except (OSError, RuntimeError, ValueError) as exc:
             raise CLEVRDatasetError(
-                f"cannot decode selected index {index} as PNG: {record.image_path}"
+                f"cannot decode selected index {index} as PNG: {image_path}"
             ) from exc
         if image.dtype != torch.float32 or tuple(image.shape) != (3, 224, 224):
             raise CLEVRDatasetError(
                 f"decoded image for selected index {index} has an invalid tensor "
-                f"contract: {record.image_path}"
+                f"contract: {image_path}"
             )
         if not bool(torch.isfinite(image).all()):
             raise CLEVRDatasetError(
                 f"decoded image for selected index {index} is not finite: "
-                f"{record.image_path}"
+                f"{image_path}"
             )
-        if bool((image < 0).any()) or bool((image > 1).any()):
+        if bool((image < -_FLOAT32_UNIT_INTERVAL_TOLERANCE).any()) or bool(
+            (image > 1 + _FLOAT32_UNIT_INTERVAL_TOLERANCE).any()
+        ):
             raise CLEVRDatasetError(
-                f"decoded image for selected index {index} is outside [0,1]: "
-                f"{record.image_path}"
+                f"decoded image for selected index {index} is outside the "
+                f"float32 tolerance of [0,1]: "
+                f"{image_path}"
             )
         tokens = torch.tensor(record.encoded_tokens, dtype=torch.int64)
         return {
@@ -440,8 +466,12 @@ def _validate_collate_sample(
         )
     if not bool(torch.isfinite(image).all()):
         raise CLEVRDatasetError(f"{context} image must be finite")
-    if bool((image < 0).any()) or bool((image > 1).any()):
-        raise CLEVRDatasetError(f"{context} image must be in range [0,1]")
+    if bool((image < -_FLOAT32_UNIT_INTERVAL_TOLERANCE).any()) or bool(
+        (image > 1 + _FLOAT32_UNIT_INTERVAL_TOLERANCE).any()
+    ):
+        raise CLEVRDatasetError(
+            f"{context} image must be within the float32 tolerance of [0,1]"
+        )
 
     if tokens.dtype != torch.int64 or tokens.ndim != 1:
         raise CLEVRDatasetError(

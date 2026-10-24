@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 import tempfile
 import unittest
 from pathlib import Path
@@ -226,6 +227,60 @@ class RuntimeDatasetTests(unittest.TestCase):
 
         torch.testing.assert_close(dataset[0]["image"], expected, rtol=0, atol=0)
 
+    def test_native_size_resize_accepts_roundoff_without_clamping(self) -> None:
+        first_path = (
+            self.fixture.data_root
+            / "images"
+            / "train"
+            / "CLEVR_train_000001.png"
+        )
+        second_path = (
+            self.fixture.data_root
+            / "images"
+            / "train"
+            / "CLEVR_train_000002.png"
+        )
+        Image.new("RGB", (480, 320), (255, 255, 255)).save(
+            first_path, format="PNG"
+        )
+        x = torch.arange(480, dtype=torch.int64).remainder(256).to(torch.uint8)
+        y = torch.arange(320, dtype=torch.int64).remainder(256).to(torch.uint8)
+        nonconstant = torch.stack(
+            (
+                x.unsqueeze(0).expand(320, -1),
+                y.unsqueeze(1).expand(-1, 480),
+                (
+                    x.to(torch.int64).unsqueeze(0)
+                    + y.to(torch.int64).unsqueeze(1)
+                )
+                .remainder(256)
+                .to(torch.uint8),
+            )
+        )
+        tvf.to_pil_image(nonconstant).save(second_path, format="PNG")
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+
+        for index, path in enumerate((first_path, second_path)):
+            with self.subTest(path=path.name):
+                with Image.open(path, formats=("PNG",)) as source:
+                    expected = tvf.pil_to_tensor(source.convert("RGB")).to(
+                        torch.float32
+                    ) / 255.0
+                expected = tvf.resize(
+                    expected,
+                    [224, 224],
+                    interpolation=InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+
+                torch.testing.assert_close(
+                    dataset[index]["image"], expected, rtol=0, atol=0
+                )
+
     def test_requires_explicit_roots_partition_and_all_three_artifacts(self) -> None:
         cases = ("vocabulary.json", "audit_report.json", "selected_questions.jsonl")
         for filename in cases:
@@ -372,6 +427,21 @@ class RuntimeDatasetTests(unittest.TestCase):
                 finally:
                     fixture.close()
 
+    def test_rejects_one_image_assigned_to_multiple_partitions(self) -> None:
+        dev_row = next(
+            row for row in self.fixture.rows if row["partition"] == "dev"
+        )
+        dev_row.update(
+            {
+                "image_index": 1,
+                "image_filename": "CLEVR_train_000001.png",
+                "image_path": "images/train/CLEVR_train_000001.png",
+            }
+        )
+        self.fixture.write_artifacts()
+
+        self.assert_rejected(self.fixture, r"image|partition|multiple|train|dev")
+
     def test_validates_malformed_rows_even_outside_the_requested_partition(self) -> None:
         fixture = RuntimeDatasetFixture()
         try:
@@ -467,6 +537,43 @@ class RuntimeDatasetTests(unittest.TestCase):
             dataset, 0, r"index 0|CLEVR_train_000001.png|decode"
         )
 
+    def test_rejects_image_symlink_escape_introduced_after_construction(self) -> None:
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+        image_path = (
+            self.fixture.data_root
+            / "images"
+            / "train"
+            / "CLEVR_train_000001.png"
+        )
+        outside = self.fixture.root / "outside.png"
+        Image.new("RGB", (3, 2), (9, 8, 7)).save(outside, format="PNG")
+        image_path.unlink()
+        image_path.symlink_to(outside)
+
+        self.assert_access_rejected(dataset, 0, r"index 0|root|escape")
+
+    def test_rejects_parent_symlink_escape_introduced_after_construction(self) -> None:
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+        train_directory = self.fixture.data_root / "images" / "train"
+        retained_directory = self.fixture.root / "retained-train"
+        outside_directory = self.fixture.root / "outside-train"
+        train_directory.rename(retained_directory)
+        outside_directory.mkdir()
+        Image.new("RGB", (3, 2), (9, 8, 7)).save(
+            outside_directory / "CLEVR_train_000001.png", format="PNG"
+        )
+        train_directory.symlink_to(outside_directory, target_is_directory=True)
+
+        self.assert_access_rejected(dataset, 0, r"index 0|root|escape")
+
     def test_multiple_questions_may_share_one_image_without_mutable_sample_storage(
         self,
     ) -> None:
@@ -489,6 +596,47 @@ class RuntimeDatasetTests(unittest.TestCase):
         torch.testing.assert_close(
             second[:, 0, 0],
             torch.tensor([1.0, 128.0 / 255.0, 0.0]),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_dataset_survives_pickle_round_trip(self) -> None:
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+
+        restored = pickle.loads(pickle.dumps(dataset))
+
+        self.assertEqual(len(restored), 2)
+        torch.testing.assert_close(
+            restored[0]["question_tokens"],
+            torch.tensor([1, 4, 2], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_spawn_dataloader_reads_dataset_in_worker_process(self) -> None:
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=2,
+            shuffle=False,
+            num_workers=1,
+            multiprocessing_context="spawn",
+            collate_fn=collate_clevr_questions,
+        )
+
+        batch = next(iter(loader))
+
+        torch.testing.assert_close(
+            batch["answer"],
+            torch.tensor([0, 1], dtype=torch.int64),
             rtol=0,
             atol=0,
         )
@@ -583,6 +731,19 @@ class CLEVRQuestionCollateTests(unittest.TestCase):
             )
         finally:
             fixture.close()
+
+    def test_accepts_two_ulp_resize_roundoff_at_the_unit_interval_boundary(
+        self,
+    ) -> None:
+        one = torch.tensor(1.0, dtype=torch.float32)
+        positive_infinity = torch.tensor(float("inf"), dtype=torch.float32)
+        first_successor = torch.nextafter(one, positive_infinity)
+        resize_roundoff = torch.nextafter(first_successor, positive_infinity).item()
+        sample = self.sample([1, 7, 2], image_value=resize_roundoff, answer=1)
+
+        batch = collate_clevr_questions([sample])
+
+        self.assertEqual(batch["image"][0, 0, 0, 0].item(), resize_roundoff)
 
     def test_rejects_empty_batches_and_missing_or_extra_keys(self) -> None:
         self.assert_collate_rejected([], r"empty|sample")

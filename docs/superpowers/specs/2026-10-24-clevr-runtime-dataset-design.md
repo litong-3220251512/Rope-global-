@@ -118,7 +118,10 @@ The constructor resolves only the two explicit roots and fixed artifact names:
 It neither searches parent/sibling directories nor invokes the audit builder.
 The dataset retains only a private immutable tuple of minimum runtime records:
 resolved image path, the three integer sort fields, encoded token tuple, and
-binary answer. Audit-only row values are validated and then discarded.
+binary answer. The immutable vocabulary is local to constructor validation and
+is then discarded, so its read-only mapping proxy does not prevent dataset
+serialization for `spawn`/`forkserver` DataLoader workers. Audit-only row
+values are validated and then discarded.
 
 ## 5. Artifact contract
 
@@ -166,6 +169,8 @@ in particular, booleans are not accepted as integer IDs or labels. Validate:
   token sequence;
 - `(official_split, question_index)` and
   `(official_split, source_position)` are unique;
+- every `(official_split, image_index)` belongs to exactly one partition,
+  while multiple questions for that image are allowed inside that partition;
 - every partition's observed row count equals its
   `audit_report.json` `selected_question_count`, and each requested partition
   is non-empty.
@@ -209,10 +214,31 @@ X_i\in\mathbb R^{3\times224\times224}.
 \]
 
 No mean/std normalization is applied. The implementation checks the final
-shape, dtype, finiteness, and range `[0,1]`. It opens only PNG through Pillow,
-closes the file before returning, and converts decode/I/O failures into a
-dataset-contract error that names the selected index/path. Constructor path
-checks do not eagerly decode all images.
+shape, dtype, finiteness, and numerical range. In exact arithmetic, each
+antialiased bilinear output is a non-negative normalized weighted sum of input
+values in `[0,1]`, so its range remains `[0,1]`. The locked float32
+implementation can round a native-size saturated fixture to two representable
+steps above `1.0`. Let
+
+\[
+\epsilon_{32}=2^{-23},\qquad \tau=4\epsilon_{32}.
+\]
+
+Dataset access and collation therefore reject values outside
+`[-tau, 1+tau]`. This four-ULP bound covers the observed two-ULP roundoff with
+one equal safety margin for the separable resize stages, while remaining far
+below one 8-bit input step `1/255`. The implementation does not clamp or alter
+accepted tensors: output remains exactly the frozen torchvision transform.
+This is a numerical-validation tolerance, not a learned or performance-tuned
+threshold. It opens only PNG through Pillow, closes the file before returning,
+and converts decode/I/O failures into a dataset-contract error that names the
+selected index/path. Constructor path checks do not eagerly decode all images.
+Immediately before each lazy open, access re-resolves the retained path and
+rechecks that it is an existing regular file under the explicit data root.
+This rejects file or parent-directory symlink escapes introduced after
+construction. The check and Pillow open are separate filesystem operations;
+the contract does not claim atomic resistance to an adversary mutating the
+filesystem concurrently between them.
 
 ## 7. Sample and batch contract
 
