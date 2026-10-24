@@ -7,6 +7,44 @@ from torch import Tensor, nn
 
 from src.classification import RoPEClassifier
 from src.local_rope import Lambda
+from models.vit_rope import (
+    compute_mixed_cis,
+    init_random_2d_freqs,
+    init_t_xy,
+)
+
+
+class CLEVRMixedPosition(nn.Module):
+    """Official RoPE-Mixed frequencies for the fixed PUB-R1.1 backbone."""
+
+    def __init__(self, *, seed: int) -> None:
+        super().__init__()
+        if type(seed) is not int:
+            raise TypeError("seed must be an integer")
+        if seed < 0:
+            raise ValueError("seed must be non-negative")
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            frequencies = torch.stack(
+                [
+                    init_random_2d_freqs(
+                        dim=64, num_heads=3, theta=10.0
+                    )
+                    for _ in range(6)
+                ],
+                dim=1,
+            ).view(2, 6, 96)
+        self.freqs = nn.Parameter(frequencies)
+        t_x, t_y = init_t_xy(end_x=14, end_y=14)
+        self.register_buffer("freqs_t_x", t_x)
+        self.register_buffer("freqs_t_y", t_y)
+
+    def forward(self) -> Tensor:
+        """Return live per-layer/head phases with no cross-forward cache."""
+        t_x = self.freqs_t_x.to(dtype=self.freqs.dtype)
+        t_y = self.freqs_t_y.to(dtype=self.freqs.dtype)
+        return compute_mixed_cis(self.freqs, t_x, t_y, num_heads=3)
 
 
 class CLEVRQuestionEncoder(nn.Module):

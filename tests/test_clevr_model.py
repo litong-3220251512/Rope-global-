@@ -5,10 +5,16 @@ import unittest
 
 import torch
 from torch import nn
+from torch.func import functional_call
 
-from src.clevr_model import CLEVRQuestionAnswerer, CLEVRQuestionEncoder
+from src.clevr_model import (
+    CLEVRMixedPosition,
+    CLEVRQuestionAnswerer,
+    CLEVRQuestionEncoder,
+)
 from src.local_rope import build_axial_cis
 from src.segmentation import differentiable_attention
+from models.vit_rope import init_random_2d_freqs
 
 
 def _valid_answerer_inputs(batch_size=1):
@@ -179,6 +185,142 @@ class CLEVRQuestionEncoderTests(unittest.TestCase):
                     self.assertIs(type(error), exception)
                 else:
                     self.fail(f"{name} was not rejected")
+
+
+class CLEVRMixedPositionTests(unittest.TestCase):
+    def test_rejects_non_integer_or_negative_seed(self):
+        for seed in (True, 1.0, "1"):
+            with self.subTest(seed=seed), self.assertRaises(TypeError):
+                CLEVRMixedPosition(seed=seed)
+        with self.assertRaises(ValueError):
+            CLEVRMixedPosition(seed=-1)
+
+    def test_matches_official_flattened_layout_and_base_ten_geometry(self):
+        seed = 20007
+        position = CLEVRMixedPosition(seed=seed)
+
+        self.assertEqual(tuple(position.freqs.shape), (2, 6, 96))
+        self.assertEqual(
+            sum(parameter.numel() for parameter in position.parameters()),
+            1152,
+        )
+        self.assertTrue(position.freqs.requires_grad)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            expected = torch.stack(
+                [
+                    init_random_2d_freqs(
+                        dim=64, num_heads=3, theta=10.0
+                    )
+                    for _ in range(6)
+                ],
+                dim=1,
+            ).view(2, 6, 96)
+        self.assertTrue(torch.equal(position.freqs, expected))
+
+        semantic = position.freqs.detach().view(2, 6, 3, 32)
+        magnitudes = torch.sqrt(semantic[0].square() + semantic[1].square())
+        expected_magnitudes = 10.0 ** (
+            -torch.arange(16, dtype=magnitudes.dtype) / 16.0
+        )
+        self.assertTrue(
+            torch.allclose(
+                magnitudes[..., :16],
+                expected_magnitudes.expand(6, 3, -1),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                magnitudes[..., 16:],
+                expected_magnitudes.expand(6, 3, -1),
+            )
+        )
+        dot_products = (
+            semantic[0, ..., :16] * semantic[0, ..., 16:]
+            + semantic[1, ..., :16] * semantic[1, ..., 16:]
+        )
+        torch.testing.assert_close(
+            dot_products,
+            torch.zeros_like(dot_products),
+            rtol=1.3e-6,
+            atol=1e-5,
+        )
+
+    def test_forward_matches_hand_computed_phases_and_relative_invariants(self):
+        position = CLEVRMixedPosition(seed=20007)
+
+        phases = position()
+        self.assertEqual(tuple(phases.shape), (6, 3, 196, 32))
+        self.assertIsNot(phases, position())
+        torch.testing.assert_close(
+            phases.abs(),
+            torch.ones_like(phases.abs()),
+            rtol=1.3e-6,
+            atol=1e-5,
+        )
+        self.assertTrue(
+            torch.equal(
+                position.freqs_t_x[:16],
+                torch.tensor(
+                    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0, 1),
+                    dtype=torch.float32,
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                position.freqs_t_y[:16],
+                torch.tensor(
+                    (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1),
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+        semantic = position.freqs.detach().view(2, 6, 3, 32)
+        selected_angle = 2.0 * semantic[0, 0, 0] + 3.0 * semantic[1, 0, 0]
+        expected = torch.complex(selected_angle.cos(), selected_angle.sin())
+        torch.testing.assert_close(
+            phases[0, 0, 44], expected, rtol=1.3e-6, atol=1e-5
+        )
+
+        same_patch = phases[0, 0, 44] * phases[0, 0, 44].conj()
+        torch.testing.assert_close(
+            same_patch,
+            torch.ones_like(same_patch),
+            rtol=1.3e-6,
+            atol=1e-5,
+        )
+        relative = phases[0, 0, 44] * phases[0, 0, 15].conj()
+        translated_relative = phases[0, 0, 118] * phases[0, 0, 89].conj()
+        torch.testing.assert_close(
+            relative, translated_relative, rtol=1.3e-6, atol=1e-5
+        )
+
+    def test_float64_frequency_derivative_passes_gradcheck(self):
+        position = CLEVRMixedPosition(seed=20007).double()
+        base_frequencies = position.freqs.detach().clone()
+        mask = torch.zeros_like(base_frequencies)
+        mask[0, 0, 0] = 1.0
+        delta = torch.zeros((), dtype=torch.float64, requires_grad=True)
+
+        def selected_phase(real_delta):
+            phases = functional_call(
+                position,
+                {"freqs": base_frequencies + real_delta * mask},
+                (),
+            )
+            return torch.view_as_real(phases[0, 0, (1, 44), 0])
+
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                selected_phase,
+                (delta,),
+                eps=1e-6,
+                rtol=1e-7,
+                atol=1e-7,
+            )
+        )
 
 
 class CLEVRQuestionAnswererArchitectureTests(unittest.TestCase):
