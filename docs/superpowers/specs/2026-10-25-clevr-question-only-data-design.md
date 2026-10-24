@@ -1,7 +1,7 @@
 # CLEVR Q-only Runtime Data Design
 
-Date: 2026-10-25  
-Protocol: PUB-R1.1  
+Date: 2026-10-25
+Protocol: PUB-R1.1
 Status: implementation basis; the user has instructed the agent to continue the
 accepted plan without another design-question round
 
