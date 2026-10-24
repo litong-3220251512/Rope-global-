@@ -1,0 +1,493 @@
+"""Runtime CLEVR dataset contract tests using temporary local artifacts."""
+
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+from PIL import Image
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as tvf
+
+from src.clevr_dataset import CLEVRDatasetError, CLEVRQuestionDataset
+
+
+PARTITIONS = ("train", "dev", "base_test", "confirmation")
+
+
+class RuntimeDatasetFixture:
+    def __init__(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.data_root = self.root / "CLEVR_v1.0"
+        self.audit_dir = self.root / "audit"
+        self.audit_dir.mkdir(parents=True)
+        self.rows = [
+            self._row("train", "train", 2, 20, 20, "There?", [1, 5, 2], 1, "left"),
+            self._row("confirmation", "val", 1, 1, 1, "There?", [1, 5, 2], 1, "behind"),
+            self._row("train", "train", 1, 10, 10, "Are?", [1, 4, 2], 0, "right"),
+            self._row("base_test", "val", 0, 0, 0, "Are?", [1, 4, 2], 0, "front"),
+            self._row("dev", "train", 3, 30, 30, "There?", [1, 5, 2], 1, "left"),
+        ]
+        self.colors = {
+            ("train", 1): (255, 128, 0, 64),
+            ("train", 2): (0, 255, 0, 127),
+            ("train", 3): (0, 0, 255, 255),
+            ("val", 0): (255, 0, 0, 255),
+            ("val", 1): (0, 255, 255, 255),
+        }
+        self._write_images()
+        self.write_artifacts()
+
+    @staticmethod
+    def _row(
+        partition: str,
+        official_split: str,
+        image_index: int,
+        question_index: int,
+        source_position: int,
+        question: str,
+        encoded_tokens: list[int],
+        answer: int,
+        relation: str,
+    ) -> dict[str, object]:
+        image_filename = f"CLEVR_{official_split}_{image_index:06d}.png"
+        return {
+            "partition": partition,
+            "official_split": official_split,
+            "image_index": image_index,
+            "image_filename": image_filename,
+            "image_path": f"images/{official_split}/{image_filename}",
+            "question_index": question_index,
+            "source_position": source_position,
+            "question": question,
+            "encoded_tokens": encoded_tokens,
+            "answer": answer,
+            "relation": relation,
+        }
+
+    def _write_images(self) -> None:
+        for (split, image_index), color in self.colors.items():
+            directory = self.data_root / "images" / split
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"CLEVR_{split}_{image_index:06d}.png"
+            Image.new("RGBA", (3, 2), color).save(path, format="PNG")
+
+    def write_artifacts(self) -> None:
+        vocabulary = {
+            "protocol_version": "PUB-R1.1",
+            "token_to_id": {
+                "<NULL>": 0,
+                "<START>": 1,
+                "<END>": 2,
+                "<UNK>": 3,
+                "Are": 4,
+                "There": 5,
+            },
+            "id_to_token": ["<NULL>", "<START>", "<END>", "<UNK>", "Are", "There"],
+        }
+        counts = {partition: 0 for partition in PARTITIONS}
+        for row in self.rows:
+            counts[str(row["partition"])] += 1
+        report = {
+            "protocol_version": "PUB-R1.1",
+            "partition_summaries": [
+                {
+                    "partition": partition,
+                    "mother_image_count": counts[partition],
+                    "selected_image_count": counts[partition],
+                    "selected_question_count": counts[partition],
+                }
+                for partition in PARTITIONS
+            ],
+        }
+        (self.audit_dir / "vocabulary.json").write_text(
+            json.dumps(vocabulary), encoding="utf-8"
+        )
+        (self.audit_dir / "audit_report.json").write_text(
+            json.dumps(report), encoding="utf-8"
+        )
+        with (self.audit_dir / "selected_questions.jsonl").open(
+            "w", encoding="utf-8"
+        ) as output:
+            for row in self.rows:
+                output.write(json.dumps(row) + "\n")
+
+    def close(self) -> None:
+        self.temporary.cleanup()
+
+
+class RuntimeDatasetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = RuntimeDatasetFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def assert_rejected(
+        self,
+        fixture: RuntimeDatasetFixture,
+        pattern: str,
+        *,
+        partition: str = "train",
+        data_root: Path | None = None,
+        audit_dir: Path | None = None,
+    ) -> None:
+        try:
+            CLEVRQuestionDataset(
+                data_root=fixture.data_root if data_root is None else data_root,
+                audit_dir=fixture.audit_dir if audit_dir is None else audit_dir,
+                partition=partition,
+            )
+        except Exception as error:
+            self.assertIsInstance(error, CLEVRDatasetError)
+            self.assertRegex(str(error), pattern)
+        else:
+            self.fail("invalid runtime artifacts were accepted")
+
+    def assert_access_rejected(
+        self, dataset: CLEVRQuestionDataset, index: int, pattern: str
+    ) -> None:
+        try:
+            dataset[index]
+        except Exception as error:
+            self.assertIsInstance(error, CLEVRDatasetError)
+            self.assertRegex(str(error), pattern)
+        else:
+            self.fail("invalid image access was accepted")
+
+    @staticmethod
+    def rewrite_json(path: Path, payload: object) -> None:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    @staticmethod
+    def read_json(path: Path) -> object:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_sorts_selected_partition_and_returns_only_model_tensors(self) -> None:
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+
+        self.assertEqual(len(dataset), 2)
+        sample = dataset[0]
+        self.assertEqual(
+            set(sample), {"image", "question_tokens", "question_length", "answer"}
+        )
+        self.assertEqual(sample["image"].dtype, torch.float32)
+        self.assertEqual(tuple(sample["image"].shape), (3, 224, 224))
+        self.assertTrue(torch.isfinite(sample["image"]).all())
+        self.assertGreaterEqual(sample["image"].min().item(), 0.0)
+        self.assertLessEqual(sample["image"].max().item(), 1.0)
+        torch.testing.assert_close(
+            sample["image"][:, 0, 0],
+            torch.tensor([1.0, 128.0 / 255.0, 0.0]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            sample["question_tokens"], torch.tensor([1, 4, 2]), rtol=0, atol=0
+        )
+        self.assertEqual(sample["question_tokens"].dtype, torch.int64)
+        self.assertEqual(sample["question_length"].dtype, torch.int64)
+        self.assertEqual(tuple(sample["question_length"].shape), ())
+        self.assertEqual(sample["question_length"].item(), 3)
+        self.assertEqual(sample["answer"].dtype, torch.int64)
+        self.assertEqual(tuple(sample["answer"].shape), ())
+        self.assertEqual(sample["answer"].item(), 0)
+
+    def test_rgb_transform_matches_the_frozen_torchvision_reference(self) -> None:
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+        image_path = (
+            self.fixture.data_root / "images" / "train" / "CLEVR_train_000001.png"
+        )
+        with Image.open(image_path, formats=("PNG",)) as source:
+            expected = tvf.pil_to_tensor(source.convert("RGB")).to(torch.float32) / 255.0
+        expected = tvf.resize(
+            expected,
+            [224, 224],
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
+        )
+
+        torch.testing.assert_close(dataset[0]["image"], expected, rtol=0, atol=0)
+
+    def test_requires_explicit_roots_partition_and_all_three_artifacts(self) -> None:
+        cases = ("vocabulary.json", "audit_report.json", "selected_questions.jsonl")
+        for filename in cases:
+            with self.subTest(missing=filename):
+                fixture = RuntimeDatasetFixture()
+                try:
+                    (fixture.audit_dir / filename).unlink()
+                    self.assert_rejected(fixture, r"missing|required|artifact")
+                finally:
+                    fixture.close()
+
+        fixture = RuntimeDatasetFixture()
+        try:
+            self.assert_rejected(
+                fixture, r"data root|directory", data_root=fixture.root / "missing-data"
+            )
+            self.assert_rejected(
+                fixture, r"audit.*directory", audit_dir=fixture.root / "missing-audit"
+            )
+            self.assert_rejected(fixture, r"partition", partition="unknown")
+            fixture.rows = [row for row in fixture.rows if row["partition"] != "dev"]
+            fixture.write_artifacts()
+            self.assert_rejected(fixture, r"dev.*empty|empty.*dev", partition="dev")
+        finally:
+            fixture.close()
+
+    def test_rejects_protocol_vocabulary_and_report_count_disagreement(self) -> None:
+        def run_case(name: str, mutate, pattern: str) -> None:
+            with self.subTest(case=name):
+                fixture = RuntimeDatasetFixture()
+                try:
+                    mutate(fixture)
+                    self.assert_rejected(fixture, pattern)
+                finally:
+                    fixture.close()
+
+        def wrong_vocabulary_protocol(fixture: RuntimeDatasetFixture) -> None:
+            path = fixture.audit_dir / "vocabulary.json"
+            payload = self.read_json(path)
+            payload["protocol_version"] = "PUB-R0"
+            self.rewrite_json(path, payload)
+
+        def wrong_report_protocol(fixture: RuntimeDatasetFixture) -> None:
+            path = fixture.audit_dir / "audit_report.json"
+            payload = self.read_json(path)
+            payload["protocol_version"] = "PUB-R0"
+            self.rewrite_json(path, payload)
+
+        def invalid_vocabulary_inverse(fixture: RuntimeDatasetFixture) -> None:
+            path = fixture.audit_dir / "vocabulary.json"
+            payload = self.read_json(path)
+            payload["token_to_id"]["Are"] = 5
+            self.rewrite_json(path, payload)
+
+        def missing_summary(fixture: RuntimeDatasetFixture) -> None:
+            path = fixture.audit_dir / "audit_report.json"
+            payload = self.read_json(path)
+            payload["partition_summaries"] = payload["partition_summaries"][:-1]
+            self.rewrite_json(path, payload)
+
+        def duplicate_summary(fixture: RuntimeDatasetFixture) -> None:
+            path = fixture.audit_dir / "audit_report.json"
+            payload = self.read_json(path)
+            payload["partition_summaries"].append(payload["partition_summaries"][0])
+            self.rewrite_json(path, payload)
+
+        def unknown_summary(fixture: RuntimeDatasetFixture) -> None:
+            path = fixture.audit_dir / "audit_report.json"
+            payload = self.read_json(path)
+            payload["partition_summaries"][0]["partition"] = "other"
+            self.rewrite_json(path, payload)
+
+        def count_mismatch(fixture: RuntimeDatasetFixture) -> None:
+            path = fixture.audit_dir / "audit_report.json"
+            payload = self.read_json(path)
+            payload["partition_summaries"][0]["selected_question_count"] = 99
+            self.rewrite_json(path, payload)
+
+        run_case("vocabulary protocol", wrong_vocabulary_protocol, r"protocol")
+        run_case("report protocol", wrong_report_protocol, r"protocol")
+        run_case("vocabulary inverse", invalid_vocabulary_inverse, r"vocabulary|token")
+        run_case("missing summary", missing_summary, r"summary|partition")
+        run_case("duplicate summary", duplicate_summary, r"duplicate.*summary|summary.*duplicate")
+        run_case("unknown summary", unknown_summary, r"summary|partition")
+        run_case("count mismatch", count_mismatch, r"count|train")
+
+    def test_rejects_missing_extra_or_wrong_typed_manifest_fields(self) -> None:
+        cases = (
+            ("missing", lambda row: row.pop("relation")),
+            ("extra", lambda row: row.update({"unexpected": 1})),
+            ("boolean image", lambda row: row.update({"image_index": True})),
+            ("boolean question", lambda row: row.update({"question_index": False})),
+            ("boolean source", lambda row: row.update({"source_position": True})),
+            ("boolean answer", lambda row: row.update({"answer": False})),
+        )
+        for name, mutate in cases:
+            with self.subTest(case=name):
+                fixture = RuntimeDatasetFixture()
+                try:
+                    mutate(fixture.rows[0])
+                    fixture.write_artifacts()
+                    self.assert_rejected(fixture, r"field|integer|answer|keys|line")
+                finally:
+                    fixture.close()
+
+    def test_rejects_invalid_split_identity_tokens_answer_and_relation(self) -> None:
+        cases = (
+            ("split", lambda row: row.update({"official_split": "val"}), r"split"),
+            ("filename", lambda row: row.update({"image_filename": "bad.png"}), r"filename|identity"),
+            ("negative", lambda row: row.update({"question_index": -1}), r"question_index|non-negative"),
+            ("question", lambda row: row.update({"question": 3}), r"question"),
+            ("relation", lambda row: row.update({"relation": "over"}), r"relation"),
+            ("answer", lambda row: row.update({"answer": 2}), r"answer"),
+            ("tokens type", lambda row: row.update({"encoded_tokens": "1,5,2"}), r"token"),
+            ("token bool", lambda row: row.update({"encoded_tokens": [1, True, 2]}), r"token"),
+            ("token range", lambda row: row.update({"encoded_tokens": [1, 99, 2]}), r"token"),
+            ("token null", lambda row: row.update({"encoded_tokens": [1, 0, 2]}), r"NULL|token"),
+            ("start", lambda row: row.update({"encoded_tokens": [3, 5, 2]}), r"START|token"),
+            ("end", lambda row: row.update({"encoded_tokens": [1, 5, 3]}), r"END|token"),
+            ("recompute", lambda row: row.update({"encoded_tokens": [1, 4, 2]}), r"encoded|question|token"),
+        )
+        for name, mutate, pattern in cases:
+            with self.subTest(case=name):
+                fixture = RuntimeDatasetFixture()
+                try:
+                    mutate(fixture.rows[0])
+                    fixture.write_artifacts()
+                    self.assert_rejected(fixture, pattern)
+                finally:
+                    fixture.close()
+
+    def test_rejects_duplicate_question_or_source_identity(self) -> None:
+        for field in ("question_index", "source_position"):
+            with self.subTest(field=field):
+                fixture = RuntimeDatasetFixture()
+                try:
+                    duplicate = dict(fixture.rows[2])
+                    duplicate["question_index"] = 999
+                    duplicate["source_position"] = 999
+                    duplicate[field] = fixture.rows[0][field]
+                    fixture.rows.append(duplicate)
+                    fixture.write_artifacts()
+                    self.assert_rejected(fixture, rf"duplicate.*{field}|{field}.*duplicate")
+                finally:
+                    fixture.close()
+
+    def test_validates_malformed_rows_even_outside_the_requested_partition(self) -> None:
+        fixture = RuntimeDatasetFixture()
+        try:
+            dev_row = next(row for row in fixture.rows if row["partition"] == "dev")
+            dev_row["relation"] = "over"
+            fixture.write_artifacts()
+            self.assert_rejected(fixture, r"relation|line", partition="train")
+        finally:
+            fixture.close()
+
+        for payload, pattern in (("\n", r"blank|line"), ("{bad json}\n", r"JSON|line")):
+            with self.subTest(payload=payload):
+                fixture = RuntimeDatasetFixture()
+                try:
+                    with (fixture.audit_dir / "selected_questions.jsonl").open(
+                        "a", encoding="utf-8"
+                    ) as output:
+                        output.write(payload)
+                    self.assert_rejected(fixture, pattern, partition="train")
+                finally:
+                    fixture.close()
+
+    def test_rejects_absolute_traversing_noncanonical_missing_and_symlink_escape_paths(
+        self,
+    ) -> None:
+        path_cases = (
+            ("absolute", "/tmp/outside.png", r"image_path|relative|canonical"),
+            (
+                "traversal",
+                "images/train/../train/CLEVR_train_000002.png",
+                r"image_path|canonical",
+            ),
+            (
+                "noncanonical",
+                "images/train/sub/../CLEVR_train_000002.png",
+                r"image_path|canonical",
+            ),
+        )
+        for name, image_path, pattern in path_cases:
+            with self.subTest(case=name):
+                fixture = RuntimeDatasetFixture()
+                try:
+                    fixture.rows[0]["image_path"] = image_path
+                    fixture.write_artifacts()
+                    self.assert_rejected(fixture, pattern)
+                finally:
+                    fixture.close()
+
+        fixture = RuntimeDatasetFixture()
+        try:
+            missing = (
+                fixture.data_root
+                / "images"
+                / "train"
+                / "CLEVR_train_000002.png"
+            )
+            missing.unlink()
+            self.assert_rejected(fixture, r"image|missing|file")
+        finally:
+            fixture.close()
+
+        fixture = RuntimeDatasetFixture()
+        try:
+            linked = (
+                fixture.data_root
+                / "images"
+                / "train"
+                / "CLEVR_train_000002.png"
+            )
+            outside = fixture.root / "outside.png"
+            Image.new("RGBA", (3, 2), (1, 2, 3, 255)).save(outside, format="PNG")
+            linked.unlink()
+            linked.symlink_to(outside)
+            self.assert_rejected(fixture, r"outside|root|escape")
+        finally:
+            fixture.close()
+
+    def test_decode_failure_after_construction_is_contextual_and_not_skipped(self) -> None:
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+        first_path = (
+            self.fixture.data_root
+            / "images"
+            / "train"
+            / "CLEVR_train_000001.png"
+        )
+        first_path.write_bytes(b"not a PNG")
+
+        self.assert_access_rejected(
+            dataset, 0, r"index 0|CLEVR_train_000001.png|decode"
+        )
+
+    def test_multiple_questions_may_share_one_image_without_mutable_sample_storage(
+        self,
+    ) -> None:
+        duplicate = dict(self.fixture.rows[2])
+        duplicate["question_index"] = 11
+        duplicate["source_position"] = 11
+        self.fixture.rows.append(duplicate)
+        self.fixture.write_artifacts()
+        dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+
+        first = dataset[0]["image"]
+        first.zero_()
+        second = dataset[1]["image"]
+
+        self.assertNotEqual(first.data_ptr(), second.data_ptr())
+        torch.testing.assert_close(
+            second[:, 0, 0],
+            torch.tensor([1.0, 128.0 / 255.0, 0.0]),
+            rtol=0,
+            atol=0,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
