@@ -107,7 +107,7 @@ git commit -m "feat: expose CLEVR sample provenance safely"
 **Interfaces:**
 - Consumes: `Path`, strict JSON-compatible mappings, Task 1 identities only indirectly through prediction records.
 - Produces: `CLEVRRunArtifactError`, `CLEVRRunSpec`, `CLEVRPredictionRecord`, `CLEVRRunArtifacts.open(...)`, `ensure_common_state(...)`, `append_event(...)`, `checkpoint_path(...)`, `prediction_path(...)`, `publish_predictions(...)`, and `close()`.
-- Defers: no torch/model/dataset construction, checkpoint serialization, update loop, or device selection.
+- Defers: no model/dataset construction, protocol checkpoint serialization, update loop, or device selection; PyTorch is used only for restricted common-state tensor serialization.
 
 - [ ] **Step 1: Write failing run-spec tests**
 
