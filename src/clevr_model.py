@@ -92,15 +92,30 @@ class CLEVRQuestionEncoder(nn.Module):
 
 
 class CLEVRQuestionAnswerer(nn.Module):
-    """Frozen PUB-R1.1 RGB/question architecture with G or B axial RoPE."""
+    """Frozen PUB-R1.1 RGB/question architecture with G, B, or M10 RoPE."""
 
-    def __init__(self, vocab_size: int, *, mode: str = "G") -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        *,
+        mode: str = "G",
+        m10_seed: int | None = None,
+    ) -> None:
         super().__init__()
-        if mode not in {"G", "B"}:
-            raise ValueError("mode must be G or B")
+        if mode not in {"G", "B", "M10"}:
+            raise ValueError("mode must be G, B, or M10")
+        if mode == "M10":
+            if m10_seed is None:
+                raise ValueError("M10 requires m10_seed")
+            if type(m10_seed) is not int:
+                raise TypeError("m10_seed must be an integer")
+            if m10_seed < 0:
+                raise ValueError("m10_seed must be non-negative")
+        elif m10_seed is not None:
+            raise ValueError("m10_seed is only valid for M10")
 
         classifier = RoPEClassifier(
-            mode=mode,
+            mode="G" if mode == "M10" else mode,
             fixed_lambda=1.0,
             image_size=224,
             patch_size=16,
@@ -118,6 +133,9 @@ class CLEVRQuestionAnswerer(nn.Module):
         self.backbone = classifier.backbone
         self.position = classifier.position
         self.question_encoder = CLEVRQuestionEncoder(vocab_size)
+        if mode == "M10":
+            self.position = CLEVRMixedPosition(seed=m10_seed)
+        self.mode = mode
 
     @staticmethod
     def _validate_batch(
@@ -146,14 +164,21 @@ class CLEVRQuestionAnswerer(nn.Module):
     ) -> Tensor:
         """Return all normalized CLS and patch tokens."""
         self._validate_batch(image, question_tokens, question_length)
+        if self.mode == "M10" and lam is not None:
+            raise ValueError("lam is not valid for M10")
         patches = self.backbone.patch_embed(image)
         question = self.question_encoder(question_tokens, question_length)
         cls = self.backbone.cls_token.expand(image.shape[0], -1, -1)
         cls = cls + question.unsqueeze(1)
         tokens = torch.cat((cls, patches), dim=1)
-        phases = self.position(14, 14, lam=lam, device=image.device)
-        for block in self.backbone.blocks:
-            tokens = block(tokens, freqs_cis=phases)
+        if self.mode == "M10":
+            phases = self.position()
+            for block_index, block in enumerate(self.backbone.blocks):
+                tokens = block(tokens, freqs_cis=phases[block_index])
+        else:
+            phases = self.position(14, 14, lam=lam, device=image.device)
+            for block in self.backbone.blocks:
+                tokens = block(tokens, freqs_cis=phases)
         return self.backbone.norm(tokens)
 
     def forward_features(

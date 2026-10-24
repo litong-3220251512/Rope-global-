@@ -323,6 +323,135 @@ class CLEVRMixedPositionTests(unittest.TestCase):
         )
 
 
+class CLEVRQuestionAnswererM10Tests(unittest.TestCase):
+    def test_requires_a_dedicated_seed_only_for_m10_and_rejects_lambda(self):
+        with self.assertRaises(ValueError):
+            CLEVRQuestionAnswerer(vocab_size=8, mode="M10")
+        for seed in (True, 1.0, "1"):
+            with self.subTest(seed=seed), self.assertRaises(TypeError):
+                CLEVRQuestionAnswerer(
+                    vocab_size=8, mode="M10", m10_seed=seed
+                )
+        with self.assertRaises(ValueError):
+            CLEVRQuestionAnswerer(vocab_size=8, mode="M10", m10_seed=-1)
+        for mode in ("G", "B"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                CLEVRQuestionAnswerer(
+                    vocab_size=8, mode=mode, m10_seed=20007
+                )
+
+        model = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="M10", m10_seed=20007
+        ).eval()
+        self.assertIsInstance(model.position, CLEVRMixedPosition)
+        image, question_tokens, question_length = _valid_answerer_inputs()
+        with self.assertRaises(ValueError):
+            model(
+                image,
+                question_tokens,
+                question_length,
+                lam=0.0,
+            )
+
+    def test_common_state_and_global_rng_match_g_at_equal_common_seed(self):
+        common_seed = 20261025
+        torch.manual_seed(common_seed)
+        global_model = CLEVRQuestionAnswerer(vocab_size=8, mode="G")
+        next_after_global = torch.rand(8)
+
+        torch.manual_seed(common_seed)
+        mixed_model = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="M10", m10_seed=20007
+        )
+        next_after_mixed = torch.rand(8)
+
+        global_state = {
+            name: value
+            for name, value in global_model.state_dict().items()
+            if not name.startswith("position.")
+        }
+        mixed_state = {
+            name: value
+            for name, value in mixed_model.state_dict().items()
+            if not name.startswith("position.")
+        }
+        self.assertEqual(tuple(global_state), tuple(mixed_state))
+        for name, global_value in global_state.items():
+            with self.subTest(state=name):
+                mixed_value = mixed_state[name]
+                self.assertEqual(global_value.shape, mixed_value.shape)
+                self.assertEqual(global_value.dtype, mixed_value.dtype)
+                self.assertTrue(torch.equal(global_value, mixed_value))
+        self.assertTrue(torch.equal(next_after_global, next_after_mixed))
+
+    def test_routes_each_live_mixed_phase_to_its_matching_block(self):
+        torch.manual_seed(20261025)
+        model = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="M10", m10_seed=20007
+        ).eval()
+        image, question_tokens, question_length = _valid_answerer_inputs()
+        captured = []
+
+        def capture_phase(_module, _args, kwargs):
+            captured.append(kwargs["freqs_cis"])
+
+        handles = [
+            block.register_forward_pre_hook(capture_phase, with_kwargs=True)
+            for block in model.backbone.blocks
+        ]
+        try:
+            with torch.no_grad():
+                expected = model.position()
+                model.forward_tokens(image, question_tokens, question_length)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertEqual(len(captured), 6)
+        for block_index, block_phase in enumerate(captured):
+            with self.subTest(block=block_index):
+                self.assertEqual(tuple(block_phase.shape), (3, 196, 32))
+                self.assertTrue(
+                    torch.equal(block_phase, expected[block_index])
+                )
+        self.assertFalse(torch.equal(captured[0], captured[1]))
+
+    def test_answer_loss_reaches_q_k_and_frequencies_and_update_recomputes_phase(self):
+        torch.manual_seed(20261025)
+        model = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="M10", m10_seed=20007
+        )
+        image, question_tokens, question_length = _valid_answerer_inputs()
+        logits = model(image, question_tokens, question_length)
+        loss = nn.functional.cross_entropy(
+            logits, torch.tensor((1,), dtype=torch.int64)
+        )
+        loss.backward()
+
+        frequency_gradient = model.position.freqs.grad
+        self.assertIsNotNone(frequency_gradient)
+        self.assertTrue(torch.isfinite(frequency_gradient).all())
+        self.assertGreater(frequency_gradient.abs().sum().item(), 0.0)
+        for block_index, block in enumerate(model.backbone.blocks):
+            gradient = block.attn.qkv.weight.grad
+            self.assertIsNotNone(gradient)
+            for projection, rows in (
+                ("q", slice(0, 192)),
+                ("k", slice(192, 384)),
+            ):
+                with self.subTest(block=block_index, projection=projection):
+                    selected = gradient[rows]
+                    self.assertTrue(torch.isfinite(selected).all())
+                    self.assertGreater(selected.abs().sum().item(), 0.0)
+
+        before_update = model.position()
+        with torch.no_grad():
+            model.position.freqs.add_(frequency_gradient, alpha=-0.01)
+            after_update = model.position()
+        self.assertIsNot(before_update, after_update)
+        self.assertFalse(torch.equal(before_update, after_update))
+
+
 class CLEVRQuestionAnswererArchitectureTests(unittest.TestCase):
     def test_constructs_the_exact_pub_r1_1_backbone(self):
         model = CLEVRQuestionAnswerer(vocab_size=8)
