@@ -485,12 +485,9 @@ def _publish_new_file(
     path: Path,
     payload: Mapping[str, object],
 ) -> CLEVRCheckpointMetadata:
-    descriptor, staging_name = tempfile.mkstemp(
-        prefix=f".{path.name}.staging-",
-        dir=path.parent,
-    )
-    staging = Path(staging_name)
-    descriptor_owned = True
+    descriptor: int | None = None
+    staging_name: str | None = None
+    staging: Path | None = None
     output: object | None = None
     staging_identity: tuple[int, int] | None = None
     link_started = False
@@ -498,15 +495,20 @@ def _publish_new_file(
     staging_unlink_started = False
     committed = False
     try:
+        descriptor, staging_name = tempfile.mkstemp(
+            prefix=f".{path.name}.staging-",
+            dir=path.parent,
+        )
         acquired_stat = os.fstat(descriptor)
         staging_identity = (acquired_stat.st_dev, acquired_stat.st_ino)
+        staging = Path(staging_name)
         os.fchmod(descriptor, 0o600)
         output = os.fdopen(descriptor, "wb")
-        descriptor_owned = False
+        descriptor = None
         with output:
             torch.save(payload, output)
             output.flush()
-        staging_stat = staging.stat(follow_symlinks=False)
+        staging_stat = os.stat(staging, follow_symlinks=False)
         if not stat.S_ISREG(staging_stat.st_mode):
             raise CLEVRCheckpointError("checkpoint staging path is not a regular file")
         if (staging_stat.st_dev, staging_stat.st_ino) != staging_identity:
@@ -528,18 +530,18 @@ def _publish_new_file(
             cuda_devices=payload["rng_state"]["cuda_devices"],
         )
     except BaseException as primary:
-        cleanup_failures: list[BaseException] = []
+        cleanup_failures: list[tuple[str, BaseException]] = []
 
         if output is not None and not bool(getattr(output, "closed", False)):
             try:
                 output.close()
             except BaseException as cleanup_error:
-                cleanup_failures.append(cleanup_error)
-        elif descriptor_owned:
+                cleanup_failures.append(("descriptor close", cleanup_error))
+        elif descriptor is not None:
             try:
                 os.close(descriptor)
             except BaseException as cleanup_error:
-                cleanup_failures.append(cleanup_error)
+                cleanup_failures.append(("descriptor close", cleanup_error))
 
         if (
             not committed
@@ -547,17 +549,24 @@ def _publish_new_file(
             and not link_returned
             and staging_identity is not None
         ):
-            committed = _paths_are_same_regular_inode(
-                staging,
-                path,
-                staging_identity,
-            )
-
-        if not staging_unlink_started:
             try:
-                _unlink_owned_staging(staging, staging_identity)
+                if staging is None:
+                    raise CLEVRCheckpointError(
+                        "checkpoint staging path is unavailable for reconciliation"
+                    )
+                committed = _paths_are_same_regular_inode(
+                    staging,
+                    path,
+                    staging_identity,
+                )
             except BaseException as cleanup_error:
-                cleanup_failures.append(cleanup_error)
+                cleanup_failures.append(("commit reconciliation", cleanup_error))
+
+        if not staging_unlink_started and staging_name is not None:
+            try:
+                _unlink_owned_staging(staging_name, staging_identity)
+            except BaseException as cleanup_error:
+                cleanup_failures.append(("staging cleanup", cleanup_error))
 
         if committed or cleanup_failures:
             status = "committed" if committed else "not committed"
@@ -565,9 +574,9 @@ def _publish_new_file(
                 f"checkpoint publication failed ({status})",
                 committed=committed,
             )
-            for cleanup_error in cleanup_failures:
+            for phase, cleanup_error in cleanup_failures:
                 publication_error.add_note(
-                    "checkpoint staging cleanup failure: "
+                    f"checkpoint {phase} failure: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
             raise publication_error from primary
@@ -575,13 +584,13 @@ def _publish_new_file(
 
 
 def _paths_are_same_regular_inode(
-    staging: Path,
-    target: Path,
+    staging: str | os.PathLike[str],
+    target: str | os.PathLike[str],
     expected_identity: tuple[int, int],
 ) -> bool:
     try:
-        staging_stat = staging.stat(follow_symlinks=False)
-        target_stat = target.stat(follow_symlinks=False)
+        staging_stat = os.stat(staging, follow_symlinks=False)
+        target_stat = os.stat(target, follow_symlinks=False)
     except OSError:
         return False
     if not stat.S_ISREG(staging_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
@@ -592,11 +601,11 @@ def _paths_are_same_regular_inode(
 
 
 def _unlink_owned_staging(
-    staging: Path,
+    staging: str | os.PathLike[str],
     expected_identity: tuple[int, int] | None,
 ) -> None:
     try:
-        staging_stat = staging.stat(follow_symlinks=False)
+        staging_stat = os.stat(staging, follow_symlinks=False)
     except FileNotFoundError:
         return
     if expected_identity is None:

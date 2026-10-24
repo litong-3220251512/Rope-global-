@@ -103,6 +103,35 @@ class CheckpointSaveTests(unittest.TestCase):
             return
         self.assertEqual(actual, expected)
 
+    def assert_numpy_global_state_equal(
+        self,
+        actual: tuple[object, ...],
+        expected: tuple[object, ...],
+    ) -> None:
+        self.assertEqual(actual[0], expected[0])
+        self.assertTrue(np.array_equal(actual[1], expected[1]))
+        self.assertEqual(actual[2:], expected[2:])
+
+    def assert_numpy_payload_equal(
+        self,
+        actual: dict[str, object],
+        expected: tuple[object, ...],
+    ) -> None:
+        self.assertEqual(
+            set(actual),
+            {"bit_generator", "keys", "pos", "has_gauss", "cached_gaussian"},
+        )
+        self.assertEqual(actual["bit_generator"], "MT19937")
+        self.assertTrue(
+            torch.equal(
+                actual["keys"],
+                torch.from_numpy(expected[1].astype(np.int64)),
+            )
+        )
+        self.assertEqual(actual["pos"], expected[2])
+        self.assertEqual(actual["has_gauss"], expected[3])
+        self.assertEqual(actual["cached_gaussian"], expected[4])
+
     def test_saves_complete_weights_only_payload_at_update_boundary(self) -> None:
         fixture = _CheckpointFixture()
         expected_model = _clone_state(fixture.model.state_dict())
@@ -158,6 +187,13 @@ class CheckpointSaveTests(unittest.TestCase):
                     cuda_devices=(),
                 )
 
+            self.assertEqual(random.getstate(), expected_python)
+            self.assert_numpy_global_state_equal(
+                np.random.get_state(legacy=True),
+                expected_numpy,
+            )
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), expected_torch))
+
             payload = torch.load(target, map_location="cpu", weights_only=True)
 
             self.assertEqual(
@@ -203,23 +239,9 @@ class CheckpointSaveTests(unittest.TestCase):
             self.assert_state_equal(payload["scheduler_state"], expected_scheduler)
             self.assert_state_equal(payload["sampler_state"], expected_sampler)
             self.assertEqual(payload["rng_state"]["python"], expected_python)
-            self.assertEqual(
-                set(payload["rng_state"]["numpy"]),
-                {"bit_generator", "keys", "pos", "has_gauss", "cached_gaussian"},
-            )
-            self.assertEqual(payload["rng_state"]["numpy"]["bit_generator"], "MT19937")
-            self.assertTrue(
-                torch.equal(
-                    payload["rng_state"]["numpy"]["keys"],
-                    torch.from_numpy(expected_numpy[1].astype(np.int64)),
-                )
-            )
-            self.assertEqual(payload["rng_state"]["numpy"]["pos"], expected_numpy[2])
-            self.assertEqual(
-                payload["rng_state"]["numpy"]["has_gauss"], expected_numpy[3]
-            )
-            self.assertEqual(
-                payload["rng_state"]["numpy"]["cached_gaussian"], expected_numpy[4]
+            self.assert_numpy_payload_equal(
+                payload["rng_state"]["numpy"],
+                expected_numpy,
             )
             self.assertTrue(torch.equal(payload["rng_state"]["torch_cpu"], expected_torch))
             self.assertEqual(payload["rng_state"]["cuda_devices"], ())
@@ -267,6 +289,10 @@ class CheckpointSaveTests(unittest.TestCase):
             self.assert_state_equal(payload["scheduler_state"], expected_scheduler)
             self.assert_state_equal(payload["sampler_state"], expected_sampler)
             self.assertEqual(payload["rng_state"]["python"], expected_python)
+            self.assert_numpy_payload_equal(
+                payload["rng_state"]["numpy"],
+                expected_numpy,
+            )
             self.assertTrue(torch.equal(payload["rng_state"]["torch_cpu"], expected_torch))
 
     def test_boundary_hand_example_preserves_next_committed_indices(self) -> None:
@@ -299,6 +325,42 @@ class CheckpointSaveTests(unittest.TestCase):
             # Catches saving the preview/dispatched position instead of the
             # committed position at the completed optimizer-update boundary.
             self.assertEqual(restored.preview(12), literal_next_prefix)
+
+    def test_complete_epoch_tail_boundary_is_preserved_exactly(self) -> None:
+        fixture = _CheckpointFixture()
+        fixture.sampler = CLEVRIndexStream(dataset_size=8, run_seed=101)
+        fixture.sampler.commit(fixture.sampler.preview(128))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "epoch-tail.pt"
+            save_clevr_checkpoint(
+                target,
+                method="G",
+                run_seed=101,
+                completed_updates=1,
+                model=fixture.model,
+                optimizer=fixture.optimizer,
+                scheduler=fixture.scheduler,
+                sampler=fixture.sampler,
+                cuda_devices=(),
+            )
+            payload = torch.load(target, map_location="cpu", weights_only=True)
+
+            sampler_state = payload["sampler_state"]
+            self.assertEqual(sampler_state["dataset_size"], 8)
+            self.assertEqual(sampler_state["epoch_index"], 15)
+            self.assertEqual(sampler_state["cursor"], 8)
+            self.assertEqual(
+                sampler_state["epoch_index"] * 8 + sampler_state["cursor"],
+                128,
+            )
+
+            uninterrupted_next = fixture.sampler.preview(12)
+            restored = CLEVRIndexStream(dataset_size=8, run_seed=101)
+            restored.load_state_dict(sampler_state)
+
+            # Catches rejecting or normalizing the legal c == D boundary.
+            self.assertEqual(restored.preview(12), uninterrupted_next)
 
 
 class CheckpointSaveValidationTests(unittest.TestCase):
@@ -481,6 +543,35 @@ class CheckpointSaveValidationTests(unittest.TestCase):
                     sampler=off_boundary,
                 )
 
+    def test_rejects_optimizer_identity_name_order_and_coverage_before_io(
+        self,
+    ) -> None:
+        fixture = _CheckpointFixture()
+        fixture.optimizer.param_groups[0]["param_names"] = ["0.bias"]
+        fixture.optimizer.param_groups[1]["param_names"] = ["0.weight"]
+        self.assert_rejected_before_staging(fixture=fixture)
+
+        fixture = _CheckpointFixture()
+        weight = fixture.model[0].weight
+        bias = fixture.model[0].bias
+        fixture.optimizer.param_groups[0]["params"] = [bias]
+        fixture.optimizer.param_groups[1]["params"] = [weight]
+        self.assert_rejected_before_staging(fixture=fixture)
+
+        fixture = _CheckpointFixture()
+        weight = fixture.model[0].weight
+        fixture.optimizer.param_groups[1]["params"] = [weight]
+        fixture.optimizer.param_groups[1]["param_names"] = ["0.weight"]
+        self.assert_rejected_before_staging(fixture=fixture)
+
+        fixture = _CheckpointFixture()
+        fixture.optimizer.param_groups[1]["group_name"] = "decay"
+        self.assert_rejected_before_staging(fixture=fixture)
+
+        fixture = _CheckpointFixture()
+        fixture.optimizer.param_groups[0]["param_names"] = []
+        self.assert_rejected_before_staging(fixture=fixture)
+
     def test_rejects_missing_or_non_directory_parent_before_io(self) -> None:
         fixture = _CheckpointFixture()
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -550,6 +641,172 @@ class CheckpointPublicationTests(unittest.TestCase):
 
     def assert_no_staging(self, target: Path) -> None:
         self.assertEqual(list(target.parent.glob(f".{target.name}.staging-*")), [])
+
+    def descriptor_is_closed(self, descriptor: int) -> bool:
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            return True
+        return False
+
+    def test_first_post_mkstemp_interrupt_closes_descriptor_and_removes_staging(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "setup-interrupt.pt"
+            descriptors: list[int] = []
+            staging_paths: list[str] = []
+            primary = KeyboardInterrupt("constructing staging Path")
+            real_mkstemp = tempfile.mkstemp
+
+            def recording_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+                descriptor, staging_name = real_mkstemp(*args, **kwargs)
+                descriptors.append(descriptor)
+                staging_paths.append(staging_name)
+                return descriptor, staging_name
+
+            observed: BaseException | None = None
+            try:
+                with (
+                    mock.patch.object(
+                        checkpoint_module.tempfile,
+                        "mkstemp",
+                        side_effect=recording_mkstemp,
+                    ),
+                    mock.patch.object(checkpoint_module, "Path", side_effect=primary),
+                ):
+                    try:
+                        checkpoint_module._publish_new_file(target, {})
+                    except BaseException as error:
+                        observed = error
+
+                descriptor_closed = self.descriptor_is_closed(descriptors[0])
+                staging_exists = os.path.lexists(staging_paths[0])
+            finally:
+                if descriptors and not self.descriptor_is_closed(descriptors[0]):
+                    os.close(descriptors[0])
+                if staging_paths and os.path.lexists(staging_paths[0]):
+                    os.unlink(staging_paths[0])
+
+            self.assertIs(observed, primary)
+            self.assertTrue(descriptor_closed)
+            self.assertFalse(staging_exists)
+            self.assertFalse(target.exists())
+
+    def test_first_post_mkstemp_interrupt_reports_cleanup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "setup-cleanup-failure.pt"
+            descriptors: list[int] = []
+            staging_paths: list[str] = []
+            primary = KeyboardInterrupt("constructing staging Path")
+            cleanup = OSError("setup staging unlink failed")
+            real_mkstemp = tempfile.mkstemp
+
+            def recording_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+                descriptor, staging_name = real_mkstemp(*args, **kwargs)
+                descriptors.append(descriptor)
+                staging_paths.append(staging_name)
+                return descriptor, staging_name
+
+            observed: BaseException | None = None
+            try:
+                with (
+                    mock.patch.object(
+                        checkpoint_module.tempfile,
+                        "mkstemp",
+                        side_effect=recording_mkstemp,
+                    ),
+                    mock.patch.object(checkpoint_module, "Path", side_effect=primary),
+                    mock.patch.object(
+                        checkpoint_module.os,
+                        "unlink",
+                        side_effect=cleanup,
+                    ),
+                ):
+                    try:
+                        checkpoint_module._publish_new_file(target, {})
+                    except BaseException as error:
+                        observed = error
+
+                descriptor_closed = self.descriptor_is_closed(descriptors[0])
+                staging_exists = os.path.lexists(staging_paths[0])
+            finally:
+                if descriptors and not self.descriptor_is_closed(descriptors[0]):
+                    os.close(descriptors[0])
+                if staging_paths and os.path.lexists(staging_paths[0]):
+                    os.unlink(staging_paths[0])
+
+            self.assertIsInstance(observed, CLEVRCheckpointPublicationError)
+            self.assertFalse(observed.committed)
+            self.assertIs(observed.__cause__, primary)
+            self.assertTrue(
+                any("unlink" in note for note in observed.__notes__)
+            )
+            self.assertTrue(descriptor_closed)
+            self.assertTrue(staging_exists)
+            self.assertFalse(target.exists())
+
+    def test_reconciliation_interrupt_retains_primary_and_continues_cleanup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "reconciliation-interrupt.pt"
+            descriptors: list[int] = []
+            staging_paths: list[str] = []
+            primary = OSError("ambiguous link failure")
+            reconciliation = KeyboardInterrupt("inode reconciliation interrupted")
+            real_mkstemp = tempfile.mkstemp
+
+            def recording_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+                descriptor, staging_name = real_mkstemp(*args, **kwargs)
+                descriptors.append(descriptor)
+                staging_paths.append(staging_name)
+                return descriptor, staging_name
+
+            observed: BaseException | None = None
+            try:
+                with (
+                    mock.patch.object(
+                        checkpoint_module.tempfile,
+                        "mkstemp",
+                        side_effect=recording_mkstemp,
+                    ),
+                    mock.patch.object(
+                        checkpoint_module.os,
+                        "link",
+                        side_effect=primary,
+                    ),
+                    mock.patch.object(
+                        checkpoint_module,
+                        "_paths_are_same_regular_inode",
+                        side_effect=reconciliation,
+                    ),
+                ):
+                    try:
+                        self.save(target)
+                    except BaseException as error:
+                        observed = error
+
+                descriptor_closed = self.descriptor_is_closed(descriptors[0])
+                staging_exists = os.path.lexists(staging_paths[0])
+            finally:
+                if descriptors and not self.descriptor_is_closed(descriptors[0]):
+                    os.close(descriptors[0])
+                if staging_paths and os.path.lexists(staging_paths[0]):
+                    os.unlink(staging_paths[0])
+
+            self.assertIsInstance(observed, CLEVRCheckpointPublicationError)
+            self.assertFalse(observed.committed)
+            self.assertIs(observed.__cause__, primary)
+            self.assertTrue(
+                any(
+                    "reconciliation" in note and "KeyboardInterrupt" in note
+                    for note in observed.__notes__
+                )
+            )
+            self.assertTrue(descriptor_closed)
+            self.assertFalse(staging_exists)
+            self.assertFalse(target.exists())
 
     def test_existing_file_directory_and_symlink_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
