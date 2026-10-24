@@ -458,6 +458,29 @@ class CLEVRLearningRateTests(unittest.TestCase):
                 with self.assertRaises(CLEVRTrainingConfigurationError):
                     build_clevr_lr_scheduler(optimizer)  # type: ignore[arg-type]
 
+    def test_scheduler_rejects_conflicting_initial_lr_atomically(self) -> None:
+        first = torch.nn.Parameter(torch.tensor(0.0))
+        second = torch.nn.Parameter(torch.tensor(0.0))
+        optimizers = (
+            torch.optim.AdamW([first], lr=3e-4),
+            torch.optim.AdamW(
+                ({"params": [first]}, {"params": [second]}),
+                lr=3e-4,
+            ),
+        )
+        optimizers[0].param_groups[0]["initial_lr"] = 1e-3
+        optimizers[1].param_groups[0]["initial_lr"] = 3e-4
+        optimizers[1].param_groups[1]["initial_lr"] = 1e-3
+
+        for optimizer in optimizers:
+            with self.subTest(groups=len(optimizer.param_groups)):
+                before = copy.deepcopy(optimizer.state_dict())
+
+                with self.assertRaises(CLEVRTrainingConfigurationError):
+                    build_clevr_lr_scheduler(optimizer)
+
+                self.assertEqual(optimizer.state_dict(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

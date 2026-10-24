@@ -260,6 +260,16 @@ def build_clevr_lr_scheduler(optimizer: AdamW) -> LambdaLR:
             raise CLEVRTrainingConfigurationError(
                 "optimizer group learning rate must start at 3e-4"
             )
+        if "initial_lr" in group:
+            initial_learning_rate = group["initial_lr"]
+            if type(initial_learning_rate) not in {int, float}:
+                raise CLEVRTrainingConfigurationError(
+                    "optimizer group initial_lr must be an ordinary number"
+                )
+            if initial_learning_rate != _BASE_LEARNING_RATE:
+                raise CLEVRTrainingConfigurationError(
+                    "optimizer group initial_lr must be 3e-4"
+                )
 
     def multiplier(scheduler_epoch: int) -> float:
         next_update = min(scheduler_epoch + 1, _TOTAL_UPDATES)
