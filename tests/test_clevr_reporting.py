@@ -15,7 +15,10 @@ from pathlib import Path
 from unittest import mock
 
 import src.clevr_reporting as clevr_reporting
+import run_clevr_data_audit as audit_producer
 from run_clevr_statistics import main as statistics_cli_main
+from src.clevr_audit import AuditResult, PartitionSummary, SelectedQuestion
+from src.clevr_partitions import ImageIdentity, build_image_partitions
 from src.clevr_reporting import (
     ArtifactEvidence,
     CLEVRReportError,
@@ -37,6 +40,7 @@ from src.clevr_statistics import (
     TargetRow,
     compute_clevr_statistics,
 )
+from src.clevr_text import build_vocabulary
 
 
 _IMAGE_PARTITIONS = {
@@ -56,9 +60,9 @@ _IMAGE_PARTITIONS = {
         ],
         "dev": [
             {
-                "official_split": "val",
+                "official_split": "train",
                 "image_index": 12,
-                "image_filename": "CLEVR_val_000012.png",
+                "image_filename": "CLEVR_train_000012.png",
             }
         ],
         "base_test": [
@@ -120,12 +124,12 @@ _MANIFEST_ROWS = (
     },
     {
         "partition": "dev",
-        "official_split": "val",
+        "official_split": "train",
         "image_index": 12,
-        "image_filename": "CLEVR_val_000012.png",
-        "image_path": "images/val/CLEVR_val_000012.png",
+        "image_filename": "CLEVR_train_000012.png",
+        "image_path": "images/train/CLEVR_train_000012.png",
         "question_index": 30,
-        "source_position": 0,
+        "source_position": 2,
         "question": "Is anything left of the object?",
         "encoded_tokens": [1, 5, 2],
         "answer": 1,
@@ -223,12 +227,12 @@ _REPORTING_MANIFEST_ROWS = (
     },
     {
         "partition": "dev",
-        "official_split": "val",
+        "official_split": "train",
         "image_index": 12,
-        "image_filename": "CLEVR_val_000012.png",
-        "image_path": "images/val/CLEVR_val_000012.png",
+        "image_filename": "CLEVR_train_000012.png",
+        "image_path": "images/train/CLEVR_train_000012.png",
         "question_index": 30,
-        "source_position": 0,
+        "source_position": 2,
         "question": "Is anything left of the object?",
         "encoded_tokens": [1, 5, 2],
         "answer": 1,
@@ -519,6 +523,83 @@ class AuditBundleTests(unittest.TestCase):
             counts, PartitionCounts(train=2, dev=1, base_test=2, confirmation=1)
         )
 
+    def test_loads_artifacts_serialized_from_existing_audit_producer(self) -> None:
+        # Mutation caught: mapping producer-created dev images to official val.
+        producer_dir = self.audit_dir.parent / "producer-audit"
+        producer_dir.mkdir()
+        data_root = self.audit_dir.parent / "CLEVR_v1.0"
+        partitions = build_image_partitions(
+            tuple(
+                ImageIdentity("train", index, f"CLEVR_train_{index:06d}.png")
+                for index in range(10)
+            ),
+            tuple(
+                ImageIdentity("val", index, f"CLEVR_val_{index:06d}.png")
+                for index in range(2)
+            ),
+        )
+        selected_questions = tuple(
+            SelectedQuestion(
+                partition=partition,
+                official_split=image.official_split,
+                image_index=image.image_index,
+                image_filename=image.image_filename,
+                image_path=data_root
+                / "images"
+                / image.official_split
+                / image.image_filename,
+                question_index=question_index,
+                source_position=source_position,
+                question=f"{partition} question?",
+                encoded_tokens=(1, 3, 2),
+                answer=answer,
+                relation=relation,
+            )
+            for partition, image, question_index, source_position, answer, relation in (
+                ("train", partitions.train[0], 10, 100, 0, "left"),
+                ("dev", partitions.dev[0], 11, 101, 1, "right"),
+                ("base_test", partitions.base_test[0], 20, 200, 0, "front"),
+                (
+                    "confirmation",
+                    partitions.confirmation[0],
+                    21,
+                    201,
+                    1,
+                    "behind",
+                ),
+            )
+        )
+        audit = AuditResult(
+            selected_questions=selected_questions,
+            vocabulary=build_vocabulary(("train question?",)),
+            image_partitions=partitions,
+            cell_counts=(),
+            exclusion_counts=(),
+            partition_summaries=tuple(
+                PartitionSummary(
+                    partition=partition,
+                    mother_image_count=len(getattr(partitions, partition)),
+                    selected_image_count=1,
+                    selected_question_count=1,
+                )
+                for partition in ("train", "dev", "base_test", "confirmation")
+            ),
+            source_summaries=(),
+            file_summaries=(),
+        )
+        audit_producer._write_artifacts(producer_dir, audit, data_root)
+
+        targets, _, counts = load_audit_targets(producer_dir)
+
+        self.assertEqual(
+            tuple((target.partition, target.official_split) for target in targets),
+            (("train", "train"), ("base_test", "val")),
+        )
+        self.assertEqual(
+            counts,
+            PartitionCounts(train=1, dev=1, base_test=1, confirmation=1),
+        )
+
     def test_symlinked_audit_inputs_record_resolved_target_paths(self) -> None:
         # Mutation caught: discarding each reader's resolved artifact identity.
         target_dir = self.audit_dir.parent / "resolved-artifacts"
@@ -777,9 +858,9 @@ class AuditBundleTests(unittest.TestCase):
 
         self._reset_bundle()
         self.image_partitions["partitions"]["dev"][0] = {
-            "official_split": "train",
+            "official_split": "val",
             "image_index": 12,
-            "image_filename": "CLEVR_train_000012.png",
+            "image_filename": "CLEVR_val_000012.png",
         }
         self._write_bundle()
         self._assert_bundle_error("image_partitions.json")
@@ -799,9 +880,9 @@ class AuditBundleTests(unittest.TestCase):
         self._reset_bundle()
         self.manifest_rows[3].update(
             {
-                "image_index": 11,
-                "image_filename": "CLEVR_val_000011.png",
-                "image_path": "images/val/CLEVR_val_000011.png",
+                "image_index": 2,
+                "image_filename": "CLEVR_train_000002.png",
+                "image_path": "images/train/CLEVR_train_000002.png",
             }
         )
         self._write_bundle()
@@ -2272,6 +2353,36 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse(output_dir.exists())
         self.assertEqual(self._staging_paths(output_dir), [])
         self.assertFalse(self._lock_path(output_dir).exists())
+
+    def test_interrupt_after_real_rename_reports_committed_bundle(self) -> None:
+        # Mutation caught: recording commit only after a successful rename return.
+        output_dir = self.root / "rename-return-interrupt"
+        lock_path = self._lock_path(output_dir)
+        real_rename = clevr_reporting.os.rename
+
+        def rename_then_interrupt(source: Path, target: Path) -> None:
+            real_rename(source, target)
+            raise KeyboardInterrupt("injected after successful rename")
+
+        with mock.patch.object(
+            clevr_reporting.os,
+            "rename",
+            side_effect=rename_then_interrupt,
+        ):
+            with self.assertRaises(clevr_reporting.ReportPublicationError) as caught:
+                clevr_reporting.publish_statistics_bundle(
+                    output_dir,
+                    self._build_bundle(),
+                )
+
+        self.assertIs(caught.exception.committed, True)
+        self.assertIn("committed", str(caught.exception))
+        self.assertNotIn("not committed", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, KeyboardInterrupt)
+        self.assertIn("after successful rename", str(caught.exception.__cause__))
+        self._assert_complete_output(output_dir)
+        self.assertEqual(self._staging_paths(output_dir), [])
+        self.assertFalse(lock_path.exists())
 
     def test_partial_lock_token_interrupt_cleans_identity_owned_lock(self) -> None:
         # Mutation caught: requiring a complete token after token initialization failed.

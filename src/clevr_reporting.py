@@ -39,7 +39,7 @@ _PARTITIONS = ("train", "dev", "base_test", "confirmation")
 _TARGET_PARTITIONS = ("train", "base_test")
 _PARTITION_SPLITS = {
     "train": "train",
-    "dev": "val",
+    "dev": "train",
     "base_test": "val",
     "confirmation": "val",
 }
@@ -1246,6 +1246,37 @@ def _release_publication_lock(
         raise cleanup_error
 
 
+def _rename_staging_directory(
+    staging_dir: Path,
+    output_dir: Path,
+) -> BaseException | None:
+    staging_stat = staging_dir.stat(follow_symlinks=False)
+    staging_identity = (staging_stat.st_dev, staging_stat.st_ino)
+    try:
+        os.rename(staging_dir, output_dir)
+    except BaseException as rename_error:
+        try:
+            staging_dir.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            staging_absent = True
+        except OSError:
+            staging_absent = False
+        else:
+            staging_absent = False
+
+        try:
+            output_stat = output_dir.stat(follow_symlinks=False)
+        except OSError:
+            output_identity = None
+        else:
+            output_identity = (output_stat.st_dev, output_stat.st_ino)
+
+        if staging_absent and output_identity == staging_identity:
+            return rename_error
+        raise
+    return None
+
+
 def publish_statistics_bundle(
     output_dir: Path,
     bundle: StatisticsBundle,
@@ -1281,6 +1312,7 @@ def publish_statistics_bundle(
     staging_dir: Path | None = None
     lock_identity: tuple[int, int] | None = None
     initialized_lock_token: bytes | None = None
+    rename_error: BaseException | None = None
     try:
         lock_fd = os.open(
             lock_path,
@@ -1333,7 +1365,7 @@ def publish_statistics_bundle(
                 "output directory appeared after publication lock acquisition: "
                 f"{resolved_output}"
             )
-        os.rename(staging_dir, resolved_output)
+        rename_error = _rename_staging_directory(staging_dir, resolved_output)
         committed = True
         staging_dir = None
     except BaseException as primary_error:
@@ -1379,8 +1411,19 @@ def publish_statistics_bundle(
             initialized_lock_token,
         )
     except BaseException as cleanup_error:
+        if rename_error is not None:
+            cleanup_error.add_note(
+                "rename also raised after the committed directory was reconciled: "
+                f"{rename_error}"
+            )
         raise ReportPublicationError(
             "statistics bundle committed, but unable to remove publication lock: "
             f"{cleanup_error}",
             committed=committed,
         ) from cleanup_error
+    if rename_error is not None:
+        raise ReportPublicationError(
+            "statistics bundle committed, but rename raised after the commit "
+            f"was reconciled: {rename_error}",
+            committed=True,
+        ) from rename_error

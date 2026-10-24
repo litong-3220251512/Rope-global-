@@ -31,7 +31,7 @@
 
 CLI 接收显式 `--audit-dir`，且只读取其中固定的 `image_partitions.json`、`selected_questions.jsonl` 与 `audit_report.json`；不递归扫描、不寻找替代文件。`vocabulary.json` 不参与结果统计，报告器不读取它。所有 JSON 使用第 3.4 节的严格解析。
 
-`image_partitions.json` 顶层字段必须精确为 `protocol_version, partitions`，协议必须为 `PUB-R1.1`。`partitions` 必须精确包含 `train,dev,base_test,confirmation`；每个元素必须精确含 `official_split,image_index,image_filename`，并能构造 `ImageIdentity`。每张图像全目录唯一，train 只含 official train，其余只含 official val。
+`image_partitions.json` 顶层字段必须精确为 `protocol_version, partitions`，协议必须为 `PUB-R1.1`。`partitions` 必须精确包含 `train,dev,base_test,confirmation`；每个元素必须精确含 `official_split,image_index,image_filename`，并能构造 `ImageIdentity`。每张图像全目录唯一，train 与 dev 只含 official train，base_test 与 confirmation 只含 official val。
 
 `audit_report.json` 顶层必须精确包含审计发布器现有的 `protocol_version,environment,partition_summaries,cell_counts,exclusion_counts,source_summaries,file_summaries`。协议必须为 `PUB-R1.1`。报告器只信任并严格解析与本单元有关的 `partition_summaries`：四个元素按固定 partition 顺序，每项精确含 `partition,mother_image_count,selected_image_count,selected_question_count` 和非负严格整数；其余五个字段必须具有审计发布器产生的 JSON container 类型，但不重新执行源 CLEVR 审计。
 
@@ -48,7 +48,7 @@ question_index, source_position, question, encoded_tokens, answer, relation
 
 字段约束：
 
-- `partition ∈ {train,dev,base_test,confirmation}`；映射必须为 `train→train`，其余三者 `→val`；
+- `partition ∈ {train,dev,base_test,confirmation}`；映射必须为 `train→train`、`dev→train`、`base_test→val`、`confirmation→val`；
 - `image_index, question_index, source_position` 是非负 Python `int` 对应的 JSON integer，布尔值不接受；
 - `image_filename = CLEVR_<official_split>_<image_index:06d>.png`；
 - `image_path = images/<official_split>/<image_filename>`，必须是上述规范 POSIX 相对路径；不访问该图像；
@@ -157,8 +157,8 @@ python run_clevr_statistics.py \
 2. 创建父目录和 `.<name>.lock`，使用 `O_CREAT|O_EXCL` 防止并发发布。
 3. 用 `tempfile.mkdtemp(dir=output.parent)` 在同一父目录创建 staging。
 4. 以第 4 节固定编码写规范 targets、20 份规范 predictions 和 `statistics_report.json`。
-5. 再检查目标未出现，然后把 staging directory rename 为目标。
-6. rename 是提交点。提交前任意主异常先清理本次 staging，再尝试清理 lock，且不创建最终目录；提交后不回滚最终目录。lock unlink 自身失败时抛出专用状态错误：rename 前明确 `not committed`，rename 后明确 `committed`；两者都保留无法删除的 lock 供人工审查。
+5. 再检查目标未出现，记录 staging directory 的 `(st_dev, st_ino)`，然后把 staging directory rename 为目标。
+6. rename 是提交点。若 rename 调用在完成文件系统移动后抛出异常，只有旧 staging 路径已不存在且最终路径的 `(st_dev, st_ino)` 与记录值相同时才按已提交处理：清除 staging 清理所有权、保留完整最终目录，并进入提交后的 lock 处理；否则仍按提交前失败处理。提交前任意主异常先清理本次 staging，再尝试清理 lock，且不创建最终目录；提交后不回滚最终目录。lock unlink 自身失败时抛出专用状态错误：rename 前明确 `not committed`，rename 后明确 `committed`；两者都保留无法删除的 lock 供人工审查。
 
 成功 rename 在项目支持的 POSIX 环境中提供原子可见性；跨文件系统风险由同父目录 staging 排除。no-overwrite 只对遵守同一 `O_EXCL` lock 的协作发布者成立；非协作进程在最终检查与 rename 之间创建空目标目录的 POSIX 竞态不在保证内，设计不以 ctypes 私自引入 Linux-only `renameat2`。没有 fsync，因此不承诺系统掉电后的持久性。进程被 SIGKILL 时可能留下 lock/staging，工具不会猜测其是否 stale 或自动删除；由操作者审查后处理。
 
