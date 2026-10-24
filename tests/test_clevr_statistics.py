@@ -7,11 +7,16 @@ from dataclasses import FrozenInstanceError
 from src.clevr_statistics import (
     CellMetrics,
     ClassificationMetrics,
+    PairedSummary,
     PredictionRow,
     RunMetrics,
     RunPredictions,
+    SeedSummary,
     TargetRow,
     evaluate_run,
+    evaluate_train_majority,
+    summarize_paired_differences,
+    summarize_seed_values,
 )
 
 
@@ -92,6 +97,24 @@ def _zero_logit_run(
             if target.partition == "base_test"
         ),
     )
+
+
+def _targets_with_train_labels(labels: tuple[int, ...]) -> tuple[TargetRow, ...]:
+    train = tuple(
+        _target(
+            partition="train",
+            official_split="train",
+            image_index=50 + index,
+            question_index=50 + index,
+            relation=("left", "right", "front", "behind")[index % 4],
+            label=label,
+        )
+        for index, label in enumerate(labels)
+    )
+    base_test = tuple(
+        target for target in _complete_targets() if target.partition == "base_test"
+    )
+    return train + base_test
 
 
 class RecordContractTests(unittest.TestCase):
@@ -375,6 +398,152 @@ class RunMetricTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "cross_entropy"):
             evaluate_run(targets, run)
+
+
+class MajorityBaselineTests(unittest.TestCase):
+    def test_tied_train_labels_predict_no_and_do_not_manufacture_cross_entropy(self) -> None:
+        targets = _targets_with_train_labels((0, 0, 1, 1))
+
+        metrics = evaluate_train_majority(targets)
+
+        self.assertEqual(metrics.question_count, 8)
+        self.assertEqual(metrics.correct_count, 4)
+        self.assertEqual(metrics.accuracy, 0.5)
+        self.assertIsNone(metrics.cross_entropy)
+        self.assertEqual(
+            tuple(cell.accuracy for cell in metrics.cells),
+            (1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0),
+        )
+        self.assertEqual(metrics.macro_accuracy, 0.5)
+
+    def test_yes_train_majority_predicts_yes_for_every_base_test_question(self) -> None:
+        targets = _targets_with_train_labels((1, 0, 1))
+
+        metrics = evaluate_train_majority(targets)
+
+        self.assertEqual(metrics.correct_count, 4)
+        self.assertEqual(
+            tuple(cell.accuracy for cell in metrics.cells),
+            (0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
+        )
+
+    def test_test_labels_cannot_choose_the_majority_class(self) -> None:
+        targets = (
+            _target(
+                partition="train",
+                official_split="train",
+                image_index=1,
+                question_index=1,
+                label=1,
+            ),
+            _target(
+                partition="train",
+                official_split="train",
+                image_index=2,
+                question_index=2,
+                label=1,
+            ),
+            _target(image_index=3, question_index=3, label=0),
+            _target(image_index=4, question_index=4, label=0),
+            _target(image_index=5, question_index=5, label=0),
+        )
+
+        metrics = evaluate_train_majority(targets)
+
+        self.assertEqual(metrics.correct_count, 0)
+        self.assertEqual(metrics.accuracy, 0.0)
+
+    def test_target_reordering_does_not_change_majority_metrics(self) -> None:
+        targets = _targets_with_train_labels((1, 0, 1))
+
+        self.assertEqual(
+            evaluate_train_majority(targets),
+            evaluate_train_majority(tuple(reversed(targets))),
+        )
+
+
+class SeedSummaryTests(unittest.TestCase):
+    def test_uses_formal_seed_order_sample_sd_and_fixed_t_interval(self) -> None:
+        values = {
+            105: 0.02,
+            104: 0.01,
+            103: 0.0,
+            102: -0.01,
+            101: -0.02,
+        }
+
+        summary = summarize_seed_values("G accuracy", values)
+
+        expected_sd = math.sqrt(0.001 / 4)
+        expected_half_width = 2.7764451051977987 * expected_sd / math.sqrt(5)
+        self.assertIsInstance(summary, SeedSummary)
+        self.assertEqual(summary.name, "G accuracy")
+        self.assertEqual(summary.seeds, (101, 102, 103, 104, 105))
+        self.assertEqual(summary.values, (-0.02, -0.01, 0.0, 0.01, 0.02))
+        self.assertEqual(summary.mean, 0.0)
+        self.assertAlmostEqual(summary.sample_sd, expected_sd)
+        self.assertAlmostEqual(summary.interval[0], -expected_half_width)
+        self.assertAlmostEqual(summary.interval[1], expected_half_width)
+        with self.assertRaises(FrozenInstanceError):
+            summary.mean = 1.0
+
+    def test_constant_values_have_zero_sd_and_degenerate_interval(self) -> None:
+        summary = summarize_seed_values(
+            "constant", {seed: 0.25 for seed in (101, 102, 103, 104, 105)}
+        )
+
+        self.assertEqual(summary.sample_sd, 0.0)
+        self.assertEqual(summary.interval, (0.25, 0.25))
+
+    def test_rejects_nonformal_seed_sets_names_and_nonfinite_values(self) -> None:
+        valid = {seed: 0.5 for seed in (101, 102, 103, 104, 105)}
+        cases = (
+            ("valid", {seed: value for seed, value in valid.items() if seed != 105}),
+            ("valid", valid | {106: 0.5}),
+            ("valid", valid | {True: 0.5}),
+            ("", valid),
+            ("   ", valid),
+            ("valid", valid | {101: True}),
+            ("valid", valid | {101: math.nan}),
+            ("valid", valid | {101: math.inf}),
+        )
+        for name, values in cases:
+            with self.subTest(name=name, keys=tuple(values)), self.assertRaises(
+                ValueError
+            ):
+                summarize_seed_values(name, values)
+
+        with self.assertRaises(ValueError):
+            summarize_seed_values("valid", [(101, 0.5)])
+
+    def test_paired_summary_subtracts_values_within_each_seed(self) -> None:
+        minuend = {
+            101: 0.48,
+            102: 0.49,
+            103: 0.50,
+            104: 0.51,
+            105: 0.52,
+        }
+        subtrahend = {seed: 0.5 for seed in (101, 102, 103, 104, 105)}
+
+        summary = summarize_paired_differences(
+            "B-G", minuend=minuend, subtrahend=subtrahend
+        )
+
+        self.assertIsInstance(summary, PairedSummary)
+        self.assertEqual(summary.name, "B-G")
+        for observed, expected in zip(
+            summary.values, (-0.02, -0.01, 0.0, 0.01, 0.02), strict=True
+        ):
+            self.assertAlmostEqual(observed, expected)
+        self.assertAlmostEqual(summary.mean, 0.0)
+
+    def test_paired_summary_rejects_mismatched_seed_sets(self) -> None:
+        complete = {seed: 0.5 for seed in (101, 102, 103, 104, 105)}
+        incomplete = {seed: 0.5 for seed in (101, 102, 103, 104)}
+
+        with self.assertRaisesRegex(ValueError, "seed"):
+            summarize_paired_differences("B-G", complete, incomplete)
 
 
 if __name__ == "__main__":

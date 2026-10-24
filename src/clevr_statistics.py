@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
@@ -13,6 +14,7 @@ import numpy as np
 METHODS = ("G", "B", "M10", "Q-only")
 SEEDS = (101, 102, 103, 104, 105)
 RELATIONS = ("left", "right", "front", "behind")
+T4_975 = 2.7764451051977987
 
 
 def _require_nonnegative_int(value: object, field: str) -> int:
@@ -216,6 +218,106 @@ class RunMetrics:
             raise ValueError("metrics must be ClassificationMetrics")
 
 
+def _validate_summary_fields(
+    name: object,
+    seeds: object,
+    values: object,
+    mean: object,
+    sample_sd: object,
+    interval: object,
+) -> tuple[str, tuple[int, ...], tuple[float, ...], float, float, tuple[float, float]]:
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("summary name must be a non-empty string")
+    if not isinstance(seeds, tuple) or seeds != SEEDS:
+        raise ValueError("summary seeds must be the formal seed tuple")
+    if not isinstance(values, tuple) or len(values) != len(SEEDS):
+        raise ValueError("summary values must be a five-value tuple")
+    normalized_values = tuple(
+        _require_finite_real(value, f"values[{index}]")
+        for index, value in enumerate(values)
+    )
+    normalized_mean = _require_finite_real(mean, "summary mean")
+    normalized_sd = _require_finite_real(sample_sd, "sample_sd")
+    if normalized_sd < 0:
+        raise ValueError("sample_sd must be non-negative")
+    if not isinstance(interval, tuple) or len(interval) != 2:
+        raise ValueError("interval must be a two-value tuple")
+    normalized_interval = tuple(
+        _require_finite_real(value, f"interval[{index}]")
+        for index, value in enumerate(interval)
+    )
+    expected_mean = statistics.fmean(normalized_values)
+    expected_sd = statistics.stdev(normalized_values)
+    half_width = T4_975 * expected_sd / math.sqrt(len(SEEDS))
+    expected_interval = (expected_mean - half_width, expected_mean + half_width)
+    if normalized_mean != expected_mean:
+        raise ValueError("summary mean does not match values")
+    if normalized_sd != expected_sd:
+        raise ValueError("sample_sd does not match values")
+    if normalized_interval != expected_interval:
+        raise ValueError("interval does not match values")
+    return (
+        name,
+        seeds,
+        normalized_values,
+        normalized_mean,
+        normalized_sd,
+        normalized_interval,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SeedSummary:
+    name: str
+    seeds: tuple[int, ...]
+    values: tuple[float, ...]
+    mean: float
+    sample_sd: float
+    interval: tuple[float, float]
+
+    def __post_init__(self) -> None:
+        validated = _validate_summary_fields(
+            self.name,
+            self.seeds,
+            self.values,
+            self.mean,
+            self.sample_sd,
+            self.interval,
+        )
+        for field, value in zip(
+            ("name", "seeds", "values", "mean", "sample_sd", "interval"),
+            validated,
+            strict=True,
+        ):
+            object.__setattr__(self, field, value)
+
+
+@dataclass(frozen=True, slots=True)
+class PairedSummary:
+    name: str
+    seeds: tuple[int, ...]
+    values: tuple[float, ...]
+    mean: float
+    sample_sd: float
+    interval: tuple[float, float]
+
+    def __post_init__(self) -> None:
+        validated = _validate_summary_fields(
+            self.name,
+            self.seeds,
+            self.values,
+            self.mean,
+            self.sample_sd,
+            self.interval,
+        )
+        for field, value in zip(
+            ("name", "seeds", "values", "mean", "sample_sd", "interval"),
+            validated,
+            strict=True,
+        ):
+            object.__setattr__(self, field, value)
+
+
 def _validated_targets(
     targets: Sequence[TargetRow],
 ) -> tuple[tuple[TargetRow, ...], tuple[TargetRow, ...]]:
@@ -351,3 +453,68 @@ def evaluate_run(
         seed=run.seed,
         metrics=_classification_metrics(base_test, predictions, losses),
     )
+
+
+def evaluate_train_majority(
+    targets: Sequence[TargetRow],
+) -> ClassificationMetrics:
+    """Evaluate the no-training baseline chosen only from train labels."""
+    train, base_test = _validated_targets(targets)
+    predicted_label = int(sum(target.label for target in train) > len(train) / 2)
+    predictions = {
+        target.question_index: predicted_label for target in base_test
+    }
+    return _classification_metrics(base_test, predictions, losses=None)
+
+
+def _ordered_seed_values(values: Mapping[int, float]) -> tuple[float, ...]:
+    if not isinstance(values, Mapping):
+        raise ValueError("seed values must be a mapping")
+    if any(type(seed) is not int for seed in values) or set(values) != set(SEEDS):
+        raise ValueError("seed values must contain exactly the five formal seeds")
+    return tuple(
+        _require_finite_real(values[seed], f"value for seed {seed}")
+        for seed in SEEDS
+    )
+
+
+def _summary_numbers(
+    values: tuple[float, ...],
+) -> tuple[float, float, tuple[float, float]]:
+    mean = statistics.fmean(values)
+    sample_sd = statistics.stdev(values)
+    half_width = T4_975 * sample_sd / math.sqrt(len(SEEDS))
+    return mean, sample_sd, (mean - half_width, mean + half_width)
+
+
+def summarize_seed_values(
+    name: str, values: Mapping[int, float]
+) -> SeedSummary:
+    """Summarize exactly the five formal seeds with a sample-SD t interval."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("summary name must be a non-empty string")
+    ordered = _ordered_seed_values(values)
+    mean, sample_sd, interval = _summary_numbers(ordered)
+    return SeedSummary(name, SEEDS, ordered, mean, sample_sd, interval)
+
+
+def summarize_paired_differences(
+    name: str,
+    minuend: Mapping[int, float],
+    subtrahend: Mapping[int, float],
+) -> PairedSummary:
+    """Subtract corresponding formal seeds before summarizing the contrast."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("summary name must be a non-empty string")
+    minuend_values = _ordered_seed_values(minuend)
+    subtrahend_values = _ordered_seed_values(subtrahend)
+    differences = tuple(
+        _require_finite_real(
+            first - second, f"paired difference for seed {seed}"
+        )
+        for seed, first, second in zip(
+            SEEDS, minuend_values, subtrahend_values, strict=True
+        )
+    )
+    mean, sample_sd, interval = _summary_numbers(differences)
+    return PairedSummary(name, SEEDS, differences, mean, sample_sd, interval)
