@@ -1,4 +1,4 @@
-"""Dependency-injected, artifact-free PUB-R1.1 computation engine.
+"""PUB-R1.1 computation engine and explicit production orchestration.
 
 A failed update is not rollback-safe. Recover from an explicit completed
 checkpoint; only a returned result denotes a successfully committed update.
@@ -9,16 +9,40 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import math
+from pathlib import Path
+import platform
+import random
 
+import numpy as np
+import PIL
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+import timm
+import torchvision
 
-from src.clevr_dataset import CLEVRSampleIdentity
-from src.clevr_run_artifacts import CLEVRPredictionRecord
+from src.clevr_dataset import (
+    CLEVRSampleIdentity,
+    CLEVRQuestionDataset,
+    CLEVRQuestionOnlyDataset,
+    collate_clevr_question_only,
+    collate_clevr_questions,
+)
+from src.clevr_checkpoint import load_clevr_checkpoint, save_clevr_checkpoint
+from src.clevr_run_artifacts import (
+    CLEVRPredictionRecord,
+    CLEVRRunArtifacts,
+    CLEVRRunSpec,
+    PROTOCOL_VERSION,
+)
 from src.clevr_sampling import CLEVRIndexStream
+from src.clevr_training import (
+    CLEVRPairedInitialization,
+    build_clevr_adamw,
+    build_clevr_lr_scheduler,
+)
 
 
 class CLEVRRunnerError(RuntimeError):
@@ -44,6 +68,531 @@ class CLEVREvaluationResult:
     cross_entropy: float
     accuracy: float
     rows: tuple[CLEVRPredictionRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CLEVRRunPreflight:
+    methods: tuple[str, ...]
+    specs: Mapping[str, CLEVRRunSpec]
+    train_datasets: Mapping[str, object]
+    dev_datasets: Mapping[str, object]
+    vocab_size: int
+
+
+_METHOD_ORDER = ("G", "B", "M10", "Q-only")
+
+
+def _normalize_methods(methods: tuple[str, ...]) -> tuple[str, ...]:
+    if type(methods) is not tuple or not methods:
+        raise CLEVRRunnerError("methods must be a nonempty tuple")
+    if any(type(method) is not str or method not in _METHOD_ORDER for method in methods):
+        raise CLEVRRunnerError("methods must contain only G, B, M10, or Q-only")
+    if len(set(methods)) != len(methods):
+        raise CLEVRRunnerError("methods must not contain duplicates")
+    return tuple(method for method in _METHOD_ORDER if method in methods)
+
+
+def _absolute_directory(path: Path, name: str) -> None:
+    if not isinstance(path, Path) or not path.is_absolute() or not path.is_dir():
+        raise CLEVRRunnerError(f"{name} must be an explicit existing absolute directory")
+
+
+def _explicit_output_root(path: Path) -> None:
+    if (not isinstance(path, Path) or not path.is_absolute()
+            or (path.exists() and not path.is_dir())):
+        raise CLEVRRunnerError(
+            "output_root must be an explicit absolute path that is absent or a directory"
+        )
+
+
+def _validate_request(
+    *, spec_phase: str, seed: int, methods: tuple[str, ...], audit_dir: Path,
+    data_root: Path | None, device_index: int,
+) -> tuple[tuple[str, ...], dict[str, CLEVRRunSpec]]:
+    ordered = _normalize_methods(methods)
+    _absolute_directory(audit_dir, "audit_dir")
+    needs_rgb = any(method != "Q-only" for method in ordered)
+    if needs_rgb:
+        if data_root is None:
+            raise CLEVRRunnerError("data_root is required when an RGB method is requested")
+        _absolute_directory(data_root, "data_root")
+    elif data_root is not None:
+        raise CLEVRRunnerError("data_root must be absent for a Q-only-only request")
+    if type(device_index) is not int or device_index < 0:
+        raise CLEVRRunnerError("device_index must be an ordinary nonnegative integer")
+    try:
+        specs = {method: CLEVRRunSpec(spec_phase, method, seed) for method in ordered}
+    except ValueError as exc:
+        raise CLEVRRunnerError("phase, seed, or method violates the frozen run matrix") from exc
+    return ordered, specs
+
+
+def _require_dataset_pair(rgb: object, qonly: object, partition: str) -> None:
+    if len(rgb) != len(qonly):
+        raise CLEVRRunnerError(f"RGB and Q-only {partition} lengths disagree")
+    if getattr(rgb, "vocab_size", None) != getattr(qonly, "vocab_size", None):
+        raise CLEVRRunnerError(f"RGB and Q-only {partition} vocabularies disagree")
+    for index in range(len(rgb)):
+        if rgb.sample_identity(index) != qonly.sample_identity(index):
+            raise CLEVRRunnerError(f"RGB and Q-only {partition} identities disagree")
+
+
+def preflight_clevr_run(
+    *, spec_phase: str, seed: int, methods: tuple[str, ...], audit_dir: Path,
+    data_root: Path | None, device_index: int,
+) -> CLEVRRunPreflight:
+    """Validate one seed request and build only its train/dev dataset views."""
+    ordered, specs = _validate_request(
+        spec_phase=spec_phase, seed=seed, methods=methods, audit_dir=audit_dir,
+        data_root=data_root, device_index=device_index,
+    )
+    rgb_train = rgb_dev = q_train = q_dev = None
+    if any(method != "Q-only" for method in ordered):
+        assert data_root is not None
+        rgb_train = CLEVRQuestionDataset(
+            data_root=data_root, audit_dir=audit_dir, partition="train",
+        )
+        rgb_dev = CLEVRQuestionDataset(
+            data_root=data_root, audit_dir=audit_dir, partition="dev",
+        )
+    if "Q-only" in ordered:
+        q_train = CLEVRQuestionOnlyDataset(audit_dir=audit_dir, partition="train")
+        q_dev = CLEVRQuestionOnlyDataset(audit_dir=audit_dir, partition="dev")
+    if rgb_train is not None and q_train is not None:
+        _require_dataset_pair(rgb_train, q_train, "train")
+        _require_dataset_pair(rgb_dev, q_dev, "dev")
+    all_datasets = [dataset for dataset in (rgb_train, rgb_dev, q_train, q_dev)
+                    if dataset is not None]
+    if not all_datasets:
+        raise CLEVRRunnerError("preflight constructed no datasets")
+    vocab_size = getattr(all_datasets[0], "vocab_size", None)
+    if (type(vocab_size) is not int or vocab_size < 4
+            or any(getattr(dataset, "vocab_size", None) != vocab_size
+                   for dataset in all_datasets)):
+        raise CLEVRRunnerError("train/dev dataset vocabularies disagree or are invalid")
+    train_datasets = {
+        method: q_train if method == "Q-only" else rgb_train for method in ordered
+    }
+    dev_datasets = {
+        method: q_dev if method == "Q-only" else rgb_dev for method in ordered
+    }
+    return CLEVRRunPreflight(ordered, specs, train_datasets, dev_datasets, vocab_size)
+
+
+def _setup_clevr_runtime(device_index: int) -> torch.device:
+    if type(device_index) is not int or device_index < 0:
+        raise CLEVRRunnerError("device_index must be an ordinary nonnegative integer")
+    if not torch.cuda.is_available() or device_index >= torch.cuda.device_count():
+        raise CLEVRRunnerError("the explicitly requested CUDA device is unavailable")
+    torch.cuda.set_device(device_index)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    return torch.device(f"cuda:{device_index}")
+
+
+def _expanded_clevr_config(
+    *, device_index: int, audit_dir: Path, data_root: Path | None,
+    vocab_size: int, train_size: int,
+) -> dict[str, object]:
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "data": {
+            "audit_dir": str(audit_dir.resolve()),
+            "data_root": None if data_root is None else str(data_root.resolve()),
+            "train_size": train_size,
+            "vocab_size": vocab_size,
+        },
+        "packages": {
+            "python": platform.python_version(), "numpy": str(np.__version__),
+            "torch": str(torch.__version__), "torchvision": str(torchvision.__version__),
+            "timm": str(timm.__version__), "pillow": str(PIL.__version__),
+            "cuda_runtime": str(torch.version.cuda),
+        },
+        "model": {
+            "image_shape": [3, 224, 224], "patch_size": 16, "grid_size": [14, 14],
+            "embed_dim": 192, "depth": 6, "heads": 3, "head_dim": 64,
+            "mlp_dim": 768, "num_classes": 2, "question_embedding_dim": 64,
+            "question_hidden_dim": 192, "question_layers": 1,
+            "question_bidirectional": False, "attention_backend": "manual",
+            "layer_norm_epsilon": 1e-6, "layer_scale_initial": 1e-4,
+            "dropout": 0.0, "attention_dropout": 0.0, "drop_path": 0.0,
+            "fixed_lambda": 1.0, "global_theta": 100.0, "mixed_theta": 10.0,
+            "m10_seed_offset": 20_000,
+        },
+        "training": {
+            "effective_batch_size": 128, "micro_batch_size": 16,
+            "accumulation_steps": 8, "optimizer": "AdamW", "betas": [0.9, 0.999],
+            "epsilon": 1e-8, "weight_decay": 0.05, "base_learning_rate": 3e-4,
+            "minimum_learning_rate": 1e-6, "warmup_updates": 400,
+            "scheduler_total_updates": 8_000, "loss": "cross_entropy",
+            "label_smoothing": 0.0, "gradient_clip_norm": 1.0,
+            "sampler": "numpy.random.PCG64", "sampler_seed_offset": 10_000,
+            "checkpoint_interval_updates": 1_000,
+        },
+        "runtime": {
+            "device": f"cuda:{device_index}", "device_index": device_index,
+            "device_name": torch.cuda.get_device_name(device_index),
+            "precision": "float32", "amp": False,
+            "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+            "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "deterministic_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        },
+    }
+
+
+def _validate_resume_checkpoints(
+    resume_checkpoints: Mapping[str, Path], methods: tuple[str, ...],
+) -> dict[str, Path]:
+    if not isinstance(resume_checkpoints, Mapping):
+        raise CLEVRRunnerError("resume_checkpoints must be an explicit mapping")
+    result: dict[str, Path] = {}
+    for method, path in resume_checkpoints.items():
+        if type(method) is not str or method not in methods or method in result:
+            raise CLEVRRunnerError("resume checkpoint methods must be unique requested methods")
+        if (not isinstance(path, Path) or not path.is_absolute()
+                or not path.is_file()):
+            raise CLEVRRunnerError("resume checkpoints must be explicit existing absolute files")
+        result[method] = path
+    return result
+
+
+def _save_boundary(
+    *, artifacts: CLEVRRunArtifacts, completed_updates: int, method: str,
+    seed: int, model: nn.Module, optimizer: AdamW, scheduler: LambdaLR,
+    sampler: CLEVRIndexStream, device_index: int,
+) -> None:
+    if any(parameter.grad is not None for parameter in model.parameters()):
+        raise CLEVRRunnerError("checkpoint boundary requires all gradients to be None")
+    save_clevr_checkpoint(
+        artifacts.checkpoint_path(completed_updates), method=method,
+        run_seed=seed, completed_updates=completed_updates, model=model,
+        optimizer=optimizer, scheduler=scheduler, sampler=sampler,
+        cuda_devices=(device_index,),
+    )
+
+
+def _publish_evaluation(
+    *, artifacts: CLEVRRunArtifacts, result: CLEVREvaluationResult,
+    completed_updates: int,
+) -> Path:
+    path = artifacts.publish_predictions(
+        partition=result.partition, completed_updates=completed_updates,
+        rows=result.rows,
+    )
+    artifacts.append_event(
+        completed_updates=completed_updates, event="evaluation",
+        details={
+            "partition": result.partition,
+            "total_questions": result.total_questions,
+            "correct": result.correct,
+            "loss_sum": result.loss_sum,
+            "cross_entropy": result.cross_entropy,
+            "accuracy": result.accuracy,
+            "predictions": str(path),
+        },
+    )
+    return path
+
+
+def _append_failure(
+    artifacts: CLEVRRunArtifacts, completed_updates: int, primary: BaseException,
+) -> None:
+    try:
+        artifacts.append_event(
+            completed_updates=completed_updates, event="failure",
+            details={"type": type(primary).__name__, "message": str(primary)},
+        )
+    except BaseException as logging_failure:
+        primary.add_note(
+            f"failure journal append failed: {type(logging_failure).__name__}: "
+            f"{logging_failure}"
+        )
+
+
+def train_clevr_seed(
+    *,
+    spec_phase: str,
+    seed: int,
+    methods: tuple[str, ...],
+    audit_dir: Path,
+    data_root: Path | None,
+    output_root: Path,
+    device_index: int,
+    resume_checkpoints: Mapping[str, Path],
+) -> None:
+    """Run one explicitly authorized seed, one sequential method arm at a time."""
+    _explicit_output_root(output_root)
+    preflight = preflight_clevr_run(
+        spec_phase=spec_phase, seed=seed, methods=methods, audit_dir=audit_dir,
+        data_root=data_root, device_index=device_index,
+    )
+    resumes = _validate_resume_checkpoints(resume_checkpoints, preflight.methods)
+    device = _setup_clevr_runtime(device_index)
+    factory = CLEVRPairedInitialization(vocab_size=preflight.vocab_size, run_seed=seed)
+    common_state = factory.common_state_dict()
+    for method in preflight.methods:
+        spec = preflight.specs[method]
+        resume_path = resumes.get(method)
+        train_dataset = preflight.train_datasets[method]
+        dev_dataset = preflight.dev_datasets[method]
+        expanded_config = _expanded_clevr_config(
+            device_index=device_index, audit_dir=audit_dir,
+            data_root=None if method == "Q-only" else data_root,
+            vocab_size=preflight.vocab_size, train_size=len(train_dataset),
+        )
+        artifacts = CLEVRRunArtifacts.open(
+            output_root=output_root, spec=spec, expanded_config=expanded_config,
+            resume=resume_path is not None,
+        )
+        completed_updates = 0
+        primary: BaseException | None = None
+        try:
+            artifacts.ensure_common_state(common_state)
+            if resume_path is None:
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.random.default_generator.manual_seed(seed)
+                torch.cuda.manual_seed(seed)
+            model = factory.build(method).to(device)
+            optimizer = build_clevr_adamw(model)
+            scheduler = build_clevr_lr_scheduler(optimizer)
+            sampler = CLEVRIndexStream(dataset_size=len(train_dataset), run_seed=seed)
+            collate_fn = (collate_clevr_question_only
+                          if method == "Q-only" else collate_clevr_questions)
+            resumed_at_target = False
+            if resume_path is None:
+                artifacts.append_event(
+                    completed_updates=0, event="start",
+                    details={"target_updates": spec.target_updates},
+                )
+                _save_boundary(
+                    artifacts=artifacts, completed_updates=0, method=method,
+                    seed=seed, model=model, optimizer=optimizer,
+                    scheduler=scheduler, sampler=sampler, device_index=device_index,
+                )
+            else:
+                metadata = load_clevr_checkpoint(
+                    resume_path, expected_method=method, expected_run_seed=seed,
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    sampler=sampler, cuda_devices=(device_index,),
+                )
+                if (metadata.method != method or metadata.run_seed != seed
+                        or metadata.dataset_size != len(train_dataset)
+                        or metadata.cuda_devices != (device_index,)
+                        or type(metadata.completed_updates) is not int
+                        or not 0 <= metadata.completed_updates <= spec.target_updates):
+                    raise CLEVRRunnerError(
+                        "resume checkpoint metadata disagrees with method/seed/dataset/target"
+                    )
+                completed_updates = metadata.completed_updates
+                resumed_at_target = completed_updates == spec.target_updates
+                artifacts.append_event(
+                    completed_updates=completed_updates, event="resume",
+                    details={"checkpoint": str(resume_path),
+                             "target_updates": spec.target_updates},
+                )
+            model.train(True)
+            for update in range(completed_updates + 1, spec.target_updates + 1):
+                result = run_clevr_update(
+                    model=model, optimizer=optimizer, scheduler=scheduler,
+                    sampler=sampler, dataset=train_dataset,
+                    collate_fn=collate_fn, method=method, device=device,
+                )
+                completed_updates = update
+                artifacts.append_event(
+                    completed_updates=update, event="update",
+                    details={
+                        "dataset_indices": list(result.dataset_indices),
+                        "question_indices": list(result.question_indices),
+                        "loss_sum": result.loss_sum,
+                        "loss_mean": result.loss_mean,
+                        "gradient_norm": result.gradient_norm,
+                        "learning_rate": result.learning_rate,
+                    },
+                )
+                checkpoint_boundary = update % 1_000 == 0 or update == spec.target_updates
+                if checkpoint_boundary:
+                    _save_boundary(
+                        artifacts=artifacts, completed_updates=update,
+                        method=method, seed=seed, model=model,
+                        optimizer=optimizer, scheduler=scheduler,
+                        sampler=sampler, device_index=device_index,
+                    )
+                dev_boundary = (
+                    (spec.phase == "pilot" and update == spec.target_updates)
+                    or (spec.phase == "formal" and update % 1_000 == 0)
+                )
+                if dev_boundary:
+                    _publish_evaluation(
+                        artifacts=artifacts,
+                        result=evaluate_clevr_model(
+                            model=model, dataset=dev_dataset, collate_fn=collate_fn,
+                            method=method, partition="dev", device=device,
+                        ),
+                        completed_updates=update,
+                    )
+                if spec.phase == "formal" and update == 8_000:
+                    _publish_evaluation(
+                        artifacts=artifacts,
+                        result=evaluate_clevr_model(
+                            model=model, dataset=train_dataset, collate_fn=collate_fn,
+                            method=method, partition="train", device=device,
+                        ),
+                        completed_updates=update,
+                    )
+            if resumed_at_target and spec.phase in ("pilot", "formal"):
+                _publish_evaluation(
+                    artifacts=artifacts,
+                    result=evaluate_clevr_model(
+                        model=model, dataset=dev_dataset, collate_fn=collate_fn,
+                        method=method, partition="dev", device=device,
+                    ),
+                    completed_updates=completed_updates,
+                )
+            if resumed_at_target and spec.phase == "formal":
+                _publish_evaluation(
+                    artifacts=artifacts,
+                    result=evaluate_clevr_model(
+                        model=model, dataset=train_dataset, collate_fn=collate_fn,
+                        method=method, partition="train", device=device,
+                    ),
+                    completed_updates=completed_updates,
+                )
+            artifacts.append_event(
+                completed_updates=completed_updates, event="complete",
+                details={"target_updates": spec.target_updates},
+            )
+        except BaseException as exc:
+            primary = exc
+            _append_failure(artifacts, completed_updates, exc)
+            raise
+        finally:
+            try:
+                artifacts.close()
+            except BaseException as close_failure:
+                if primary is None:
+                    raise
+                primary.add_note(
+                    f"attempt close failed: {type(close_failure).__name__}: {close_failure}"
+                )
+        del model, optimizer, scheduler, sampler
+
+
+def evaluate_clevr_checkpoint(
+    *,
+    spec_phase: str,
+    seed: int,
+    method: str,
+    audit_dir: Path,
+    data_root: Path | None,
+    output_root: Path,
+    device_index: int,
+    checkpoint: Path,
+    partition: str = "base_test",
+) -> Path:
+    """Evaluate one explicit formal update-8000 checkpoint on base-test once."""
+    _absolute_directory(output_root, "output_root")
+    if spec_phase != "formal":
+        raise CLEVRRunnerError("base-test evaluation is restricted to the formal phase")
+    if partition != "base_test":
+        raise CLEVRRunnerError("only the base_test partition is supported")
+    ordered, specs = _validate_request(
+        spec_phase=spec_phase, seed=seed, methods=(method,),
+        audit_dir=audit_dir, data_root=data_root, device_index=device_index,
+    )
+    method = ordered[0]
+    if (not isinstance(checkpoint, Path) or not checkpoint.is_absolute()
+            or not checkpoint.is_file()):
+        raise CLEVRRunnerError("checkpoint must be an explicit existing absolute file")
+    canonical = (output_root / "formal" / f"seed_{seed}" / method /
+                 "predictions" / "base_test" / f"{method}_seed_{seed}.jsonl")
+    if canonical.exists() or canonical.is_symlink():
+        raise CLEVRRunnerError("canonical base-test prediction output already exists")
+    if method == "Q-only":
+        train_dataset = CLEVRQuestionOnlyDataset(
+            audit_dir=audit_dir, partition="train",
+        )
+        collate_fn = collate_clevr_question_only
+    else:
+        assert data_root is not None
+        train_dataset = CLEVRQuestionDataset(
+            data_root=data_root, audit_dir=audit_dir, partition="train",
+        )
+        collate_fn = collate_clevr_questions
+    device = _setup_clevr_runtime(device_index)
+    expanded_config = _expanded_clevr_config(
+        device_index=device_index, audit_dir=audit_dir,
+        data_root=None if method == "Q-only" else data_root,
+        vocab_size=train_dataset.vocab_size, train_size=len(train_dataset),
+    )
+    factory = CLEVRPairedInitialization(
+        vocab_size=train_dataset.vocab_size, run_seed=seed,
+    )
+    spec = specs[method]
+    artifacts = CLEVRRunArtifacts.open(
+        output_root=output_root, spec=spec, expanded_config=expanded_config,
+        resume=True,
+    )
+    completed_updates = 0
+    primary: BaseException | None = None
+    try:
+        artifacts.ensure_common_state(factory.common_state_dict())
+        model = factory.build(method).to(device)
+        optimizer = build_clevr_adamw(model)
+        scheduler = build_clevr_lr_scheduler(optimizer)
+        sampler = CLEVRIndexStream(dataset_size=len(train_dataset), run_seed=seed)
+        metadata = load_clevr_checkpoint(
+            checkpoint, expected_method=method, expected_run_seed=seed,
+            model=model, optimizer=optimizer, scheduler=scheduler,
+            sampler=sampler, cuda_devices=(device_index,),
+        )
+        if (metadata.method != method or metadata.run_seed != seed
+                or metadata.completed_updates != 8_000
+                or metadata.dataset_size != len(train_dataset)
+                or metadata.cuda_devices != (device_index,)):
+            raise CLEVRRunnerError(
+                "formal evaluation requires the matching update-8000 checkpoint"
+            )
+        completed_updates = 8_000
+        if method == "Q-only":
+            base_test = CLEVRQuestionOnlyDataset(
+                audit_dir=audit_dir, partition="base_test",
+            )
+        else:
+            assert data_root is not None
+            base_test = CLEVRQuestionDataset(
+                data_root=data_root, audit_dir=audit_dir, partition="base_test",
+            )
+        if (base_test.vocab_size != train_dataset.vocab_size or len(base_test) == 0):
+            raise CLEVRRunnerError("base-test vocabulary or size is invalid")
+        result = evaluate_clevr_model(
+            model=model, dataset=base_test, collate_fn=collate_fn,
+            method=method, partition="base_test", device=device,
+        )
+        path = _publish_evaluation(
+            artifacts=artifacts, result=result, completed_updates=8_000,
+        )
+        artifacts.append_event(
+            completed_updates=8_000, event="complete",
+            details={"partition": "base_test", "checkpoint": str(checkpoint)},
+        )
+        return path
+    except BaseException as exc:
+        primary = exc
+        _append_failure(artifacts, completed_updates, exc)
+        raise
+    finally:
+        try:
+            artifacts.close()
+        except BaseException as close_failure:
+            if primary is None:
+                raise
+            primary.add_note(
+                f"attempt close failed: {type(close_failure).__name__}: {close_failure}"
+            )
 
 
 def _require_method(method: str) -> None:

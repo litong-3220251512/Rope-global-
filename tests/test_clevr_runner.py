@@ -3,9 +3,14 @@
 import importlib
 import importlib.util
 import math
+from collections import OrderedDict
+from contextlib import ExitStack
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 from copy import deepcopy
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import torch
 from torch import nn
@@ -502,6 +507,764 @@ class EvaluationTests(RunnerCase):
                     self.evaluate(**args)
                 self.assertTrue(self.model.training)
 
+
+class _PreflightDataset:
+    constructions = []
+    sizes = {"train": 3, "dev": 2}
+    vocabularies = {"rgb": 17, "qonly": 17}
+    identity_delta = 0
+
+    def __init__(self, *, kind, partition, audit_dir, data_root=None):
+        self.kind = kind
+        self.partition = partition
+        self.vocab_size = self.vocabularies[kind]
+        self.constructions.append((kind, partition, audit_dir, data_root))
+
+    def __len__(self):
+        return self.sizes[self.partition]
+
+    def sample_identity(self, index):
+        delta = self.identity_delta if self.kind == "qonly" else 0
+        return CLEVRSampleIdentity(
+            self.partition, "train", index, f"image_{index}.png",
+            100 + index + delta, index,
+        )
+
+    def __getitem__(self, index):
+        raise AssertionError("preflight must not access model-facing tensors")
+
+
+class ProductionPreflightTests(unittest.TestCase):
+    def setUp(self):
+        self.runner = importlib.import_module("src.clevr_runner")
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.audit = self.root / "audit"
+        self.data = self.root / "data"
+        self.audit.mkdir()
+        self.data.mkdir()
+        _PreflightDataset.constructions = []
+        _PreflightDataset.sizes = {"train": 3, "dev": 2}
+        _PreflightDataset.vocabularies = {"rgb": 17, "qonly": 17}
+        _PreflightDataset.identity_delta = 0
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _rgb(self, **kwargs):
+        return _PreflightDataset(kind="rgb", **kwargs)
+
+    def _qonly(self, **kwargs):
+        return _PreflightDataset(kind="qonly", **kwargs)
+
+    def preflight(self, **overrides):
+        arguments = dict(
+            spec_phase="formal", seed=101, methods=("B", "Q-only", "G"),
+            audit_dir=self.audit, data_root=self.data, device_index=2,
+        )
+        arguments.update(overrides)
+        with patch.object(self.runner, "CLEVRQuestionDataset", side_effect=self._rgb), \
+                patch.object(self.runner, "CLEVRQuestionOnlyDataset", side_effect=self._qonly):
+            return self.runner.preflight_clevr_run(**arguments)
+
+    def test_normalizes_methods_and_constructs_only_train_dev_without_item_access(self):
+        result = self.preflight()
+        self.assertEqual(result.methods, ("G", "B", "Q-only"))
+        self.assertEqual(tuple(result.specs), result.methods)
+        self.assertEqual(result.vocab_size, 17)
+        self.assertIs(result.train_datasets["G"], result.train_datasets["B"])
+        self.assertIsNot(result.train_datasets["G"], result.train_datasets["Q-only"])
+        self.assertEqual(
+            _PreflightDataset.constructions,
+            [
+                ("rgb", "train", self.audit, self.data),
+                ("rgb", "dev", self.audit, self.data),
+                ("qonly", "train", self.audit, None),
+                ("qonly", "dev", self.audit, None),
+            ],
+        )
+
+    def test_qonly_requires_data_root_absent_and_never_constructs_rgb(self):
+        result = self.preflight(methods=("Q-only",), data_root=None)
+        self.assertEqual(result.methods, ("Q-only",))
+        self.assertEqual(
+            _PreflightDataset.constructions,
+            [("qonly", "train", self.audit, None),
+             ("qonly", "dev", self.audit, None)],
+        )
+        with self.assertRaises(self.runner.CLEVRRunnerError):
+            self.preflight(methods=("Q-only",), data_root=self.data)
+
+    def test_rejects_paths_methods_phase_seed_and_device_before_dataset_or_cuda(self):
+        cases = (
+            {"audit_dir": Path("relative")},
+            {"audit_dir": self.root / "missing"},
+            {"data_root": None},
+            {"data_root": Path("relative")},
+            {"methods": ()},
+            {"methods": ("G", "G")},
+            {"methods": ("G", "unknown")},
+            {"spec_phase": "formal", "seed": 9001},
+            {"device_index": -1},
+            {"device_index": True},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                _PreflightDataset.constructions.clear()
+                with patch.object(self.runner.torch, "cuda") as cuda:
+                    with self.assertRaises((self.runner.CLEVRRunnerError, ValueError)):
+                        self.preflight(**overrides)
+                    self.assertFalse(_PreflightDataset.constructions)
+                    self.assertFalse(cuda.mock_calls)
+
+    def test_rejects_rgb_qonly_length_vocab_or_identity_disagreement_without_items(self):
+        for case in ("length", "vocab", "identity"):
+            with self.subTest(case=case):
+                _PreflightDataset.sizes = {"train": 3, "dev": 2}
+                _PreflightDataset.vocabularies = {"rgb": 17, "qonly": 17}
+                _PreflightDataset.identity_delta = 0
+                if case == "length":
+                    _PreflightDataset.sizes = {"train": 3, "dev": 2, "qonly": 4}
+                    original_len = _PreflightDataset.__len__
+                    def mismatched_len(instance):
+                        if instance.kind == "qonly" and instance.partition == "train":
+                            return 4
+                        return original_len(instance)
+                    context = patch.object(_PreflightDataset, "__len__", mismatched_len)
+                else:
+                    context = patch.object(_PreflightDataset, "__len__", _PreflightDataset.__len__)
+                if case == "vocab":
+                    _PreflightDataset.vocabularies["qonly"] = 18
+                if case == "identity":
+                    _PreflightDataset.identity_delta = 1
+                with context, self.assertRaises(self.runner.CLEVRRunnerError):
+                    self.preflight(methods=("G", "Q-only"))
+
+    def test_runtime_requires_exact_cuda_and_disables_both_tf32_backends(self):
+        calls = []
+        class Flag:
+            allow_tf32 = True
+        class CudnnFlag:
+            allow_tf32 = True
+            deterministic = False
+            benchmark = True
+        matmul = Flag()
+        cudnn = CudnnFlag()
+        with patch.object(self.runner.torch.cuda, "is_available", return_value=True) as available, \
+                patch.object(self.runner.torch.cuda, "device_count", return_value=3) as count, \
+                patch.object(self.runner.torch.cuda, "set_device", side_effect=lambda i: calls.append(i)), \
+                patch.object(self.runner.torch.backends.cuda, "matmul", matmul), \
+                patch.object(self.runner.torch.backends, "cudnn", cudnn):
+            device = self.runner._setup_clevr_runtime(2)
+        self.assertEqual(device, torch.device("cuda:2"))
+        self.assertEqual(calls, [2])
+        self.assertTrue(available.called)
+        self.assertTrue(count.called)
+        self.assertFalse(matmul.allow_tf32)
+        self.assertFalse(cudnn.allow_tf32)
+        with patch.object(self.runner.torch.cuda, "is_available", return_value=False), \
+                patch.object(self.runner.torch.cuda, "set_device") as set_device:
+            with self.assertRaises(self.runner.CLEVRRunnerError):
+                self.runner._setup_clevr_runtime(0)
+            set_device.assert_not_called()
+
+    def test_expanded_config_is_exact_auditable_and_contains_no_hash(self):
+        class MatmulFlag:
+            allow_tf32 = False
+        class CudnnFlag:
+            allow_tf32 = False
+            deterministic = True
+            benchmark = False
+        with patch.object(self.runner.torch.cuda, "get_device_name", return_value="Injected GPU"), \
+                patch.object(self.runner.torch, "are_deterministic_algorithms_enabled", return_value=True), \
+                patch.object(self.runner.torch, "is_deterministic_algorithms_warn_only_enabled", return_value=False), \
+                patch.object(self.runner.torch.backends.cuda, "matmul", MatmulFlag()), \
+                patch.object(self.runner.torch.backends, "cudnn", CudnnFlag()):
+            config = self.runner._expanded_clevr_config(
+                device_index=2, audit_dir=self.audit, data_root=self.data,
+                vocab_size=17, train_size=3,
+            )
+        self.assertEqual(config, {
+            "protocol_version": "PUB-R1.1",
+            "data": {
+                "audit_dir": str(self.audit), "data_root": str(self.data),
+                "train_size": 3, "vocab_size": 17,
+            },
+            "packages": {
+                "python": "3.11.14", "numpy": "2.2.6", "torch": "2.6.0+cu124",
+                "torchvision": "0.21.0+cu124", "timm": "1.0.24", "pillow": "12.0.0",
+                "cuda_runtime": "12.4",
+            },
+            "model": {
+                "image_shape": [3, 224, 224], "patch_size": 16, "grid_size": [14, 14],
+                "embed_dim": 192, "depth": 6, "heads": 3, "head_dim": 64,
+                "mlp_dim": 768, "num_classes": 2, "question_embedding_dim": 64,
+                "question_hidden_dim": 192, "question_layers": 1,
+                "question_bidirectional": False, "attention_backend": "manual",
+                "layer_norm_epsilon": 1e-6, "layer_scale_initial": 1e-4,
+                "dropout": 0.0, "attention_dropout": 0.0, "drop_path": 0.0,
+                "fixed_lambda": 1.0, "global_theta": 100.0, "mixed_theta": 10.0,
+                "m10_seed_offset": 20000,
+            },
+            "training": {
+                "effective_batch_size": 128, "micro_batch_size": 16,
+                "accumulation_steps": 8, "optimizer": "AdamW", "betas": [0.9, 0.999],
+                "epsilon": 1e-8, "weight_decay": 0.05, "base_learning_rate": 3e-4,
+                "minimum_learning_rate": 1e-6, "warmup_updates": 400,
+                "scheduler_total_updates": 8000, "loss": "cross_entropy",
+                "label_smoothing": 0.0, "gradient_clip_norm": 1.0,
+                "sampler": "numpy.random.PCG64", "sampler_seed_offset": 10000,
+                "checkpoint_interval_updates": 1000,
+            },
+            "runtime": {
+                "device": "cuda:2", "device_index": 2, "device_name": "Injected GPU",
+                "precision": "float32", "amp": False,
+                "cuda_matmul_allow_tf32": False, "cudnn_allow_tf32": False,
+                "deterministic_algorithms": True, "deterministic_warn_only": False,
+                "cudnn_deterministic": True, "cudnn_benchmark": False,
+            },
+        })
+        def keys(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    yield key
+                    yield from keys(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from keys(item)
+        self.assertFalse(any("hash" in key.lower() for key in keys(config)))
+
+
+class _OrchestrationDataset:
+    def __init__(self, name, size=257):
+        self.name = name
+        self.size = size
+        self.vocab_size = 17
+
+    def __len__(self):
+        return self.size
+
+
+class _OrchestrationModel:
+    def __init__(self, method, trace):
+        self.method = method
+        self.trace = trace
+        self.parameter = nn.Parameter(torch.tensor(1.0))
+
+    def to(self, device):
+        self.trace.append(("to", self.method, str(device)))
+        return self
+
+    def train(self, mode=True):
+        self.trace.append(("train", self.method, mode))
+        return self
+
+    def parameters(self):
+        return (self.parameter,)
+
+
+class _OrchestrationFactory:
+    instances = []
+    trace = []
+
+    def __init__(self, *, vocab_size, run_seed):
+        self.vocab_size = vocab_size
+        self.run_seed = run_seed
+        self.builds = []
+        self.instances.append(self)
+        self.trace.append(("factory", vocab_size, run_seed))
+
+    def common_state_dict(self):
+        self.trace.append("common-state")
+        return OrderedDict((("shared", torch.tensor([3.0])),))
+
+    def build(self, method):
+        self.trace.append(("build", method))
+        self.builds.append(method)
+        return _OrchestrationModel(method, self.trace)
+
+
+class _OrchestrationSampler:
+    def __init__(self, *, dataset_size, run_seed):
+        self.dataset_size = dataset_size
+        self.run_seed = run_seed
+        self.completed = 0
+
+
+class _OrchestrationArtifacts:
+    opened = []
+    trace = []
+    root = None
+    fail_failure_event = False
+
+    @classmethod
+    def open(cls, *, output_root, spec, expanded_config, resume):
+        artifact = cls()
+        artifact.spec = spec
+        artifact.run_dir = output_root / spec.phase / f"seed_{spec.seed}" / spec.method
+        artifact.events = []
+        artifact.predictions = []
+        artifact.closed = False
+        cls.opened.append((artifact, resume, expanded_config))
+        cls.trace.append(("open", spec.method, resume))
+        return artifact
+
+    def ensure_common_state(self, state):
+        snapshot = OrderedDict((key, value.clone()) for key, value in state.items())
+        self.trace.append(("ensure-common", self.spec.method, snapshot))
+        return self.run_dir.parent / "common_state.pt"
+
+    def append_event(self, *, completed_updates, event, details):
+        if event == "failure" and self.fail_failure_event:
+            raise RuntimeError("journal failure")
+        self.events.append((completed_updates, event, details))
+        self.trace.append(("event", self.spec.method, completed_updates, event))
+
+    def checkpoint_path(self, update):
+        self.trace.append(("checkpoint-path", self.spec.method, update))
+        return self.run_dir / "checkpoints" / f"update_{update:04d}.pt"
+
+    def publish_predictions(self, *, partition, completed_updates, rows):
+        self.predictions.append((partition, completed_updates, tuple(rows)))
+        self.trace.append(("publish", self.spec.method, partition, completed_updates))
+        return self.run_dir / "predictions" / partition / f"{completed_updates}.jsonl"
+
+    def close(self):
+        self.closed = True
+        self.trace.append(("close", self.spec.method))
+
+
+class ProductionTrainingTests(unittest.TestCase):
+    def setUp(self):
+        self.runner = importlib.import_module("src.clevr_runner")
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.audit = self.root / "audit"
+        self.data = self.root / "data"
+        self.output = self.root / "output"
+        for path in (self.audit, self.data, self.output):
+            path.mkdir()
+        self.train_rgb = _OrchestrationDataset("train-rgb")
+        self.dev_rgb = _OrchestrationDataset("dev-rgb", 19)
+        self.train_q = _OrchestrationDataset("train-q")
+        self.dev_q = _OrchestrationDataset("dev-q", 19)
+        _OrchestrationFactory.instances = []
+        _OrchestrationFactory.trace = []
+        _OrchestrationArtifacts.opened = []
+        _OrchestrationArtifacts.trace = _OrchestrationFactory.trace
+        _OrchestrationArtifacts.fail_failure_event = False
+        self.saved = []
+        self.loaded = []
+        self.update_counts = {}
+        self.eval_calls = []
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _preflight(self, phase, methods, seed):
+        specs = {method: self.runner.CLEVRRunSpec(phase, method, seed) for method in methods}
+        train = {method: self.train_q if method == "Q-only" else self.train_rgb
+                 for method in methods}
+        dev = {method: self.dev_q if method == "Q-only" else self.dev_rgb
+               for method in methods}
+        return self.runner.CLEVRRunPreflight(methods, specs, train, dev, 17)
+
+    def _save(self, path, **kwargs):
+        self.assertTrue(all(parameter.grad is None for parameter in kwargs["model"].parameters()))
+        expected = kwargs["completed_updates"]
+        self.assertEqual(kwargs["sampler"].completed, expected)
+        self.saved.append((path, kwargs))
+        return SimpleNamespace(completed_updates=expected)
+
+    def _load(self, path, **kwargs):
+        completed = 7999 if "formal" in str(path) else 799
+        kwargs["sampler"].completed = completed
+        metadata = SimpleNamespace(
+            path=str(path), method=kwargs["expected_method"],
+            run_seed=kwargs["expected_run_seed"], completed_updates=completed,
+            dataset_size=kwargs["sampler"].dataset_size,
+            cuda_devices=kwargs["cuda_devices"],
+        )
+        self.loaded.append((path, kwargs, metadata))
+        _OrchestrationFactory.trace.append(("load", kwargs["expected_method"], completed))
+        return metadata
+
+    def _update(self, **kwargs):
+        method = kwargs["method"]
+        count = self.update_counts.get(method, kwargs["sampler"].completed) + 1
+        self.update_counts[method] = count
+        kwargs["sampler"].completed = count
+        self.assertIs(
+            kwargs["collate_fn"],
+            collate_clevr_question_only if method == "Q-only" else collate_clevr_questions,
+        )
+        identity = 10 if method == "Q-only" else 20
+        return self.runner.CLEVRUpdateResult(
+            tuple(range(128)), tuple(range(identity, identity + 128)),
+            64.0, 0.5, 0.75, 3e-4,
+        )
+
+    def _evaluate(self, **kwargs):
+        self.eval_calls.append(kwargs)
+        partition = kwargs["partition"]
+        return self.runner.CLEVREvaluationResult(
+            partition, 2, 1, 1.0, 0.5, 0.5,
+            (self.runner.CLEVRPredictionRecord(1, 0, (1.0, 0.0)),),
+        )
+
+    def _patches(self, *, phase, methods, seed, load=None, update=None):
+        preflight = self._preflight(phase, methods, seed)
+        stack = ExitStack()
+        stack.enter_context(patch.object(self.runner, "preflight_clevr_run", return_value=preflight))
+        stack.enter_context(patch.object(self.runner, "_setup_clevr_runtime", return_value=torch.device("cpu")))
+        self.config_mock = stack.enter_context(
+            patch.object(self.runner, "_expanded_clevr_config", return_value={"frozen": True})
+        )
+        stack.enter_context(patch.object(self.runner, "CLEVRPairedInitialization", _OrchestrationFactory))
+        stack.enter_context(patch.object(self.runner, "CLEVRRunArtifacts", _OrchestrationArtifacts))
+        stack.enter_context(patch.object(self.runner, "build_clevr_adamw", side_effect=lambda model: SimpleNamespace(model=model)))
+        stack.enter_context(patch.object(self.runner, "build_clevr_lr_scheduler", side_effect=lambda optimizer: SimpleNamespace(optimizer=optimizer)))
+        stack.enter_context(patch.object(self.runner, "CLEVRIndexStream", _OrchestrationSampler))
+        stack.enter_context(patch.object(self.runner, "save_clevr_checkpoint", side_effect=self._save))
+        stack.enter_context(patch.object(self.runner, "load_clevr_checkpoint", side_effect=load or self._load))
+        stack.enter_context(patch.object(self.runner, "run_clevr_update", side_effect=update or self._update))
+        stack.enter_context(patch.object(self.runner, "evaluate_clevr_model", side_effect=self._evaluate))
+        stack.enter_context(patch.object(self.runner.random, "seed", side_effect=lambda seed: _OrchestrationFactory.trace.append(("python-seed", seed))))
+        stack.enter_context(patch.object(self.runner.np.random, "seed", side_effect=lambda seed: _OrchestrationFactory.trace.append(("numpy-seed", seed))))
+        cpu_generator = SimpleNamespace(
+            manual_seed=lambda seed: _OrchestrationFactory.trace.append(("torch-seed", seed))
+        )
+        stack.enter_context(patch.object(self.runner.torch.random, "default_generator", cpu_generator))
+        stack.enter_context(patch.object(
+            self.runner.torch, "manual_seed",
+            side_effect=AssertionError("fresh arm must not seed every CUDA device"),
+        ))
+        stack.enter_context(patch.object(self.runner.torch.cuda, "manual_seed", side_effect=lambda seed: _OrchestrationFactory.trace.append(("cuda-seed", seed))))
+        return stack
+
+    def _train(self, *, phase, seed, methods, resumes):
+        return self.runner.train_clevr_seed(
+            spec_phase=phase, seed=seed, methods=methods, audit_dir=self.audit,
+            data_root=None if methods == ("Q-only",) else self.data,
+            output_root=self.output, device_index=0, resume_checkpoints=resumes,
+        )
+
+    def test_fresh_seed_uses_one_factory_reseeds_each_arm_and_commits_update_zero_then_final(self):
+        methods = ("G", "Q-only")
+        with self._patches(phase="smoke", methods=methods, seed=9001):
+            self._train(phase="smoke", seed=9001, methods=methods, resumes={})
+        self.assertEqual(len(_OrchestrationFactory.instances), 1)
+        self.assertEqual(_OrchestrationFactory.instances[0].builds, ["G", "Q-only"])
+        for method in methods:
+            trace = _OrchestrationFactory.trace
+            build = trace.index(("build", method))
+            ensure = next(i for i, event in enumerate(trace)
+                          if event[:2] == ("ensure-common", method))
+            update = next(i for i, event in enumerate(trace)
+                          if event[:4] == ("event", method, 1, "update"))
+            final_checkpoint = trace.index(("checkpoint-path", method, 1))
+            self.assertLess(ensure, update)
+            self.assertLess(build, update)
+            self.assertLess(update, final_checkpoint)
+        seed_events = [event for event in _OrchestrationFactory.trace
+                       if isinstance(event, tuple) and event[0].endswith("seed")]
+        self.assertEqual(seed_events, [
+            ("python-seed", 9001), ("numpy-seed", 9001),
+            ("torch-seed", 9001), ("cuda-seed", 9001),
+        ] * 2)
+        self.assertEqual(
+            [(entry[1]["method"], entry[1]["completed_updates"]) for entry in self.saved],
+            [("G", 0), ("G", 1), ("Q-only", 0), ("Q-only", 1)],
+        )
+        self.assertEqual(self.config_mock.call_args_list, [
+            call(device_index=0, audit_dir=self.audit, data_root=self.data,
+                 vocab_size=17, train_size=257),
+            call(device_index=0, audit_dir=self.audit, data_root=None,
+                 vocab_size=17, train_size=257),
+        ])
+        for artifact, resume, _ in _OrchestrationArtifacts.opened:
+            self.assertFalse(resume)
+            self.assertEqual([event[1] for event in artifact.events],
+                             ["start", "update", "complete"])
+            self.assertTrue(artifact.closed)
+        self.assertFalse(self.eval_calls)
+
+    def test_fresh_pilot_evaluates_dev_only_at_800_and_publishes_summary(self):
+        with self._patches(phase="pilot", methods=("G",), seed=9001):
+            self._train(phase="pilot", seed=9001, methods=("G",), resumes={})
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertEqual(self.update_counts, {"G": 800})
+        self.assertEqual([entry[1]["completed_updates"] for entry in self.saved], [0, 800])
+        self.assertEqual([call["partition"] for call in self.eval_calls], ["dev"])
+        self.assertEqual([(p, u) for p, u, _ in artifact.predictions], [("dev", 800)])
+        self.assertEqual(artifact.events[-2][1:], ("evaluation", artifact.events[-2][2]))
+        self.assertEqual(artifact.events[-1][1], "complete")
+
+    def test_fresh_training_accepts_an_explicit_absolute_new_output_root(self):
+        self.output = self.root / "new-output"
+        self.assertFalse(self.output.exists())
+        with self._patches(phase="smoke", methods=("G",), seed=9001):
+            self._train(phase="smoke", seed=9001, methods=("G",), resumes={})
+        self.assertEqual(len(_OrchestrationArtifacts.opened), 1)
+
+    def test_resume_constructs_then_loads_and_runs_8000_without_update_zero(self):
+        checkpoint = self.root / "formal-update-7999.pt"
+        checkpoint.write_bytes(b"injected")
+        with self._patches(phase="formal", methods=("B",), seed=101):
+            self._train(phase="formal", seed=101, methods=("B",), resumes={"B": checkpoint})
+        trace = _OrchestrationFactory.trace
+        self.assertLess(trace.index(("build", "B")), trace.index(("load", "B", 7999)))
+        self.assertEqual(len(self.loaded), 1)
+        self.assertEqual(self.update_counts, {"B": 8000})
+        self.assertEqual([entry[1]["completed_updates"] for entry in self.saved], [8000])
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertTrue(_OrchestrationArtifacts.opened[0][1])
+        self.assertEqual([event[1] for event in artifact.events],
+                         ["resume", "update", "evaluation", "evaluation", "complete"])
+        self.assertEqual([call["partition"] for call in self.eval_calls], ["dev", "train"])
+        self.assertEqual([(p, u) for p, u, _ in artifact.predictions],
+                         [("dev", 8000), ("train", 8000)])
+        self.assertFalse(any(event[0] == "checkpoint-path" and event[2] == 0 for event in trace))
+
+    def test_resume_at_target_runs_no_update_and_finishes_required_evaluation(self):
+        checkpoint = self.root / "pilot-update-0800.pt"
+        checkpoint.write_bytes(b"injected")
+        def load_target(path, **kwargs):
+            kwargs["sampler"].completed = 800
+            return SimpleNamespace(
+                method="G", run_seed=9001, completed_updates=800,
+                dataset_size=kwargs["sampler"].dataset_size,
+                cuda_devices=kwargs["cuda_devices"],
+            )
+        def forbidden_update(**kwargs):
+            raise AssertionError("target checkpoint must not run another update")
+        with self._patches(
+            phase="pilot", methods=("G",), seed=9001,
+            load=load_target, update=forbidden_update,
+        ):
+            self._train(
+                phase="pilot", seed=9001, methods=("G",),
+                resumes={"G": checkpoint},
+            )
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertFalse(self.saved)
+        self.assertEqual([call["partition"] for call in self.eval_calls], ["dev"])
+        self.assertEqual([event[1] for event in artifact.events],
+                         ["resume", "evaluation", "complete"])
+
+    def test_resume_mapping_and_metadata_mismatch_fail_before_update(self):
+        checkpoint = self.root / "pilot-update-0799.pt"
+        checkpoint.write_bytes(b"injected")
+        cases = (
+            {"G": Path("relative.pt")},
+            {"unknown": checkpoint},
+            {"G": self.root / "missing.pt"},
+        )
+        for resumes in cases:
+            with self.subTest(resumes=resumes), \
+                    self._patches(phase="pilot", methods=("G",), seed=9001):
+                with self.assertRaises(self.runner.CLEVRRunnerError):
+                    self._train(phase="pilot", seed=9001, methods=("G",), resumes=resumes)
+        def mismatched(path, **kwargs):
+            return SimpleNamespace(method="G", run_seed=9001, completed_updates=801,
+                                   dataset_size=257, cuda_devices=(0,))
+        with self._patches(phase="pilot", methods=("G",), seed=9001, load=mismatched):
+            with self.assertRaises(self.runner.CLEVRRunnerError):
+                self._train(phase="pilot", seed=9001, methods=("G",),
+                            resumes={"G": checkpoint})
+        self.assertFalse(self.update_counts)
+
+    def test_failure_event_is_best_effort_and_primary_baseexception_is_reraised(self):
+        primary = KeyboardInterrupt("stop now")
+        def fail_update(**kwargs):
+            raise primary
+        with self._patches(phase="smoke", methods=("G",), seed=9001, update=fail_update):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self._train(phase="smoke", seed=9001, methods=("G",), resumes={})
+        self.assertIs(caught.exception, primary)
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertEqual(artifact.events[-1][1], "failure")
+        self.assertEqual(artifact.events[-1][2]["type"], "KeyboardInterrupt")
+        self.assertTrue(artifact.closed)
+        _OrchestrationArtifacts.opened.clear()
+        _OrchestrationArtifacts.fail_failure_event = True
+        primary = RuntimeError("training failed")
+        with self._patches(
+            phase="smoke", methods=("G",), seed=9001,
+            update=lambda **kwargs: (_ for _ in ()).throw(primary),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                self._train(phase="smoke", seed=9001, methods=("G",), resumes={})
+        self.assertIs(caught.exception, primary)
+        self.assertTrue(any("journal failure" in note for note in primary.__notes__))
+
+
+class ProductionFormalEvaluationTests(unittest.TestCase):
+    def setUp(self):
+        self.runner = importlib.import_module("src.clevr_runner")
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.audit = self.root / "audit"
+        self.data = self.root / "data"
+        self.output = self.root / "output"
+        for path in (self.audit, self.data, self.output):
+            path.mkdir()
+        self.checkpoint = self.root / "update_8000.pt"
+        self.checkpoint.write_bytes(b"injected")
+        self.trace = []
+        _OrchestrationFactory.instances = []
+        _OrchestrationFactory.trace = self.trace
+        _OrchestrationArtifacts.opened = []
+        _OrchestrationArtifacts.trace = self.trace
+        _OrchestrationArtifacts.fail_failure_event = False
+        self.train = _OrchestrationDataset("train", 257)
+        self.base = _OrchestrationDataset("base_test", 23)
+        self.base_items = 0
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _dataset(self, *, data_root, audit_dir, partition):
+        self.trace.append(("dataset", "rgb", partition))
+        if partition == "train":
+            return self.train
+        if partition == "base_test":
+            return self.base
+        raise AssertionError(f"forbidden partition {partition}")
+
+    def _q_dataset(self, *, audit_dir, partition):
+        self.trace.append(("dataset", "qonly", partition))
+        if partition == "train":
+            return self.train
+        if partition == "base_test":
+            return self.base
+        raise AssertionError(f"forbidden partition {partition}")
+
+    def _load(self, path, **kwargs):
+        self.trace.append(("load", kwargs["expected_method"], 8000))
+        return SimpleNamespace(
+            method=kwargs["expected_method"], run_seed=kwargs["expected_run_seed"],
+            completed_updates=8000, dataset_size=kwargs["sampler"].dataset_size,
+            cuda_devices=kwargs["cuda_devices"], path=str(path),
+        )
+
+    def _evaluate(self, **kwargs):
+        self.trace.append(("evaluate", kwargs["method"], kwargs["partition"]))
+        self.assertIs(kwargs["dataset"], self.base)
+        return self.runner.CLEVREvaluationResult(
+            "base_test", 1, 1, 0.25, 0.25, 1.0,
+            (self.runner.CLEVRPredictionRecord(8, 1, (0.0, 2.0)),),
+        )
+
+    def _patches(self, *, setup=None, load=None, artifact_class=None):
+        stack = ExitStack()
+        stack.enter_context(patch.object(self.runner, "CLEVRQuestionDataset", side_effect=self._dataset))
+        stack.enter_context(patch.object(self.runner, "CLEVRQuestionOnlyDataset", side_effect=self._q_dataset))
+        stack.enter_context(patch.object(self.runner, "_setup_clevr_runtime",
+                                         side_effect=setup, return_value=torch.device("cpu")))
+        stack.enter_context(patch.object(self.runner, "_expanded_clevr_config", return_value={"frozen": True}))
+        stack.enter_context(patch.object(self.runner, "CLEVRPairedInitialization", _OrchestrationFactory))
+        stack.enter_context(patch.object(self.runner, "CLEVRRunArtifacts", artifact_class or _OrchestrationArtifacts))
+        stack.enter_context(patch.object(self.runner, "build_clevr_adamw", side_effect=lambda model: SimpleNamespace(model=model)))
+        stack.enter_context(patch.object(self.runner, "build_clevr_lr_scheduler", side_effect=lambda optimizer: SimpleNamespace(optimizer=optimizer)))
+        stack.enter_context(patch.object(self.runner, "CLEVRIndexStream", _OrchestrationSampler))
+        stack.enter_context(patch.object(self.runner, "load_clevr_checkpoint", side_effect=load or self._load))
+        stack.enter_context(patch.object(self.runner, "evaluate_clevr_model", side_effect=self._evaluate))
+        return stack
+
+    def _run(self, **overrides):
+        arguments = dict(
+            spec_phase="formal", seed=101, method="G", audit_dir=self.audit,
+            data_root=self.data, output_root=self.output, device_index=0,
+            checkpoint=self.checkpoint, partition="base_test",
+        )
+        arguments.update(overrides)
+        return self.runner.evaluate_clevr_checkpoint(**arguments)
+
+    def test_verifies_train_state_then_constructs_base_test_evaluates_once_and_publishes(self):
+        with self._patches():
+            path = self._run()
+        self.assertEqual(len(_OrchestrationFactory.instances), 1)
+        self.assertEqual(_OrchestrationFactory.instances[0].builds, ["G"])
+        self.assertEqual([event for event in self.trace if event[0] == "dataset"],
+                         [("dataset", "rgb", "train"),
+                          ("dataset", "rgb", "base_test")])
+        self.assertLess(self.trace.index(("load", "G", 8000)),
+                        self.trace.index(("dataset", "rgb", "base_test")))
+        ensure_index = next(i for i, event in enumerate(self.trace)
+                            if event[:2] == ("ensure-common", "G"))
+        self.assertLess(ensure_index, self.trace.index(("load", "G", 8000)))
+        self.assertEqual([event for event in self.trace if event[0] == "evaluate"],
+                         [("evaluate", "G", "base_test")])
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertTrue(_OrchestrationArtifacts.opened[0][1])
+        self.assertEqual([(p, u) for p, u, _ in artifact.predictions],
+                         [("base_test", 8000)])
+        self.assertEqual(path, artifact.run_dir / "predictions" / "base_test" / "8000.jsonl")
+        self.assertEqual([event[1] for event in artifact.events],
+                         ["evaluation", "complete"])
+        self.assertTrue(artifact.closed)
+
+    def test_qonly_builds_only_question_datasets_and_requires_no_data_root(self):
+        with self._patches():
+            self._run(method="Q-only", data_root=None)
+        self.assertEqual([event for event in self.trace if event[0] == "dataset"],
+                         [("dataset", "qonly", "train"),
+                          ("dataset", "qonly", "base_test")])
+
+    def test_rejects_nonformal_confirmation_bad_paths_and_existing_output_before_base(self):
+        cases = (
+            {"spec_phase": "pilot", "seed": 9001},
+            {"spec_phase": "smoke", "seed": 9001},
+            {"seed": 9001},
+            {"method": "bad"},
+            {"partition": "confirmation"},
+            {"checkpoint": Path("relative.pt")},
+            {"checkpoint": self.root / "missing.pt"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.trace.clear()
+                with self._patches(), self.assertRaises(self.runner.CLEVRRunnerError):
+                    self._run(**overrides)
+                self.assertFalse(any(event[0] == "dataset" and event[2] == "base_test"
+                                     for event in self.trace))
+        target = (self.output / "formal" / "seed_101" / "G" /
+                  "predictions" / "base_test")
+        target.mkdir(parents=True)
+        (target / "G_seed_101.jsonl").write_text("existing", encoding="utf-8")
+        self.trace.clear()
+        with self._patches(), self.assertRaises(self.runner.CLEVRRunnerError):
+            self._run()
+        self.assertFalse(any(event[0] == "dataset" and event[2] == "base_test"
+                             for event in self.trace))
+
+    def test_unknown_cuda_config_common_state_and_checkpoint_mismatch_stop_before_base(self):
+        cases = []
+        cases.append(("cuda", dict(setup=RuntimeError("unknown cuda"))))
+        class BadArtifacts(_OrchestrationArtifacts):
+            @classmethod
+            def open(cls, **kwargs):
+                raise RuntimeError("config mismatch")
+        cases.append(("config", dict(artifact_class=BadArtifacts)))
+        class BadCommonArtifacts(_OrchestrationArtifacts):
+            def ensure_common_state(self, state):
+                raise RuntimeError("common-state mismatch")
+        cases.append(("common-state", dict(artifact_class=BadCommonArtifacts)))
+        def bad_load(path, **kwargs):
+            return SimpleNamespace(
+                method=kwargs["expected_method"], run_seed=kwargs["expected_run_seed"],
+                completed_updates=7999, dataset_size=kwargs["sampler"].dataset_size,
+                cuda_devices=kwargs["cuda_devices"],
+            )
+        cases.append(("checkpoint", dict(load=bad_load)))
+        for name, patch_args in cases:
+            with self.subTest(name=name):
+                self.trace.clear()
+                with self._patches(**patch_args), self.assertRaises((RuntimeError, self.runner.CLEVRRunnerError)):
+                    self._run()
+                self.assertFalse(any(event[0] == "dataset" and event[2] == "base_test"
+                                     for event in self.trace))
 
 if __name__ == "__main__":
     unittest.main()
