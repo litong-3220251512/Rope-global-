@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import math
 
 import torch
 from torch import Tensor
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from timm.optim import param_groups_weight_decay
 
 from src.clevr_model import CLEVRQuestionAnswerer
@@ -16,6 +18,9 @@ _M10_SEED_OFFSET = 20_000
 _MAX_TORCH_SEED = (1 << 64) - 1
 _MODES = {"G", "B", "M10", "Q-only"}
 _BASE_LEARNING_RATE = 3e-4
+_MINIMUM_LEARNING_RATE = 1e-6
+_WARMUP_UPDATES = 400
+_TOTAL_UPDATES = 8_000
 _WEIGHT_DECAY = 0.05
 
 
@@ -209,3 +214,55 @@ def build_clevr_adamw(model: CLEVRQuestionAnswerer) -> AdamW:
         betas=(0.9, 0.999),
         eps=1e-8,
     )
+
+
+def clevr_learning_rate(update: int) -> float:
+    """Return the frozen learning rate for one-indexed optimizer update."""
+    if type(update) is not int:
+        raise CLEVRTrainingConfigurationError(
+            "update must be an ordinary integer"
+        )
+    if update < 1 or update > _TOTAL_UPDATES:
+        raise CLEVRTrainingConfigurationError(
+            "update must be between 1 and 8000"
+        )
+    if update <= _WARMUP_UPDATES:
+        return _BASE_LEARNING_RATE * update / _WARMUP_UPDATES
+    return _MINIMUM_LEARNING_RATE + (
+        (_BASE_LEARNING_RATE - _MINIMUM_LEARNING_RATE)
+        / 2
+        * (
+            1
+            + math.cos(
+                math.pi
+                * (update - _WARMUP_UPDATES)
+                / (_TOTAL_UPDATES - _WARMUP_UPDATES)
+            )
+        )
+    )
+
+
+def build_clevr_lr_scheduler(optimizer: AdamW) -> LambdaLR:
+    """Set each group to the LR for the next protocol optimizer update."""
+    if not isinstance(optimizer, AdamW):
+        raise CLEVRTrainingConfigurationError("optimizer must be AdamW")
+    if not optimizer.param_groups:
+        raise CLEVRTrainingConfigurationError(
+            "optimizer must contain at least one parameter group"
+        )
+    for group in optimizer.param_groups:
+        learning_rate = group.get("lr")
+        if type(learning_rate) not in {int, float}:
+            raise CLEVRTrainingConfigurationError(
+                "optimizer group learning rate must be an ordinary number"
+            )
+        if learning_rate != _BASE_LEARNING_RATE:
+            raise CLEVRTrainingConfigurationError(
+                "optimizer group learning rate must start at 3e-4"
+            )
+
+    def multiplier(scheduler_epoch: int) -> float:
+        next_update = min(scheduler_epoch + 1, _TOTAL_UPDATES)
+        return clevr_learning_rate(next_update) / _BASE_LEARNING_RATE
+
+    return LambdaLR(optimizer, lr_lambda=multiplier)

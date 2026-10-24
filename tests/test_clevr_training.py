@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import copy
+import math
 import random
 import unittest
 from unittest.mock import patch
@@ -15,6 +17,8 @@ from src.clevr_training import (
     CLEVRPairedInitialization,
     CLEVRTrainingConfigurationError,
     build_clevr_adamw,
+    build_clevr_lr_scheduler,
+    clevr_learning_rate,
 )
 
 
@@ -314,6 +318,145 @@ class CLEVRAdamWTests(unittest.TestCase):
             with self.subTest(value_type=type(value).__name__):
                 with self.assertRaises(CLEVRTrainingConfigurationError):
                     build_clevr_adamw(value)  # type: ignore[arg-type]
+
+
+class CLEVRLearningRateTests(unittest.TestCase):
+    @staticmethod
+    def _optimizer(
+        learning_rate: float = 3e-4,
+    ) -> tuple[torch.nn.Parameter, torch.optim.AdamW]:
+        parameter = torch.nn.Parameter(torch.tensor(0.0))
+        optimizer = torch.optim.AdamW([parameter], lr=learning_rate)
+        return parameter, optimizer
+
+    @staticmethod
+    def _complete_update(
+        parameter: torch.nn.Parameter,
+        optimizer: torch.optim.AdamW,
+        scheduler: torch.optim.lr_scheduler.LambdaLR,
+    ) -> None:
+        parameter.grad = torch.zeros_like(parameter)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+
+    def test_formula_matches_hand_derived_boundaries_and_rejects_invalid_updates(
+        self,
+    ) -> None:
+        expected_401 = 1e-6 + (3e-4 - 1e-6) / 2 * (
+            1 + math.cos(math.pi / 7600)
+        )
+        expected = {
+            1: 7.5e-7,
+            400: 3e-4,
+            401: expected_401,
+            4200: 1.505e-4,
+            8000: 1e-6,
+        }
+        for update, value in expected.items():
+            with self.subTest(update=update):
+                self.assertTrue(
+                    math.isclose(
+                        clevr_learning_rate(update),
+                        value,
+                        rel_tol=1e-15,
+                        abs_tol=0.0,
+                    )
+                )
+
+        for update in (-1, 0, 8001, True, 1.0, np.int64(1)):
+            with self.subTest(invalid_update=update):
+                with self.assertRaises(CLEVRTrainingConfigurationError):
+                    clevr_learning_rate(update)  # type: ignore[arg-type]
+
+    def test_lambda_scheduler_current_lr_tracks_the_next_update_without_off_by_one(
+        self,
+    ) -> None:
+        parameter, optimizer = self._optimizer()
+        scheduler = build_clevr_lr_scheduler(optimizer)
+        expected_after_completed = {
+            0: 7.5e-7,
+            1: 1.5e-6,
+            399: 3e-4,
+            400: 1e-6
+            + (3e-4 - 1e-6) / 2 * (1 + math.cos(math.pi / 7600)),
+            4199: 1.505e-4,
+            7999: 1e-6,
+            8000: 1e-6,
+        }
+
+        self.assertEqual(scheduler.last_epoch, 0)
+        self.assertEqual(scheduler._step_count, 1)
+        for completed in range(8001):
+            if completed in expected_after_completed:
+                with self.subTest(completed=completed):
+                    self.assertEqual(scheduler.last_epoch, completed)
+                    self.assertTrue(
+                        math.isclose(
+                            optimizer.param_groups[0]["lr"],
+                            expected_after_completed[completed],
+                            rel_tol=1e-15,
+                            abs_tol=0.0,
+                        )
+                    )
+            if completed < 8000:
+                self._complete_update(parameter, optimizer, scheduler)
+
+    def test_scheduler_state_restore_matches_uninterrupted_next_rates(
+        self,
+    ) -> None:
+        parameter, optimizer = self._optimizer()
+        scheduler = build_clevr_lr_scheduler(optimizer)
+        for _ in range(1000):
+            self._complete_update(parameter, optimizer, scheduler)
+        optimizer_state = copy.deepcopy(optimizer.state_dict())
+        scheduler_state = copy.deepcopy(scheduler.state_dict())
+
+        restored_parameter, restored_optimizer = self._optimizer()
+        restored_scheduler = build_clevr_lr_scheduler(restored_optimizer)
+        restored_optimizer.load_state_dict(optimizer_state)
+        restored_scheduler.load_state_dict(scheduler_state)
+
+        self.assertEqual(restored_scheduler.last_epoch, scheduler.last_epoch)
+        self.assertEqual(
+            restored_scheduler._step_count,
+            scheduler._step_count,
+        )
+        self.assertEqual(
+            restored_optimizer.param_groups[0]["lr"],
+            optimizer.param_groups[0]["lr"],
+        )
+        for offset in range(1, 11):
+            self._complete_update(parameter, optimizer, scheduler)
+            self._complete_update(
+                restored_parameter,
+                restored_optimizer,
+                restored_scheduler,
+            )
+            with self.subTest(offset=offset):
+                self.assertEqual(
+                    restored_scheduler.last_epoch,
+                    scheduler.last_epoch,
+                )
+                self.assertEqual(
+                    restored_scheduler._step_count,
+                    scheduler._step_count,
+                )
+                self.assertEqual(
+                    restored_optimizer.param_groups[0]["lr"],
+                    optimizer.param_groups[0]["lr"],
+                )
+
+    def test_scheduler_rejects_non_adamw_or_wrong_base_lr(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor(0.0))
+        invalid_optimizers = (
+            torch.optim.SGD([parameter], lr=3e-4),
+            torch.optim.AdamW([parameter], lr=1e-4),
+        )
+        for optimizer in invalid_optimizers:
+            with self.subTest(optimizer=type(optimizer).__name__):
+                with self.assertRaises(CLEVRTrainingConfigurationError):
+                    build_clevr_lr_scheduler(optimizer)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
