@@ -9,10 +9,15 @@ from pathlib import Path
 
 import torch
 from PIL import Image
+from torch.utils.data import DataLoader
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as tvf
 
-from src.clevr_dataset import CLEVRDatasetError, CLEVRQuestionDataset
+from src.clevr_dataset import (
+    CLEVRDatasetError,
+    CLEVRQuestionDataset,
+    collate_clevr_questions,
+)
 
 
 PARTITIONS = ("train", "dev", "base_test", "confirmation")
@@ -487,6 +492,220 @@ class RuntimeDatasetTests(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+
+class CLEVRQuestionCollateTests(unittest.TestCase):
+    @staticmethod
+    def sample(
+        tokens: list[int], *, image_value: float, answer: int
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "image": torch.full((3, 224, 224), image_value, dtype=torch.float32),
+            "question_tokens": torch.tensor(tokens, dtype=torch.int64),
+            "question_length": torch.tensor(len(tokens), dtype=torch.int64),
+            "answer": torch.tensor(answer, dtype=torch.int64),
+        }
+
+    def assert_collate_rejected(
+        self, samples: object, pattern: str = r"sample|collate|batch|tensor|key"
+    ) -> None:
+        try:
+            collate_clevr_questions(samples)  # type: ignore[arg-type]
+        except Exception as error:
+            self.assertIsInstance(error, CLEVRDatasetError)
+            self.assertRegex(str(error), pattern)
+        else:
+            self.fail("invalid CLEVR samples were collated")
+
+    def test_pads_with_null_without_truncation_and_preserves_sample_order(
+        self,
+    ) -> None:
+        samples = [
+            self.sample([1, 7, 2], image_value=0.25, answer=1),
+            self.sample([1, 5, 6, 2], image_value=0.75, answer=0),
+        ]
+
+        batch = collate_clevr_questions(samples)
+
+        self.assertEqual(
+            set(batch), {"image", "question_tokens", "question_length", "answer"}
+        )
+        torch.testing.assert_close(
+            batch["question_tokens"],
+            torch.tensor([[1, 7, 2, 0], [1, 5, 6, 2]], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            batch["question_length"],
+            torch.tensor([3, 4], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            batch["answer"], torch.tensor([1, 0], dtype=torch.int64), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            batch["image"][:, 0, 0, 0],
+            torch.tensor([0.25, 0.75], dtype=torch.float32),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_dataloader_batch_contains_exactly_the_four_model_fields(self) -> None:
+        fixture = RuntimeDatasetFixture()
+        try:
+            dataset = CLEVRQuestionDataset(
+                data_root=fixture.data_root,
+                audit_dir=fixture.audit_dir,
+                partition="train",
+            )
+            loader = DataLoader(
+                dataset,
+                batch_size=2,
+                shuffle=False,
+                collate_fn=collate_clevr_questions,
+            )
+
+            batch = next(iter(loader))
+
+            self.assertEqual(
+                set(batch),
+                {"image", "question_tokens", "question_length", "answer"},
+            )
+            self.assertEqual(tuple(batch["image"].shape), (2, 3, 224, 224))
+            self.assertEqual(tuple(batch["question_tokens"].shape), (2, 3))
+            torch.testing.assert_close(
+                batch["answer"],
+                torch.tensor([0, 1], dtype=torch.int64),
+                rtol=0,
+                atol=0,
+            )
+        finally:
+            fixture.close()
+
+    def test_rejects_empty_batches_and_missing_or_extra_keys(self) -> None:
+        self.assert_collate_rejected([], r"empty|sample")
+
+        missing = self.sample([1, 7, 2], image_value=0.25, answer=1)
+        missing.pop("answer")
+        self.assert_collate_rejected([missing], r"key|field|sample 0")
+
+        extra = self.sample([1, 7, 2], image_value=0.25, answer=1)
+        extra["image_path"] = torch.tensor(0)
+        self.assert_collate_rejected([extra], r"key|field|sample 0")
+
+        non_tensor = self.sample([1, 7, 2], image_value=0.25, answer=1)
+        non_tensor["answer"] = 1  # type: ignore[assignment]
+        self.assert_collate_rejected([non_tensor], r"answer|tensor|sample 0")
+
+    def test_rejects_wrong_sample_dtypes_shapes_lengths_and_answers(self) -> None:
+        def run_case(name: str, mutate, pattern: str) -> None:
+            with self.subTest(case=name):
+                sample = self.sample([1, 7, 2], image_value=0.25, answer=1)
+                mutate(sample)
+                self.assert_collate_rejected([sample], pattern)
+
+        run_case(
+            "image dtype",
+            lambda sample: sample.update({"image": sample["image"].to(torch.float64)}),
+            r"image|dtype|sample 0",
+        )
+        run_case(
+            "image shape",
+            lambda sample: sample.update({"image": sample["image"][:, :223]}),
+            r"image|shape|sample 0",
+        )
+        run_case(
+            "image nonfinite",
+            lambda sample: sample["image"].view(-1).__setitem__(0, float("nan")),
+            r"image|finite|sample 0",
+        )
+        run_case(
+            "image below range",
+            lambda sample: sample["image"].view(-1).__setitem__(0, -0.01),
+            r"image|range|sample 0|\[0,1\]",
+        )
+        run_case(
+            "image above range",
+            lambda sample: sample["image"].view(-1).__setitem__(0, 1.01),
+            r"image|range|sample 0|\[0,1\]",
+        )
+        run_case(
+            "token dtype",
+            lambda sample: sample.update(
+                {"question_tokens": sample["question_tokens"].to(torch.int32)}
+            ),
+            r"token|dtype|sample 0",
+        )
+        run_case(
+            "token rank",
+            lambda sample: sample.update(
+                {"question_tokens": sample["question_tokens"].unsqueeze(0)}
+            ),
+            r"token|shape|rank|sample 0",
+        )
+        run_case(
+            "empty tokens",
+            lambda sample: sample.update(
+                {"question_tokens": torch.empty(0, dtype=torch.int64)}
+            ),
+            r"token|empty|START|END|sample 0",
+        )
+        run_case(
+            "length dtype",
+            lambda sample: sample.update(
+                {"question_length": sample["question_length"].to(torch.int32)}
+            ),
+            r"length|dtype|sample 0",
+        )
+        run_case(
+            "length shape",
+            lambda sample: sample.update(
+                {"question_length": sample["question_length"].unsqueeze(0)}
+            ),
+            r"length|shape|scalar|sample 0",
+        )
+        run_case(
+            "length mismatch",
+            lambda sample: sample.update(
+                {"question_length": torch.tensor(2, dtype=torch.int64)}
+            ),
+            r"length|token|sample 0",
+        )
+        run_case(
+            "answer dtype",
+            lambda sample: sample.update(
+                {"answer": sample["answer"].to(torch.int32)}
+            ),
+            r"answer|dtype|sample 0",
+        )
+        run_case(
+            "answer shape",
+            lambda sample: sample.update({"answer": sample["answer"].unsqueeze(0)}),
+            r"answer|shape|scalar|sample 0",
+        )
+        run_case(
+            "answer value",
+            lambda sample: sample.update(
+                {"answer": torch.tensor(2, dtype=torch.int64)}
+            ),
+            r"answer|0 or 1|sample 0",
+        )
+
+    def test_rejects_tokens_without_exact_start_end_or_with_null_before_padding(
+        self,
+    ) -> None:
+        for name, tokens, pattern in (
+            ("wrong start", [3, 7, 2], r"START|token|sample 0"),
+            ("wrong end", [1, 7, 3], r"END|token|sample 0"),
+            ("embedded null", [1, 0, 2], r"NULL|token|sample 0"),
+            ("negative token", [1, -1, 2], r"negative|token|sample 0"),
+        ):
+            with self.subTest(case=name):
+                self.assert_collate_rejected(
+                    [self.sample(tokens, image_value=0.25, answer=1)], pattern
+                )
 
 
 if __name__ == "__main__":

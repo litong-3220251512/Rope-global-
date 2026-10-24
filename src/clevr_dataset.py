@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from PIL import Image
 from torch import Tensor
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as tvf
@@ -40,6 +41,7 @@ _ROW_FIELDS = {
     "answer",
     "relation",
 }
+_MODEL_FIELDS = {"image", "question_tokens", "question_length", "answer"}
 
 
 class CLEVRDatasetError(ValueError):
@@ -387,3 +389,91 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
             "question_length": torch.tensor(tokens.numel(), dtype=torch.int64),
             "answer": torch.tensor(record.answer, dtype=torch.int64),
         }
+
+
+def collate_clevr_questions(
+    samples: Sequence[Mapping[str, Tensor]],
+) -> dict[str, Tensor]:
+    """Pad audited question samples without reordering or truncation."""
+    if not samples:
+        raise CLEVRDatasetError("cannot collate an empty CLEVR sample sequence")
+    validated = [
+        _validate_collate_sample(sample, index=index)
+        for index, sample in enumerate(samples)
+    ]
+    return {
+        "image": torch.stack([sample[0] for sample in validated]),
+        "question_tokens": pad_sequence(
+            [sample[1] for sample in validated],
+            batch_first=True,
+            padding_value=0,
+        ),
+        "question_length": torch.stack([sample[2] for sample in validated]),
+        "answer": torch.stack([sample[3] for sample in validated]),
+    }
+
+
+def _validate_collate_sample(
+    sample: Mapping[str, Tensor], *, index: int
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    context = f"CLEVR collate sample {index}"
+    if not isinstance(sample, Mapping):
+        raise CLEVRDatasetError(f"{context} must be a mapping")
+    if set(sample) != _MODEL_FIELDS:
+        missing = sorted(_MODEL_FIELDS.difference(sample))
+        extra = sorted(set(sample).difference(_MODEL_FIELDS))
+        raise CLEVRDatasetError(
+            f"{context} keys disagree with the model contract; "
+            f"missing={missing}, extra={extra}"
+        )
+    if any(not isinstance(value, Tensor) for value in sample.values()):
+        raise CLEVRDatasetError(f"{context} values must all be tensors")
+
+    image = sample["image"]
+    tokens = sample["question_tokens"]
+    length = sample["question_length"]
+    answer = sample["answer"]
+
+    if image.dtype != torch.float32 or tuple(image.shape) != (3, 224, 224):
+        raise CLEVRDatasetError(
+            f"{context} image must have dtype float32 and shape [3,224,224]"
+        )
+    if not bool(torch.isfinite(image).all()):
+        raise CLEVRDatasetError(f"{context} image must be finite")
+    if bool((image < 0).any()) or bool((image > 1).any()):
+        raise CLEVRDatasetError(f"{context} image must be in range [0,1]")
+
+    if tokens.dtype != torch.int64 or tokens.ndim != 1:
+        raise CLEVRDatasetError(
+            f"{context} question_tokens must have dtype int64 and rank 1"
+        )
+    if tokens.numel() < 2:
+        raise CLEVRDatasetError(
+            f"{context} question_tokens must contain START and END"
+        )
+    if tokens[0].item() != 1:
+        raise CLEVRDatasetError(f"{context} question_tokens must begin with START")
+    if tokens[-1].item() != 2:
+        raise CLEVRDatasetError(f"{context} question_tokens must end with END")
+    if bool((tokens == 0).any()):
+        raise CLEVRDatasetError(
+            f"{context} question_tokens must not contain NULL before padding"
+        )
+    if bool((tokens < 0).any()):
+        raise CLEVRDatasetError(
+            f"{context} question_tokens must not contain negative IDs"
+        )
+
+    if length.dtype != torch.int64 or length.ndim != 0:
+        raise CLEVRDatasetError(
+            f"{context} question_length must be an int64 scalar"
+        )
+    if length.item() != tokens.numel():
+        raise CLEVRDatasetError(
+            f"{context} question_length disagrees with question_tokens"
+        )
+    if answer.dtype != torch.int64 or answer.ndim != 0:
+        raise CLEVRDatasetError(f"{context} answer must be an int64 scalar")
+    if answer.item() not in {0, 1}:
+        raise CLEVRDatasetError(f"{context} answer must be 0 or 1")
+    return image, tokens, length, answer
