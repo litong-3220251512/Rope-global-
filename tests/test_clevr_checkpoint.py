@@ -29,6 +29,7 @@ from src.clevr_checkpoint import (
     save_clevr_checkpoint,
 )
 from src.clevr_sampling import CLEVRIndexStream
+from src.clevr_training import build_clevr_lr_scheduler, clevr_learning_rate
 
 
 def _clone_state(value: object) -> object:
@@ -47,28 +48,8 @@ class _CheckpointFixture:
     def __init__(self) -> None:
         torch.manual_seed(17)
         self.model = nn.Sequential(nn.Linear(3, 2))
-        named_parameters = dict(self.model.named_parameters())
-        self.optimizer = AdamW(
-            [
-                {
-                    "params": [named_parameters["0.weight"]],
-                    "group_name": "decay",
-                    "param_names": ["0.weight"],
-                    "lr": 0.01,
-                },
-                {
-                    "params": [named_parameters["0.bias"]],
-                    "group_name": "no_decay",
-                    "param_names": ["0.bias"],
-                    "lr": 0.02,
-                    "weight_decay": 0.0,
-                },
-            ]
-        )
-        self.scheduler = LambdaLR(
-            self.optimizer,
-            lr_lambda=(lambda _: 1.0, lambda _: 1.0),
-        )
+        self.optimizer = _tiny_protocol_optimizer(self.model)
+        self.scheduler = build_clevr_lr_scheduler(self.optimizer)
 
         for index, parameter in enumerate(self.model.parameters(), start=1):
             parameter.grad = torch.full_like(parameter, index / 10)
@@ -83,6 +64,29 @@ class _CheckpointFixture:
         random.seed(31)
         np.random.seed(32)
         torch.manual_seed(33)
+
+
+def _tiny_protocol_optimizer(model: nn.Module) -> AdamW:
+    named_parameters = dict(model.named_parameters())
+    return AdamW(
+        [
+            {
+                "params": [named_parameters["0.weight"]],
+                "group_name": "decay",
+                "param_names": ["0.weight"],
+                "weight_decay": 0.05,
+            },
+            {
+                "params": [named_parameters["0.bias"]],
+                "group_name": "no_decay",
+                "param_names": ["0.bias"],
+                "weight_decay": 0.0,
+            },
+        ],
+        lr=3e-4,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    )
 
 
 class CheckpointSaveTests(unittest.TestCase):
@@ -1113,10 +1117,151 @@ class CheckpointPublicationTests(unittest.TestCase):
                 side_effect=AssertionError("publication reimplemented short writes"),
             ):
                 self.save(target)
-
             payload = torch.load(target, map_location="cpu", weights_only=True)
             self.assertEqual(payload["protocol_version"], "PUB-R1.1")
             self.assert_no_staging(target)
+
+    def test_live_inode_reference_spans_stream_close_link_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "live-inode.pt"
+            real_dup, real_fdopen = os.dup, os.fdopen
+            real_link, real_unlink = os.link, os.unlink
+            references: list[int] = []
+            streams: list[_FileProxy] = []
+
+            def duplicate(descriptor: int) -> int:
+                reference = real_dup(descriptor)
+                references.append(reference)
+                return reference
+
+            def wrap(descriptor: int, mode: str) -> _FileProxy:
+                output = _FileProxy(real_fdopen(descriptor, mode))
+                streams.append(output)
+                return output
+
+            def require_live_reference() -> None:
+                self.assertEqual(len(references), 1)
+                self.assertTrue(streams[0].closed)
+                self.assertTrue(stat.S_ISREG(os.fstat(references[0]).st_mode))
+
+            def link(source: object, destination: object) -> None:
+                require_live_reference()
+                real_link(source, destination)
+
+            def unlink(path: object) -> None:
+                require_live_reference()
+                real_unlink(path)
+
+            with (
+                mock.patch.object(checkpoint_module.os, "dup", side_effect=duplicate),
+                mock.patch.object(checkpoint_module.os, "fdopen", side_effect=wrap),
+                mock.patch.object(checkpoint_module.os, "link", side_effect=link),
+                mock.patch.object(checkpoint_module.os, "unlink", side_effect=unlink),
+            ):
+                self.save(target)
+
+            self.assertTrue(target.is_file())
+            self.assert_no_staging(target)
+            self.assertEqual(len(references), 1)
+            with self.assertRaises(OSError):
+                os.fstat(references[0])
+
+    def test_stream_close_replacement_cannot_publish_or_delete_foreign_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "replacement.pt"
+            real_dup, real_fdopen = os.dup, os.fdopen
+            references: list[int] = []
+            foreign: list[Path] = []
+            owned_identity: list[tuple[int, int]] = []
+
+            def duplicate(descriptor: int) -> int:
+                reference = real_dup(descriptor)
+                references.append(reference)
+                return reference
+
+            def wrap(descriptor: int, mode: str) -> _FileProxy:
+                output = _FileProxy(real_fdopen(descriptor, mode))
+                entry = os.fstat(descriptor)
+                owned_identity.append((entry.st_dev, entry.st_ino))
+                close = output.close
+
+                def replace_after_close() -> None:
+                    close()
+                    self.assertEqual(len(references), 1)
+                    pinned = os.fstat(references[0])
+                    self.assertEqual((pinned.st_dev, pinned.st_ino), owned_identity[0])
+                    staging = next(target.parent.glob(f".{target.name}.staging-*"))
+                    staging.unlink()
+                    staging.write_bytes(b"foreign checkpoint")
+                    foreign.append(staging)
+
+                output.close = replace_after_close
+                return output
+
+            with (
+                mock.patch.object(checkpoint_module.os, "dup", side_effect=duplicate),
+                mock.patch.object(checkpoint_module.os, "fdopen", side_effect=wrap),
+            ):
+                with self.assertRaises(CLEVRCheckpointPublicationError) as caught:
+                    self.save(target)
+
+            self.assertFalse(caught.exception.committed)
+            self.assertFalse(target.exists())
+            self.assertEqual(foreign[0].read_bytes(), b"foreign checkpoint")
+            self.assertTrue(any("ownership" in note for note in caught.exception.__notes__))
+            self.assertNotEqual(
+                (foreign[0].stat().st_dev, foreign[0].stat().st_ino),
+                owned_identity[0],
+            )
+            with self.assertRaises(OSError):
+                os.fstat(references[0])
+
+    def test_inode_reference_acquisition_failure_cleans_without_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "dup-failure.pt"
+            failure = OSError("inode reference acquisition")
+            with mock.patch.object(checkpoint_module.os, "dup", side_effect=failure):
+                with self.assertRaises(OSError) as caught:
+                    self.save(target)
+            self.assertIs(caught.exception, failure)
+            self.assertFalse(target.exists())
+            self.assert_no_staging(target)
+
+    def test_inode_reference_release_failure_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "release-failure.pt"
+            real_dup, real_close = os.dup, os.close
+            references: list[int] = []
+            releases: list[int] = []
+            failure = OSError("inode reference release")
+
+            def duplicate(descriptor: int) -> int:
+                reference = real_dup(descriptor)
+                references.append(reference)
+                return reference
+
+            def close(descriptor: int) -> None:
+                if descriptor in references:
+                    releases.append(descriptor)
+                    raise failure
+                real_close(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(checkpoint_module.os, "dup", side_effect=duplicate),
+                    mock.patch.object(checkpoint_module.os, "close", side_effect=close),
+                ):
+                    with self.assertRaises(CLEVRCheckpointPublicationError) as caught:
+                        self.save(target)
+                self.assertTrue(caught.exception.committed)
+                self.assertIs(caught.exception.__cause__, failure)
+                self.assertEqual(releases, references)
+                self.assertEqual(len(releases), 1)
+                self.assertTrue(target.is_file())
+                self.assert_no_staging(target)
+            finally:
+                for reference in references:
+                    real_close(reference)
 
 
 class _IntSubclass(int):
@@ -1435,6 +1580,78 @@ class CheckpointLoadTests(unittest.TestCase):
         payload["optimizer_state"]["param_groups"][0]["param_names"].reverse()
         self.assert_rejected(payload, model=model, optimizer=optimizer, scheduler=scheduler)
 
+    def test_rejects_optimizer_numeric_protocol_corruption_before_mutation(self):
+        self.assertEqual(
+            [(group["group_name"], group["param_names"], group["weight_decay"])
+             for group in self.payload["optimizer_state"]["param_groups"]],
+            [("decay", ["0.weight"], 0.05),
+             ("no_decay", ["0.bias"], 0.0)],
+        )
+        self.assertEqual(
+            [group["betas"] for group in self.payload["optimizer_state"]["param_groups"]],
+            [(0.9, 0.999), (0.9, 0.999)],
+        )
+        self.assertEqual(
+            [group["eps"] for group in self.payload["optimizer_state"]["param_groups"]],
+            [1e-8, 1e-8],
+        )
+        cases = (
+            ("betas", (0.1, 0.2)),
+            ("eps", 0.5),
+            ("weight_decay", 0.9),
+        )
+        for group_index in range(2):
+            for field, value in cases:
+                with self.subTest(group=group_index, field=field):
+                    malformed = copy.deepcopy(self.payload)
+                    malformed["optimizer_state"]["param_groups"][group_index][field] = value
+                    self.assert_rejected(malformed)
+
+        for group_index in range(2):
+            with self.subTest(group=group_index, field="initial_lr/base_lrs"):
+                malformed = copy.deepcopy(self.payload)
+                malformed["optimizer_state"]["param_groups"][group_index]["initial_lr"] = 0.123
+                malformed["scheduler_state"]["base_lrs"][group_index] = 0.123
+                self.assert_rejected(malformed)
+
+            with self.subTest(group=group_index, field="lr/_last_lr"):
+                malformed = copy.deepcopy(self.payload)
+                malformed["optimizer_state"]["param_groups"][group_index]["lr"] = 0.123
+                malformed["scheduler_state"]["_last_lr"][group_index] = 0.123
+                self.assert_rejected(malformed)
+
+    def test_rejects_wrong_next_update_schedule_at_completed_boundary(self):
+        expected = clevr_learning_rate(2)
+        self.assertEqual(self.payload["completed_updates"], 1)
+        self.assertEqual(
+            [group["initial_lr"] for group in self.payload["optimizer_state"]["param_groups"]],
+            [3e-4, 3e-4],
+        )
+        self.assertEqual(
+            [group["lr"] for group in self.payload["optimizer_state"]["param_groups"]],
+            [expected, expected],
+        )
+        self.assertEqual(self.payload["scheduler_state"]["base_lrs"], [3e-4, 3e-4])
+        self.assertEqual(self.payload["scheduler_state"]["_last_lr"], [expected, expected])
+
+        malformed = copy.deepcopy(self.payload)
+        for group in malformed["optimizer_state"]["param_groups"]:
+            group["lr"] = 0.123
+        malformed["scheduler_state"]["_last_lr"] = [0.123, 0.123]
+        self.assert_rejected(malformed)
+
+    def test_rejects_boundary_inconsistent_or_nonfinite_materialized_adamw_state(self):
+        for identifier in self.payload["optimizer_state"]["state"]:
+            with self.subTest(identifier=identifier, field="step"):
+                malformed = copy.deepcopy(self.payload)
+                malformed["optimizer_state"]["state"][identifier]["step"].fill_(2)
+                self.assert_rejected(malformed)
+            for field in ("exp_avg", "exp_avg_sq"):
+                with self.subTest(identifier=identifier, field=field):
+                    malformed = copy.deepcopy(self.payload)
+                    malformed["optimizer_state"]["state"][identifier][field].view(-1)[0] = float("nan")
+                    self.assert_rejected(malformed)
+
     def test_rejects_scheduler_cross_splice_and_optimizer_link(self):
         for field, value in (("last_epoch", 2), ("_step_count", 1),
                              ("_last_lr", [0.5, 0.5]), ("base_lrs", [0.01]),
@@ -1732,12 +1949,8 @@ class CheckpointLoadTests(unittest.TestCase):
         )
         expected_next = self.next_observations()
         model = nn.Sequential(nn.Linear(3, 2))
-        named = dict(model.named_parameters())
-        optimizer = AdamW([
-            dict(params=[named["0.weight"]], group_name="decay", param_names=["0.weight"], lr=0.01),
-            dict(params=[named["0.bias"]], group_name="no_decay", param_names=["0.bias"], lr=0.02, weight_decay=0.0),
-        ])
-        scheduler = LambdaLR(optimizer, (lambda _: 1.0, lambda _: 1.0))
+        optimizer = _tiny_protocol_optimizer(model)
+        scheduler = build_clevr_lr_scheduler(optimizer)
         sampler = CLEVRIndexStream(dataset_size=5, run_seed=101)
         self.assertEqual(optimizer.state_dict()["state"], {})
         self.assertEqual(self.load(path, model=model, optimizer=optimizer,
@@ -1789,8 +2002,8 @@ class CheckpointLoadTests(unittest.TestCase):
 
     def test_restores_zero_update_checkpoint_over_initialized_live_optimizer(self):
         f = self.fixture
-        optimizer = AdamW([dict(group) for group in f.optimizer.param_groups])
-        scheduler = LambdaLR(optimizer, (lambda _: 1.0, lambda _: 1.0))
+        optimizer = _tiny_protocol_optimizer(f.model)
+        scheduler = build_clevr_lr_scheduler(optimizer)
         sampler = CLEVRIndexStream(dataset_size=5, run_seed=101)
         path = Path(self.directory.name) / "zero.pt"
         metadata = save_clevr_checkpoint(

@@ -340,3 +340,46 @@ git commit -m "feat: add explicit CLEVR experiment runner"
 ## Final handoff
 
 After all four task reviews pass, run one independent whole-branch review over the runner design base through HEAD, allow one bounded final fix wave, and repeat the exact final verification. Prepare a PR body with problem, mathematical basis, mature-library/licensing decision, merged prerequisite heads, changes, test evidence, and limits. Push/create the real PR only if authorization succeeds; otherwise preserve the branch/worktree, record the exact blocker, and continue no further experiment execution. Do not create a tag before prerequisite and runner PRs merge and their verification is reproducible.
+
+## Final-fix correction (2026-10-25)
+
+This correction is additive and governs the final runner integration fix wave;
+the historical Task 4 text above is retained unchanged.
+
+- Checkpoint restore must validate optimizer and scheduler protocol math before
+  applying any state. Saved groups must retain the freshly built optimizer's
+  exact `group_name`, ordered `param_names`, `betas=(0.9,0.999)`, `eps=1e-8`,
+  group `weight_decay` values `0.05` and `0.0`, and base
+  `initial_lr=3e-4`. Saved scheduler `base_lrs` must equal those pristine base
+  rates. At completed-update boundary `k`, each saved optimizer `lr` and
+  scheduler `_last_lr` must equal
+  `base_lr * scheduler.lr_lambdas[i](k)`, which for
+  `build_clevr_lr_scheduler` is
+  `clevr_learning_rate(min(k + 1, 8000))`; this is the rate already installed
+  for the next optimizer update. Every nonempty/materialized AdamW state at
+  `k > 0` must have scalar finite `step == k` and finite `exp_avg`,
+  `exp_avg_sq`, and (when enabled) `max_exp_avg_sq`. Empty/lazily absent state
+  at `k=0` remains valid. Any disagreement must fail before model, optimizer,
+  scheduler, sampler, or RNG mutation and leave all live state exactly equal
+  to function entry.
+- Regression coverage is
+  `CheckpointLoadTests.test_rejects_optimizer_numeric_protocol_corruption_before_mutation`,
+  `test_rejects_wrong_next_update_schedule_at_completed_boundary`, and
+  `test_rejects_boundary_inconsistent_or_nonfinite_materialized_adamw_state`.
+  Publication ownership coverage is
+  `CheckpointPublicationTests.test_live_inode_reference_spans_stream_close_link_and_cleanup`,
+  `test_stream_close_replacement_cannot_publish_or_delete_foreign_staging`,
+  `test_inode_reference_acquisition_failure_cleans_without_commit`, and
+  `test_inode_reference_release_failure_is_not_retried`.
+- Production assembly must reject a non-`torch.float32` global default before
+  CUDA setup. It must directly verify the paired common-state's floating
+  tensors before opening an artifact attempt, then after every model build and
+  explicit device move verify every floating parameter and persistent floating
+  buffer is `torch.float32` on that device. Failure occurs before
+  `CLEVRRunArtifacts.open`, `ensure_common_state`, update-0 checkpoint
+  publication, resume load, or any training/evaluation update. The regressions
+  are
+  `ProductionTrainingTests.test_float64_default_rejected_before_cuda_or_artifact_publication`
+  and
+  `test_non_fp32_common_state_and_model_reject_before_publication`; production
+  CUDA availability remains mandatory and is not weakened by CPU test doubles.

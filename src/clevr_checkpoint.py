@@ -225,17 +225,30 @@ def _validate_load_payload(
     model_state = payload["model_state"]
     live_model = model.state_dict()
     _validate_state_schema(model_state, live_model, "model state")
-    saved_groups = _validate_load_optimizer(payload, model, optimizer)
+    k = payload["completed_updates"]
+    saved_groups = _validate_load_optimizer(
+        payload, model, optimizer, k,
+    )
     saved_scheduler = payload["scheduler_state"]
     _validate_state_schema(saved_scheduler, scheduler.state_dict(), "scheduler")
-    k = payload["completed_updates"]
     if saved_scheduler["last_epoch"] != k or saved_scheduler["_step_count"] != k + 1:
         raise CLEVRCheckpointError("scheduler counters disagree with update boundary")
-    if saved_scheduler["_last_lr"] != [group["lr"] for group in saved_groups]:
-        raise CLEVRCheckpointError("scheduler and optimizer learning rates disagree")
+    expected_lrs = _scheduler_learning_rates_at_boundary(scheduler, k)
+    _require_state_equal(
+        [group["lr"] for group in saved_groups], expected_lrs,
+        "optimizer learning rates at update boundary",
+    )
+    _require_state_equal(
+        saved_scheduler["_last_lr"], expected_lrs,
+        "scheduler learning rates at update boundary",
+    )
     _require_state_equal(
         saved_scheduler["base_lrs"], [group["initial_lr"] for group in saved_groups],
         "scheduler base learning rates",
+    )
+    _require_state_equal(
+        saved_scheduler["base_lrs"], scheduler.state_dict()["base_lrs"],
+        "scheduler protocol base learning rates",
     )
     dataset_size = _require_ordinary_int(payload["dataset_size"], "dataset_size")
     if dataset_size != sampler.dataset_size or expected_run_seed != sampler.run_seed:
@@ -326,6 +339,7 @@ def _validate_state_schema(value: object, reference: object, field: str) -> None
 
 def _validate_load_optimizer(
     payload: dict, model: nn.Module, optimizer: AdamW,
+    completed_updates: int,
 ) -> list[dict]:
     saved = payload["optimizer_state"]
     live = optimizer.state_dict()
@@ -337,6 +351,11 @@ def _validate_load_optimizer(
     for group, target in zip(saved["param_groups"], live["param_groups"]):
         for field in ("group_name", "param_names", "params"):
             _require_state_equal(group[field], target[field], f"optimizer {field}")
+        for field in target:
+            if field not in {"params", "lr"}:
+                _require_state_equal(
+                    group[field], target[field], f"optimizer protocol field {field}",
+                )
         for identifier, name in zip(group["params"], group["param_names"]):
             parameter = parameters[name]
             step_dtype = (torch.float64 if torch.get_default_dtype() == torch.float64
@@ -358,7 +377,43 @@ def _validate_load_optimizer(
         if type(state) is dict and not state:
             continue  # Public defaultdict access can create unmaterialized state.
         _validate_state_schema(state, templates[identifier], f"optimizer state {identifier}")
+        step = state["step"]
+        if not bool(torch.isfinite(step)) or step.item() != completed_updates:
+            raise CLEVRCheckpointError(
+                "optimizer step disagrees with completed update boundary"
+            )
+        for field in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            if field in state and not bool(torch.isfinite(state[field]).all()):
+                raise CLEVRCheckpointError(
+                    f"optimizer state {identifier}.{field} must be finite"
+                )
     return saved["param_groups"]
+
+
+def _scheduler_learning_rates_at_boundary(
+    scheduler: LambdaLR, completed_updates: int,
+) -> list[float]:
+    """Evaluate the supplied protocol scheduler without mutating live state."""
+    lambdas = getattr(scheduler, "lr_lambdas", None)
+    base_lrs = scheduler.state_dict().get("base_lrs")
+    if (type(lambdas) is not list or type(base_lrs) is not list
+            or len(lambdas) != len(base_lrs)):
+        raise CLEVRCheckpointError("scheduler protocol functions/base rates disagree")
+    expected: list[float] = []
+    for base_lr, schedule in zip(base_lrs, lambdas):
+        if type(base_lr) not in (int, float) or not math.isfinite(base_lr):
+            raise CLEVRCheckpointError("scheduler base learning rate must be finite")
+        try:
+            multiplier = schedule(completed_updates)
+        except BaseException as exc:
+            raise CLEVRCheckpointError("scheduler protocol evaluation failed") from exc
+        if type(multiplier) not in (int, float) or not math.isfinite(multiplier):
+            raise CLEVRCheckpointError("scheduler multiplier must be finite")
+        learning_rate = float(base_lr * multiplier)
+        if not math.isfinite(learning_rate):
+            raise CLEVRCheckpointError("scheduler learning rate must be finite")
+        expected.append(learning_rate)
+    return expected
 
 
 def _numpy_legacy_state(state: dict) -> tuple:
@@ -826,6 +881,8 @@ def _publish_new_file(
     staging: Path | None = None
     output: object | None = None
     staging_identity: tuple[int, int] | None = None
+    inode_reference: int | None = None
+    reference_release_started = False
     link_started = False
     link_returned = False
     staging_unlink_started = False
@@ -838,6 +895,7 @@ def _publish_new_file(
         acquired_stat = os.fstat(descriptor)
         staging_identity = (acquired_stat.st_dev, acquired_stat.st_ino)
         staging = Path(staging_name)
+        inode_reference = os.dup(descriptor)
         os.fchmod(descriptor, 0o600)
         output = os.fdopen(descriptor, "wb")
         descriptor = None
@@ -846,17 +904,23 @@ def _publish_new_file(
         torch.save(payload, output)
         output.flush()
         output.close()
-        staging_stat = os.stat(staging, follow_symlinks=False)
-        if not stat.S_ISREG(staging_stat.st_mode):
-            raise CLEVRCheckpointError("checkpoint staging path is not a regular file")
-        if (staging_stat.st_dev, staging_stat.st_ino) != staging_identity:
+        if not _path_matches_live_regular_inode(
+            staging, inode_reference, staging_identity,
+        ):
             raise CLEVRCheckpointError("checkpoint staging inode changed before publication")
         link_started = True
         os.link(staging, path)
         link_returned = True
         committed = True
+        if not _path_matches_live_regular_inode(
+            staging, inode_reference, staging_identity,
+        ):
+            raise CLEVRCheckpointError("checkpoint staging inode changed before cleanup")
         staging_unlink_started = True
         os.unlink(staging)
+        reference_release_started = True
+        os.close(inode_reference)
+        inode_reference = None
         final_stat = path.stat(follow_symlinks=False)
         return CLEVRCheckpointMetadata(
             path=str(path.resolve()),
@@ -882,11 +946,6 @@ def _publish_new_file(
                 output.close()
             except BaseException as cleanup_error:
                 cleanup_failures.append(("descriptor close", cleanup_error))
-        elif descriptor is not None:
-            try:
-                os.close(descriptor)
-            except BaseException as cleanup_error:
-                cleanup_failures.append(("descriptor close", cleanup_error))
 
         if (
             not committed
@@ -903,15 +962,44 @@ def _publish_new_file(
                     staging,
                     path,
                     staging_identity,
+                    inode_reference if inode_reference is not None else descriptor,
                 )
             except BaseException as cleanup_error:
                 cleanup_failures.append(("commit reconciliation", cleanup_error))
 
         if not staging_unlink_started and staging_name is not None:
             try:
-                _unlink_owned_staging(staging_name, staging_identity)
+                _unlink_owned_staging(
+                    staging_name,
+                    staging_identity,
+                    inode_reference if inode_reference is not None else descriptor,
+                )
             except BaseException as cleanup_error:
                 cleanup_failures.append(("staging cleanup", cleanup_error))
+
+        # If duplication failed, the original descriptor pins the inode until
+        # cleanup finishes. Otherwise the independent reference does.
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup_error:
+                cleanup_failures.append(("descriptor close", cleanup_error))
+        if inode_reference is not None:
+            if reference_release_started:
+                cleanup_failures.append((
+                    "inode reference release",
+                    CLEVRCheckpointError(
+                        f"fd {inode_reference} release was attempted; disposition unknown"
+                    ),
+                ))
+            else:
+                try:
+                    os.close(inode_reference)
+                except BaseException as cleanup_error:
+                    cleanup_error.add_note(
+                        f"inode reference fd {inode_reference}; close will not be retried"
+                    )
+                    cleanup_failures.append(("inode reference release", cleanup_error))
 
         if committed or cleanup_failures:
             status = "committed" if committed else "not committed"
@@ -932,36 +1020,69 @@ def _paths_are_same_regular_inode(
     staging: str | os.PathLike[str],
     target: str | os.PathLike[str],
     expected_identity: tuple[int, int],
+    inode_reference: int | None,
 ) -> bool:
     try:
         staging_stat = os.stat(staging, follow_symlinks=False)
         target_stat = os.stat(target, follow_symlinks=False)
+        reference_stat = os.fstat(inode_reference) if inode_reference is not None else None
     except OSError:
         return False
-    if not stat.S_ISREG(staging_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
+    if (reference_stat is None or not stat.S_ISREG(reference_stat.st_mode)
+            or not stat.S_ISREG(staging_stat.st_mode)
+            or not stat.S_ISREG(target_stat.st_mode)):
         return False
     staging_identity = (staging_stat.st_dev, staging_stat.st_ino)
     target_identity = (target_stat.st_dev, target_stat.st_ino)
-    return staging_identity == expected_identity == target_identity
+    reference_identity = (reference_stat.st_dev, reference_stat.st_ino)
+    return staging_identity == expected_identity == target_identity == reference_identity
+
+
+def _path_matches_live_regular_inode(
+    path: str | os.PathLike[str],
+    inode_reference: int | None,
+    expected_identity: tuple[int, int],
+) -> bool:
+    if inode_reference is None:
+        return False
+    try:
+        path_stat = os.stat(path, follow_symlinks=False)
+        reference_stat = os.fstat(inode_reference)
+    except OSError:
+        return False
+    if not stat.S_ISREG(path_stat.st_mode) or not stat.S_ISREG(reference_stat.st_mode):
+        return False
+    return (
+        (path_stat.st_dev, path_stat.st_ino)
+        == expected_identity
+        == (reference_stat.st_dev, reference_stat.st_ino)
+    )
 
 
 def _unlink_owned_staging(
     staging: str | os.PathLike[str],
     expected_identity: tuple[int, int] | None,
+    inode_reference: int | None,
 ) -> None:
     try:
         staging_stat = os.stat(staging, follow_symlinks=False)
     except FileNotFoundError:
         return
-    if expected_identity is None:
+    if expected_identity is None or inode_reference is None:
         raise CLEVRCheckpointError(
             "cannot prove ownership of checkpoint staging path"
         )
-    if not stat.S_ISREG(staging_stat.st_mode) or (
-        staging_stat.st_dev,
-        staging_stat.st_ino,
-    ) != expected_identity:
+    try:
+        reference_stat = os.fstat(inode_reference)
+    except OSError as exc:
         raise CLEVRCheckpointError(
-            "checkpoint staging path no longer identifies this invocation's file"
+            "checkpoint staging ownership reference is unavailable"
+        ) from exc
+    if (not stat.S_ISREG(staging_stat.st_mode)
+            or not stat.S_ISREG(reference_stat.st_mode)
+            or (staging_stat.st_dev, staging_stat.st_ino) != expected_identity
+            or (reference_stat.st_dev, reference_stat.st_ino) != expected_identity):
+        raise CLEVRCheckpointError(
+            "checkpoint staging ownership lost; retained foreign file"
         )
     os.unlink(staging)

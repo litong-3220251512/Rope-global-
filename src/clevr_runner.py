@@ -194,6 +194,47 @@ def _setup_clevr_runtime(device_index: int) -> torch.device:
     return torch.device(f"cuda:{device_index}")
 
 
+def _require_float32_default() -> None:
+    if torch.get_default_dtype() != torch.float32:
+        raise CLEVRRunnerError(
+            "production assembly requires the torch default dtype to be float32"
+        )
+
+
+def _require_float32_common_state(common_state: Mapping[str, Tensor]) -> None:
+    if not isinstance(common_state, Mapping) or not common_state:
+        raise CLEVRRunnerError("paired common-state must be a nonempty tensor mapping")
+    for name, value in common_state.items():
+        if type(name) is not str or not isinstance(value, Tensor):
+            raise CLEVRRunnerError("paired common-state entries must be named tensors")
+        if value.is_floating_point() and value.dtype != torch.float32:
+            raise CLEVRRunnerError(
+                f"paired common-state floating tensor is not float32: {name}"
+            )
+
+
+def _require_float32_model(model: nn.Module, device: torch.device) -> None:
+    if not isinstance(model, nn.Module):
+        raise CLEVRRunnerError("production model must be a torch.nn.Module")
+    for name, parameter in model.named_parameters():
+        if (parameter.is_floating_point()
+                and (parameter.dtype != torch.float32 or parameter.device != device)):
+            raise CLEVRRunnerError(
+                f"model floating parameter must be float32 on {device}: {name}"
+            )
+    for module_name, module in model.named_modules():
+        for name, buffer in module._buffers.items():
+            if (buffer is None or name in module._non_persistent_buffers_set
+                    or not buffer.is_floating_point()):
+                continue
+            if buffer.dtype != torch.float32 or buffer.device != device:
+                qualified = f"{module_name}.{name}" if module_name else name
+                raise CLEVRRunnerError(
+                    f"model persistent floating buffer must be float32 on {device}: "
+                    f"{qualified}"
+                )
+
+
 _AUDIT_ARTIFACT_NAMES = (
     "selected_questions.jsonl", "vocabulary.json", "audit_report.json",
 )
@@ -554,9 +595,11 @@ def train_clevr_seed(
     if _audit_artifact_snapshot(audit_dir) != audit_artifacts:
         raise CLEVRRunnerError("audit artifacts changed while datasets were constructed")
     resumes = _validate_resume_checkpoints(resume_checkpoints, preflight.methods)
+    _require_float32_default()
     device = _setup_clevr_runtime(device_index)
     factory = CLEVRPairedInitialization(vocab_size=preflight.vocab_size, run_seed=seed)
     common_state = factory.common_state_dict()
+    _require_float32_common_state(common_state)
     for method in preflight.methods:
         spec = preflight.specs[method]
         resume_path = resumes.get(method)
@@ -568,6 +611,18 @@ def train_clevr_seed(
             vocab_size=preflight.vocab_size, train_size=len(train_dataset),
             audit_artifacts=audit_artifacts,
         )
+        if resume_path is None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.random.default_generator.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+        model = factory.build(method).to(device)
+        _require_float32_model(model, device)
+        optimizer = build_clevr_adamw(model)
+        scheduler = build_clevr_lr_scheduler(optimizer)
+        sampler = CLEVRIndexStream(dataset_size=len(train_dataset), run_seed=seed)
+        collate_fn = (collate_clevr_question_only
+                      if method == "Q-only" else collate_clevr_questions)
         artifacts = CLEVRRunArtifacts.open(
             output_root=output_root, spec=spec, expanded_config=expanded_config,
             resume=resume_path is not None,
@@ -581,17 +636,6 @@ def train_clevr_seed(
                                      target_updates=spec.target_updates,
                                  ))
             artifacts.ensure_common_state(common_state)
-            if resume_path is None:
-                random.seed(seed)
-                np.random.seed(seed)
-                torch.random.default_generator.manual_seed(seed)
-                torch.cuda.manual_seed(seed)
-            model = factory.build(method).to(device)
-            optimizer = build_clevr_adamw(model)
-            scheduler = build_clevr_lr_scheduler(optimizer)
-            sampler = CLEVRIndexStream(dataset_size=len(train_dataset), run_seed=seed)
-            collate_fn = (collate_clevr_question_only
-                          if method == "Q-only" else collate_clevr_questions)
             if resume_path is None:
                 artifacts.append_event(
                     completed_updates=0, event="start",
@@ -715,6 +759,7 @@ def evaluate_clevr_checkpoint(
                  "predictions" / "base_test" / f"{method}_seed_{seed}.jsonl")
     if canonical.exists() or canonical.is_symlink():
         raise CLEVRRunnerError("canonical base-test prediction output already exists")
+    _require_float32_default()
     if method == "Q-only":
         train_dataset = CLEVRQuestionOnlyDataset(
             audit_dir=audit_dir, partition="train",
@@ -738,6 +783,13 @@ def evaluate_clevr_checkpoint(
     factory = CLEVRPairedInitialization(
         vocab_size=train_dataset.vocab_size, run_seed=seed,
     )
+    common_state = factory.common_state_dict()
+    _require_float32_common_state(common_state)
+    model = factory.build(method).to(device)
+    _require_float32_model(model, device)
+    optimizer = build_clevr_adamw(model)
+    scheduler = build_clevr_lr_scheduler(optimizer)
+    sampler = CLEVRIndexStream(dataset_size=len(train_dataset), run_seed=seed)
     spec = specs[method]
     artifacts = CLEVRRunArtifacts.open(
         output_root=output_root, spec=spec, expanded_config=expanded_config,
@@ -751,11 +803,7 @@ def evaluate_clevr_checkpoint(
         )
         if checkpoint_update != spec.target_updates:
             raise CLEVRRunnerError("formal evaluation requires the final checkpoint")
-        artifacts.ensure_common_state(factory.common_state_dict())
-        model = factory.build(method).to(device)
-        optimizer = build_clevr_adamw(model)
-        scheduler = build_clevr_lr_scheduler(optimizer)
-        sampler = CLEVRIndexStream(dataset_size=len(train_dataset), run_seed=seed)
+        artifacts.ensure_common_state(common_state)
         metadata = load_clevr_checkpoint(
             checkpoint, expected_method=method, expected_run_seed=seed,
             model=model, optimizer=optimizer, scheduler=scheduler,

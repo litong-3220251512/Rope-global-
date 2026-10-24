@@ -767,8 +767,9 @@ class _OrchestrationDataset:
         return {"answer": torch.tensor(index % 2, dtype=torch.int64)}
 
 
-class _OrchestrationModel:
+class _OrchestrationModel(nn.Module):
     def __init__(self, method, trace):
+        super().__init__()
         self.method = method
         self.trace = trace
         self.parameter = nn.Parameter(torch.tensor(1.0))
@@ -974,7 +975,9 @@ class ProductionTrainingTests(unittest.TestCase):
         preflight = self._preflight(phase, methods, seed)
         stack = ExitStack()
         stack.enter_context(patch.object(self.runner, "preflight_clevr_run", return_value=preflight))
-        stack.enter_context(patch.object(self.runner, "_setup_clevr_runtime", return_value=torch.device("cpu")))
+        self.runtime_mock = stack.enter_context(
+            patch.object(self.runner, "_setup_clevr_runtime", return_value=torch.device("cpu"))
+        )
         self.config_mock = None
         if not use_real_config:
             self.config_mock = stack.enter_context(
@@ -1089,6 +1092,49 @@ class ProductionTrainingTests(unittest.TestCase):
                              ["start", "update", "complete"])
             self.assertTrue(artifact.closed)
         self.assertFalse(self.eval_calls)
+
+    def test_float64_default_rejected_before_cuda_or_artifact_publication(self):
+        previous = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float64)
+            with self._patches(phase="smoke", methods=("Q-only",), seed=9001):
+                with self.assertRaisesRegex(self.runner.CLEVRRunnerError, "float32"):
+                    self._train(
+                        phase="smoke", seed=9001, methods=("Q-only",), resumes={},
+                    )
+                self.runtime_mock.assert_not_called()
+        finally:
+            torch.set_default_dtype(previous)
+        self.assertEqual(_OrchestrationFactory.instances, [])
+        self.assertEqual(_OrchestrationArtifacts.opened, [])
+        self.assertEqual(self.saved, [])
+
+    def test_non_fp32_common_state_and_model_reject_before_publication(self):
+        class Float64CommonFactory(_OrchestrationFactory):
+            def common_state_dict(self):
+                return OrderedDict((("shared", torch.tensor([3.0], dtype=torch.float64)),))
+
+        class Float64ModelFactory(_OrchestrationFactory):
+            def build(self, method):
+                model = _OrchestrationModel(method, self.trace)
+                model.parameter = nn.Parameter(torch.tensor(1.0, dtype=torch.float64))
+                return model
+
+        for factory, expected in (
+            (Float64CommonFactory, "common-state"),
+            (Float64ModelFactory, "model"),
+        ):
+            with self.subTest(factory=factory.__name__):
+                _OrchestrationArtifacts.opened = []
+                self.saved = []
+                with self._patches(phase="smoke", methods=("Q-only",), seed=9001), \
+                        patch.object(self.runner, "CLEVRPairedInitialization", factory):
+                    with self.assertRaisesRegex(self.runner.CLEVRRunnerError, expected):
+                        self._train(
+                            phase="smoke", seed=9001, methods=("Q-only",), resumes={},
+                        )
+                self.assertEqual(_OrchestrationArtifacts.opened, [])
+                self.assertEqual(self.saved, [])
 
     def test_fresh_pilot_evaluates_dev_only_at_800_and_publishes_summary(self):
         with self._patches(phase="pilot", methods=("G",), seed=9001):
