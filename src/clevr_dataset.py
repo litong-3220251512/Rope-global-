@@ -43,6 +43,7 @@ _ROW_FIELDS = {
     "relation",
 }
 _MODEL_FIELDS = {"image", "question_tokens", "question_length", "answer"}
+_QUESTION_ONLY_MODEL_FIELDS = {"question_tokens", "question_length", "answer"}
 
 
 class CLEVRDatasetError(ValueError):
@@ -480,6 +481,29 @@ def collate_clevr_questions(
     }
 
 
+def collate_clevr_question_only(
+    samples: Sequence[Mapping[str, Tensor]],
+) -> dict[str, Tensor]:
+    """Pad audited question-only samples without image materialization."""
+    if not samples:
+        raise CLEVRDatasetError(
+            "cannot collate an empty CLEVR question-only sample sequence"
+        )
+    validated = [
+        _validate_question_only_collate_sample(sample, index=index)
+        for index, sample in enumerate(samples)
+    ]
+    return {
+        "question_tokens": pad_sequence(
+            [sample[0] for sample in validated],
+            batch_first=True,
+            padding_value=0,
+        ),
+        "question_length": torch.stack([sample[1] for sample in validated]),
+        "answer": torch.stack([sample[2] for sample in validated]),
+    }
+
+
 def _validate_collate_sample(
     sample: Mapping[str, Tensor], *, index: int
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -514,6 +538,45 @@ def _validate_collate_sample(
             f"{context} image must be within the float32 tolerance of [0,1]"
         )
 
+    tokens, length, answer = _validate_question_tensors(
+        tokens,
+        length,
+        answer,
+        context=context,
+    )
+    return image, tokens, length, answer
+
+
+def _validate_question_only_collate_sample(
+    sample: Mapping[str, Tensor], *, index: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    context = f"CLEVR question-only collate sample {index}"
+    if not isinstance(sample, Mapping):
+        raise CLEVRDatasetError(f"{context} must be a mapping")
+    if set(sample) != _QUESTION_ONLY_MODEL_FIELDS:
+        missing = sorted(_QUESTION_ONLY_MODEL_FIELDS.difference(sample))
+        extra = sorted(set(sample).difference(_QUESTION_ONLY_MODEL_FIELDS))
+        raise CLEVRDatasetError(
+            f"{context} keys disagree with the model contract; "
+            f"missing={missing}, extra={extra}"
+        )
+    if any(not isinstance(value, Tensor) for value in sample.values()):
+        raise CLEVRDatasetError(f"{context} values must all be tensors")
+    return _validate_question_tensors(
+        sample["question_tokens"],
+        sample["question_length"],
+        sample["answer"],
+        context=context,
+    )
+
+
+def _validate_question_tensors(
+    tokens: Tensor,
+    length: Tensor,
+    answer: Tensor,
+    *,
+    context: str,
+) -> tuple[Tensor, Tensor, Tensor]:
     if tokens.dtype != torch.int64 or tokens.ndim != 1:
         raise CLEVRDatasetError(
             f"{context} question_tokens must have dtype int64 and rank 1"
@@ -547,4 +610,4 @@ def _validate_collate_sample(
         raise CLEVRDatasetError(f"{context} answer must be an int64 scalar")
     if answer.item() not in {0, 1}:
         raise CLEVRDatasetError(f"{context} answer must be 0 or 1")
-    return image, tokens, length, answer
+    return tokens, length, answer
