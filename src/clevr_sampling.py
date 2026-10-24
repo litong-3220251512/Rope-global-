@@ -10,6 +10,10 @@ from numpy.random import Generator, PCG64
 
 _SAMPLER_SEED_OFFSET = 10_000
 _PROTOCOL_VERSION = "PUB-R1.1"
+_PCG64_STATE_FIELDS = {"bit_generator", "state", "has_uint32", "uinteger"}
+_PCG64_CORE_STATE_FIELDS = {"state", "inc"}
+_UINT32_LIMIT = 1 << 32
+_UINT128_LIMIT = 1 << 128
 _STATE_FIELDS = {
     "protocol_version",
     "dataset_size",
@@ -180,11 +184,11 @@ class CLEVRIndexStream:
             raise CLEVRSamplingError(
                 "sampler PCG64 bit_generator_state must be a mapping"
             )
-        bit_generator_state = deepcopy(dict(raw_bit_generator_state))
+        bit_generator_state = self._validated_pcg64_state(raw_bit_generator_state)
         try:
             structural_probe = PCG64(0)
             structural_probe.state = deepcopy(bit_generator_state)
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, OverflowError, TypeError, ValueError) as exc:
             raise CLEVRSamplingError(
                 "sampler state has an invalid PCG64 bit_generator_state"
             ) from exc
@@ -220,6 +224,41 @@ class CLEVRIndexStream:
                 f"sampler state {field} must be an ordinary integer"
             )
         return value
+
+    @staticmethod
+    def _validated_pcg64_state(state: Mapping[str, object]) -> dict[str, object]:
+        if set(state) != _PCG64_STATE_FIELDS:
+            raise CLEVRSamplingError(
+                "sampler PCG64 bit_generator_state fields disagree"
+            )
+        if state["bit_generator"] != "PCG64":
+            raise CLEVRSamplingError(
+                "sampler PCG64 bit_generator_state names the wrong generator"
+            )
+
+        core_state = state["state"]
+        if not isinstance(core_state, Mapping):
+            raise CLEVRSamplingError("sampler PCG64 core state must be a mapping")
+        if set(core_state) != _PCG64_CORE_STATE_FIELDS:
+            raise CLEVRSamplingError("sampler PCG64 core state fields disagree")
+
+        scalar_limits = (
+            ("state", core_state["state"], _UINT128_LIMIT),
+            ("inc", core_state["inc"], _UINT128_LIMIT),
+            ("has_uint32", state["has_uint32"], 2),
+            ("uinteger", state["uinteger"], _UINT32_LIMIT),
+        )
+        for field, value, limit in scalar_limits:
+            if type(value) is not int:
+                raise CLEVRSamplingError(
+                    f"sampler PCG64 {field} must be an ordinary integer"
+                )
+            if value < 0 or value >= limit:
+                raise CLEVRSamplingError(
+                    f"sampler PCG64 {field} is outside the valid range"
+                )
+
+        return deepcopy(dict(state))
 
     def _next_permutation(self, generator: Generator) -> tuple[int, ...]:
         return tuple(int(index) for index in generator.permutation(self._dataset_size))

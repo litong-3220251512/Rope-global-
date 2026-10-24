@@ -247,6 +247,37 @@ class CLEVRIndexStreamTests(unittest.TestCase):
                 self.assertEqual(target.state_dict(), before)
                 self.assertEqual(target.preview(9), next_indices)
 
+    def test_rejects_noncanonical_pcg64_scalar_types_without_mutation(
+        self,
+    ) -> None:
+        source = CLEVRIndexStream(dataset_size=5, run_seed=101)
+        source.commit((0, 2, 1))
+        trusted = source.state_dict()
+        trusted_rng = trusted["bit_generator_state"]
+
+        malformed_values = (
+            ("has_uint32", bool(trusted_rng["has_uint32"])),
+            ("has_uint32", np.int64(trusted_rng["has_uint32"])),
+            ("has_uint32", float(trusted_rng["has_uint32"])),
+            ("uinteger", np.uint64(trusted_rng["uinteger"])),
+            ("uinteger", float(trusted_rng["uinteger"])),
+        )
+        for field, value in malformed_values:
+            with self.subTest(field=field, value_type=type(value).__name__):
+                payload = copy.deepcopy(trusted)
+                payload["bit_generator_state"][field] = value
+                target = CLEVRIndexStream(dataset_size=5, run_seed=101)
+                before = target.state_dict()
+                next_indices = target.preview(9)
+
+                with self.assertRaisesRegex(
+                    CLEVRSamplingError, r"PCG64|bit_generator|integer"
+                ):
+                    target.load_state_dict(payload)
+
+                self.assertEqual(target.state_dict(), before)
+                self.assertEqual(target.preview(9), next_indices)
+
     def test_operations_leave_global_python_numpy_and_torch_rng_unchanged(
         self,
     ) -> None:
