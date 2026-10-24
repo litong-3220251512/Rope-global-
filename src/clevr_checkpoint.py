@@ -6,8 +6,10 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 import os
+import math
 from pathlib import Path
 import platform
+import pickle
 import random
 import stat
 import tempfile
@@ -131,6 +133,330 @@ def save_clevr_checkpoint(
     )
     _validate_payload_snapshot(payload)
     return _publish_new_file(path, payload)
+
+
+def load_clevr_checkpoint(
+    path: Path,
+    *,
+    expected_method: str,
+    expected_run_seed: int,
+    model: nn.Module,
+    optimizer: AdamW,
+    scheduler: LambdaLR,
+    sampler: CLEVRIndexStream,
+    cuda_devices: tuple[int, ...],
+) -> CLEVRCheckpointMetadata:
+    """Preflight an explicit weights-only file, then restore or prove rollback.
+
+    Objects must already be constructed and gradients cleared. Empty device
+    tuples make no CUDA call; nonempty tuples require caller-initialized CUDA.
+    """
+    if not isinstance(path, Path):
+        raise CLEVRCheckpointError("path must be a pathlib.Path")
+    try:
+        resolved = path.resolve(strict=True)
+        if not resolved.is_file():
+            raise CLEVRCheckpointError("checkpoint must resolve to a regular file")
+    except OSError as exc:
+        raise CLEVRCheckpointError("checkpoint file cannot be resolved") from exc
+    _validate_method(expected_method)
+    _validate_run_seed(expected_run_seed)
+    _validate_cuda_devices(cuda_devices)
+    try:
+        payload = torch.load(resolved, map_location="cpu", weights_only=True)
+    except (OSError, EOFError, RuntimeError, pickle.UnpicklingError) as exc:
+        raise CLEVRCheckpointError("restricted checkpoint read failed") from exc
+    _validate_payload_snapshot(payload)
+    _validate_load_payload(
+        payload, expected_method, expected_run_seed, model, optimizer,
+        scheduler, sampler, cuda_devices,
+    )
+    # The canonical payload remains private; load hooks receive independent copies.
+    canonical = _snapshot_value(payload, "checkpoint")
+    metadata = CLEVRCheckpointMetadata(
+        path=str(resolved), size_bytes=resolved.stat().st_size,
+        method=payload["method"], run_seed=payload["run_seed"],
+        completed_updates=payload["completed_updates"],
+        dataset_size=payload["dataset_size"], cuda_devices=cuda_devices,
+    )
+    entry = _capture_load_state(model, optimizer, scheduler, sampler, cuda_devices)
+    try:
+        _apply_load_state(canonical, model, optimizer, scheduler, sampler, cuda_devices)
+        _verify_load_state(canonical, model, optimizer, scheduler, sampler, cuda_devices)
+    except BaseException as primary:
+        failures = _rollback_load_state(entry, model, optimizer, scheduler, sampler, cuda_devices)
+        if failures:
+            error = CLEVRCheckpointError("checkpoint application failed; rollback incomplete")
+            for component, failure in failures:
+                error.add_note(f"rollback {component}: {type(failure).__name__}: {failure}")
+            raise error from primary
+        raise
+    return metadata
+
+
+def _validate_load_payload(
+    payload: dict, expected_method: str, expected_run_seed: int, model: nn.Module,
+    optimizer: AdamW, scheduler: LambdaLR, sampler: CLEVRIndexStream,
+    cuda_devices: tuple[int, ...],
+) -> None:
+    if type(payload["protocol_version"]) is not str or payload["protocol_version"] != PROTOCOL_VERSION:
+        raise CLEVRCheckpointError("checkpoint protocol disagrees")
+    if _require_ordinary_int(payload["checkpoint_schema_version"], "schema") != CHECKPOINT_SCHEMA_VERSION:
+        raise CLEVRCheckpointError("checkpoint schema disagrees")
+    _validate_method(payload["method"])
+    _validate_run_seed(payload["run_seed"])
+    _validate_completed_updates(payload["completed_updates"])
+    if (payload["method"], payload["run_seed"]) != (expected_method, expected_run_seed):
+        raise CLEVRCheckpointError("checkpoint run identity disagrees")
+    if payload["environment"] != {
+        "python": platform.python_version(), "numpy": str(np.__version__),
+        "torch": str(torch.__version__), "cuda_runtime": str(torch.version.cuda),
+    }:
+        raise CLEVRCheckpointError("checkpoint environment disagrees")
+    if not isinstance(model, nn.Module) or not isinstance(optimizer, AdamW):
+        raise CLEVRCheckpointError("load requires nn.Module and AdamW")
+    if not isinstance(scheduler, LambdaLR) or scheduler.optimizer is not optimizer:
+        raise CLEVRCheckpointError("load requires LambdaLR owning supplied optimizer")
+    if not isinstance(sampler, CLEVRIndexStream):
+        raise CLEVRCheckpointError("load requires CLEVRIndexStream")
+    if any(p.grad is not None for p in model.parameters()):
+        raise CLEVRCheckpointError("model gradients must all be None")
+    _validate_optimizer_groups(model, optimizer)
+    model_state = payload["model_state"]
+    live_model = model.state_dict()
+    _validate_state_schema(model_state, live_model, "model state")
+    saved_groups = _validate_load_optimizer(payload, model, optimizer)
+    saved_scheduler = payload["scheduler_state"]
+    _validate_state_schema(saved_scheduler, scheduler.state_dict(), "scheduler")
+    k = payload["completed_updates"]
+    if saved_scheduler["last_epoch"] != k or saved_scheduler["_step_count"] != k + 1:
+        raise CLEVRCheckpointError("scheduler counters disagree with update boundary")
+    if saved_scheduler["_last_lr"] != [group["lr"] for group in saved_groups]:
+        raise CLEVRCheckpointError("scheduler and optimizer learning rates disagree")
+    _require_state_equal(
+        saved_scheduler["base_lrs"], [group["initial_lr"] for group in saved_groups],
+        "scheduler base learning rates",
+    )
+    dataset_size = _require_ordinary_int(payload["dataset_size"], "dataset_size")
+    if dataset_size != sampler.dataset_size or expected_run_seed != sampler.run_seed:
+        raise CLEVRCheckpointError("sampler constructor identity disagrees")
+    probe = CLEVRIndexStream(dataset_size=dataset_size, run_seed=expected_run_seed)
+    _validate_state_schema(payload["sampler_state"], sampler.state_dict(), "sampler state")
+    try:
+        probe.load_state_dict(payload["sampler_state"])
+    except ValueError as exc:
+        raise CLEVRCheckpointError("invalid sampler checkpoint") from exc
+    state = probe.state_dict()
+    if state["epoch_index"] * dataset_size + state["cursor"] != EFFECTIVE_BATCH_SIZE * k:
+        raise CLEVRCheckpointError("sampler consumed count disagrees with update boundary")
+    rng = payload["rng_state"]
+    _validate_load_rng(rng)
+    _validate_torch_cpu_rng_state(rng["torch_cpu"])
+    cpu_probe = torch.Generator(device="cpu")
+    cpu_probe.set_state(rng["torch_cpu"])
+    _require_state_equal(cpu_probe.get_state(), rng["torch_cpu"], "CPU private RNG probe")
+    _validate_cuda_devices(rng["cuda_devices"])
+    if rng["cuda_devices"] != cuda_devices or len(rng["torch_cuda"]) != len(cuda_devices):
+        raise CLEVRCheckpointError("CUDA RNG devices/states disagree")
+    if cuda_devices and not torch.cuda.is_initialized():
+        raise CLEVRCheckpointError("non-empty cuda_devices requires caller-initialized CUDA")
+    for device, state in zip(cuda_devices, rng["torch_cuda"]):
+        if (type(state) is not torch.Tensor or state.device.type != "cpu"
+                or state.dtype != torch.uint8 or state.ndim != 1):
+            raise CLEVRCheckpointError("CUDA RNG state must be a CPU byte vector")
+        try:
+            probe = torch.Generator(device=f"cuda:{device}")
+            probe.set_state(state)
+            _require_state_equal(probe.get_state(), state, "CUDA private RNG probe")
+        except RuntimeError as exc:
+            raise CLEVRCheckpointError("CUDA RNG state is invalid") from exc
+
+
+def _validate_load_rng(rng: dict) -> None:
+    python = rng["python"]
+    if type(python) is not tuple or len(python) != 3:
+        raise CLEVRCheckpointError("Python RNG state must be a three-element tuple")
+    _validate_state_schema(python[:2], random.Random(0).getstate()[:2], "Python RNG")
+    if python[2] is not None and (type(python[2]) is not float or not math.isfinite(python[2])):
+        raise CLEVRCheckpointError("Python RNG cached Gaussian must be None or finite float")
+    if python[0] != 3:
+        raise CLEVRCheckpointError("Python RNG version disagrees")
+    if any(not 0 <= word < _UINT32_LIMIT for word in python[1][:-1]):
+        raise CLEVRCheckpointError("Python RNG words outside uint32 range")
+    if not 0 <= python[1][-1] <= 624:
+        raise CLEVRCheckpointError("Python RNG position outside MT19937 range")
+    # getstate() may legitimately contain a cached Gaussian instead of None.
+    _validate_python_rng_state(python)
+    numpy = rng["numpy"]
+    if type(numpy) is not dict or set(numpy) != _NUMPY_RNG_FIELDS:
+        raise CLEVRCheckpointError("NumPy RNG fields disagree")
+    if type(numpy["bit_generator"]) is not str:
+        raise CLEVRCheckpointError("NumPy bit generator name must be an ordinary string")
+    pos = _require_ordinary_int(numpy["pos"], "NumPy pos")
+    flag = _require_ordinary_int(numpy["has_gauss"], "NumPy has_gauss")
+    if not 0 <= pos <= 624 or flag not in (0, 1):
+        raise CLEVRCheckpointError("NumPy RNG position/cache flag invalid")
+    if type(numpy["cached_gaussian"]) is not float or not math.isfinite(numpy["cached_gaussian"]):
+        raise CLEVRCheckpointError("NumPy RNG cached Gaussian must be a finite float")
+    _validate_numpy_rng_state(numpy)
+    if type(rng["torch_cuda"]) is not tuple:
+        raise CLEVRCheckpointError("CUDA RNG states must be a tuple")
+
+
+def _validate_state_schema(value: object, reference: object, field: str) -> None:
+    """Check exact containers/scalars and tensor contracts, without coercion."""
+    if type(value) is not type(reference):
+        raise CLEVRCheckpointError(f"{field}: invalid type")
+    if type(reference) is torch.Tensor:
+        if value.shape != reference.shape or value.dtype != reference.dtype:
+            raise CLEVRCheckpointError(f"{field}: invalid tensor shape/dtype")
+    elif isinstance(reference, Mapping):
+        if set(value) != set(reference):
+            raise CLEVRCheckpointError(f"{field}: invalid fields")
+        for key in reference:
+            _validate_state_schema(value[key], reference[key], f"{field}.{key}")
+    elif type(reference) in (list, tuple):
+        if len(value) != len(reference):
+            raise CLEVRCheckpointError(f"{field}: invalid length")
+        for index, (item, target) in enumerate(zip(value, reference)):
+            _validate_state_schema(item, target, f"{field}[{index}]")
+
+
+def _validate_load_optimizer(
+    payload: dict, model: nn.Module, optimizer: AdamW,
+) -> list[dict]:
+    saved = payload["optimizer_state"]
+    live = optimizer.state_dict()
+    if type(saved) is not dict or set(saved) != {"state", "param_groups"}:
+        raise CLEVRCheckpointError("optimizer fields disagree")
+    _validate_state_schema(saved["param_groups"], live["param_groups"], "optimizer groups")
+    parameters = dict(model.named_parameters())
+    templates = {}
+    for group, target in zip(saved["param_groups"], live["param_groups"]):
+        for field in ("group_name", "param_names", "params"):
+            _require_state_equal(group[field], target[field], f"optimizer {field}")
+        for identifier, name in zip(group["params"], group["param_names"]):
+            parameter = parameters[name]
+            step_dtype = (torch.float64 if torch.get_default_dtype() == torch.float64
+                          and not group["fused"] else torch.float32)
+            template = {
+                "step": torch.empty((), dtype=step_dtype),
+                "exp_avg": torch.empty_like(parameter, device="cpu"),
+                "exp_avg_sq": torch.empty_like(parameter, device="cpu"),
+            }
+            if group["amsgrad"]:
+                template["max_exp_avg_sq"] = torch.empty_like(parameter, device="cpu")
+            templates[identifier] = template
+    # At k=0 AdamW has not materialized any per-parameter state. At later
+    # boundaries require the same parameter coverage as an initialized target;
+    # a fresh target accepts the checkpoint's initialized parameter subset.
+    states = saved["state"]
+    if type(states) is not dict or not set(states).issubset(templates):
+        raise CLEVRCheckpointError("optimizer state parameter identifiers disagree")
+    if payload["completed_updates"] != 0 and live["state"] and set(states) != set(live["state"]):
+        raise CLEVRCheckpointError("optimizer state parameter coverage disagrees")
+    for identifier, state in states.items():
+        _validate_state_schema(state, templates[identifier], f"optimizer state {identifier}")
+    return saved["param_groups"]
+
+
+def _numpy_legacy_state(state: dict) -> tuple:
+    return (state["bit_generator"], state["keys"].numpy().astype(np.uint32, copy=True),
+            state["pos"], state["has_gauss"], state["cached_gaussian"])
+
+
+def _apply_load_state(
+    payload: dict, model: nn.Module, optimizer: AdamW, scheduler: LambdaLR,
+    sampler: CLEVRIndexStream, cuda_devices: tuple[int, ...],
+) -> None:
+    model.load_state_dict(_snapshot_value(payload["model_state"], "model"), strict=True)
+    scheduler.load_state_dict(_snapshot_value(payload["scheduler_state"], "scheduler"))
+    optimizer.load_state_dict(_snapshot_value(payload["optimizer_state"], "optimizer"))
+    sampler.load_state_dict(_snapshot_value(payload["sampler_state"], "sampler"))
+    rng = payload["rng_state"]
+    random.setstate(rng["python"])
+    np.random.set_state(_numpy_legacy_state(rng["numpy"]))
+    torch.random.set_rng_state(rng["torch_cpu"].clone())
+    for device, state in zip(cuda_devices, rng["torch_cuda"]):
+        torch.cuda.set_rng_state(state.clone(), device)
+
+
+def _rollback_load_state(
+    entry: dict, model: nn.Module, optimizer: AdamW, scheduler: LambdaLR,
+    sampler: CLEVRIndexStream, cuda_devices: tuple[int, ...],
+) -> list[tuple[str, BaseException]]:
+    """Attempt every reverse-order cleanup, including after BaseException."""
+    rng = entry["rng_state"]
+    actions = [
+        (f"CUDA RNG device {device}",
+         lambda state=state, device=device: torch.cuda.set_rng_state(state.clone(), device))
+        for device, state in reversed(tuple(zip(cuda_devices, rng["torch_cuda"])))
+    ]
+    actions.extend([
+        ("torch CPU RNG", lambda: torch.random.set_rng_state(rng["torch_cpu"].clone())),
+        ("NumPy RNG", lambda: np.random.set_state(_numpy_legacy_state(rng["numpy"]))),
+        ("Python RNG", lambda: random.setstate(rng["python"])),
+        ("sampler", lambda: sampler.load_state_dict(_snapshot_value(entry["sampler_state"], "sampler rollback"))),
+        ("optimizer", lambda: optimizer.load_state_dict(_snapshot_value(entry["optimizer_state"], "optimizer rollback"))),
+        ("scheduler", lambda: scheduler.load_state_dict(_snapshot_value(entry["scheduler_state"], "scheduler rollback"))),
+        ("model", lambda: model.load_state_dict(_snapshot_value(entry["model_state"], "model rollback"), strict=True)),
+    ])
+    failures = []
+    for component, action in actions:
+        try:
+            action()
+        except BaseException as error:
+            failures.append((component, error))
+    if not failures:
+        try:
+            _verify_load_state(entry, model, optimizer, scheduler, sampler, cuda_devices)
+        except BaseException as error:
+            failures.append(("equality verification", error))
+    return failures
+
+
+def _require_state_equal(actual: object, expected: object, field: str) -> None:
+    if type(actual) is not type(expected):
+        raise CLEVRCheckpointError(f"{field}: state types disagree")
+    if type(expected) is torch.Tensor:
+        equal = (actual.shape == expected.shape and actual.dtype == expected.dtype
+                 and torch.equal(actual.detach().cpu(), expected.detach().cpu()))
+    elif isinstance(expected, Mapping):
+        if set(actual) != set(expected):
+            raise CLEVRCheckpointError(f"{field}: state fields disagree")
+        for key in expected:
+            _require_state_equal(actual[key], expected[key], f"{field}.{key}")
+        return
+    elif type(expected) in (tuple, list):
+        if len(actual) != len(expected):
+            raise CLEVRCheckpointError(f"{field}: state lengths disagree")
+        for index, (left, right) in enumerate(zip(actual, expected)):
+            _require_state_equal(left, right, f"{field}[{index}]")
+        return
+    else:
+        equal = actual == expected
+    if not equal:
+        raise CLEVRCheckpointError(f"{field}: state values disagree")
+
+
+def _capture_load_state(
+    model: nn.Module, optimizer: AdamW, scheduler: LambdaLR,
+    sampler: CLEVRIndexStream, cuda_devices: tuple[int, ...],
+) -> dict[str, object]:
+    return _build_payload(
+        method="G", run_seed=sampler.run_seed, completed_updates=0,
+        model=model, optimizer=optimizer, scheduler=scheduler, sampler=sampler,
+        cuda_devices=cuda_devices,
+    )
+
+
+def _verify_load_state(
+    payload: dict, model: nn.Module, optimizer: AdamW, scheduler: LambdaLR,
+    sampler: CLEVRIndexStream, cuda_devices: tuple[int, ...],
+) -> None:
+    actual = _capture_load_state(model, optimizer, scheduler, sampler, cuda_devices)
+    for field in ("model_state", "optimizer_state", "scheduler_state", "sampler_state", "rng_state"):
+        _require_state_equal(actual[field], payload[field], field)
 
 
 def _validate_save_arguments(
