@@ -1249,6 +1249,9 @@ def publish_statistics_bundle(
 
     lock_path = resolved_output.parent / f".{resolved_output.name}.lock"
     lock_token = secrets.token_hex(32).encode("ascii")
+    committed = False
+    staging_dir: Path | None = None
+    lock_identity: tuple[int, int] | None = None
     try:
         lock_fd = os.open(
             lock_path,
@@ -1260,9 +1263,6 @@ def publish_statistics_bundle(
             f"cannot acquire publication lock {lock_path}: {exc}"
         ) from exc
 
-    committed = False
-    staging_dir: Path | None = None
-    lock_identity: tuple[int, int] | None = None
     try:
         lock_stat = os.fstat(lock_fd)
         lock_identity = (lock_stat.st_dev, lock_stat.st_ino)
