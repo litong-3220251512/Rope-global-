@@ -132,7 +132,7 @@ def _resolve_regular_file(path: Path) -> Path:
     return resolved
 
 
-def _read_json_document(path: Path) -> tuple[object, int]:
+def _read_json_document(path: Path) -> tuple[object, int, Path]:
     resolved = _resolve_regular_file(path)
     try:
         with resolved.open("r", encoding="utf-8") as input_file:
@@ -146,10 +146,12 @@ def _read_json_document(path: Path) -> tuple[object, int]:
         raise _context_error(resolved, str(exc), line=exc.lineno) from exc
     except (UnicodeError, OSError, ValueError) as exc:
         raise _context_error(resolved, str(exc)) from exc
-    return value, size_bytes
+    return value, size_bytes, resolved
 
 
-def _read_json_lines(path: Path) -> tuple[tuple[tuple[int, object], ...], int]:
+def _read_json_lines(
+    path: Path,
+) -> tuple[tuple[tuple[int, object], ...], int, Path]:
     resolved = _resolve_regular_file(path)
     rows: list[tuple[int, object]] = []
     try:
@@ -183,7 +185,7 @@ def _read_json_lines(path: Path) -> tuple[tuple[tuple[int, object], ...], int]:
         raise _context_error(resolved, str(exc)) from exc
     if not rows:
         raise _context_error(resolved, "JSONL input must not be empty")
-    return tuple(rows), size_bytes
+    return tuple(rows), size_bytes, resolved
 
 
 def _require_exact_keys(
@@ -495,9 +497,9 @@ def load_audit_targets(
     manifest_path = resolved_dir / "selected_questions.jsonl"
     report_path = resolved_dir / "audit_report.json"
 
-    image_document, image_size = _read_json_document(image_path)
-    manifest_rows, manifest_size = _read_json_lines(manifest_path)
-    report_document, report_size = _read_json_document(report_path)
+    image_document, image_size, image_path = _read_json_document(image_path)
+    manifest_rows, manifest_size, manifest_path = _read_json_lines(manifest_path)
+    report_document, report_size, report_path = _read_json_document(report_path)
 
     image_partitions, image_membership, image_count = _parse_image_partitions(
         image_document, image_path

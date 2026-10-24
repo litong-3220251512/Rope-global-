@@ -283,6 +283,33 @@ class AuditBundleTests(unittest.TestCase):
             counts, PartitionCounts(train=2, dev=1, base_test=2, confirmation=1)
         )
 
+    def test_symlinked_audit_inputs_record_resolved_target_paths(self) -> None:
+        # Mutation caught: discarding each reader's resolved artifact identity.
+        target_dir = self.audit_dir.parent / "resolved-artifacts"
+        target_dir.mkdir()
+        target_paths = []
+        for name in (
+            "image_partitions.json",
+            "selected_questions.jsonl",
+            "audit_report.json",
+        ):
+            fixed_path = self.audit_dir / name
+            target_path = target_dir / name
+            fixed_path.rename(target_path)
+            fixed_path.symlink_to(target_path)
+            target_paths.append(target_path)
+
+        _, evidence, _ = load_audit_targets(self.audit_dir)
+
+        self.assertEqual(
+            tuple(item.path for item in evidence),
+            (
+                str(target_paths[0]),
+                str(target_paths[1]),
+                str(target_paths[2]),
+            ),
+        )
+
     def test_output_records_are_frozen_and_strictly_typed(self) -> None:
         # Mutation caught: mutable records or bool/coercible values crossing the boundary.
         evidence = ArtifactEvidence("/tmp/evidence.json", 0, 0)
