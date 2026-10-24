@@ -11,7 +11,7 @@
 核查得到的直接结论是：
 
 - **RoPE-ViT** 是 G 与 M10 最接近的二维旋转位置编码实现来源，但论文实验是图像分类，不是 CLEVR 问答。
-- **FiLM 的从像素训练版本**在输入和监督类别上最接近本任务：RGB、原始问题和答案监督，不依赖对象框、场景图或程序标签；其卷积骨干、显式坐标通道、完整 CLEVR 任务和训练协议仍与 PUB-R1.1 不同。
+- **FiLM 的从像素训练版本**在输入和监督类别上最接近本任务：RGB、原始问题和答案监督，不依赖对象框、场景图或程序标签；其卷积骨干、显式坐标通道、完整 CLEVR 任务和训练协议仍与 PUB-R1.1 不同。它目前只是尚未排序、不可直接实施的文献候选。
 - **MAC 与 LCGN**提供问题引导的多步推理或网格消息传递参考，但其论文配置使用 ImageNet 预训练视觉特征，不能作为当前随机初始化 ViT 的同条件性能基线。
 - **Relation Network（RN）**有适用的从像素关系推理定义，但本次未核实到作者发布的 CLEVR 实现，不能列入“可直接复用的官方开源实现”。
 - **NS-CL 与 MDETR**的发布接口或论文训练条件使用对象框、程序、场景图派生对齐等额外监督，不满足 PUB-R1.1 的 answer-only 模型边界，不能原样接入。
@@ -71,9 +71,11 @@ G/B 的二维平面顺序为每头前 16 个 x 平面、后 16 个 y 平面。�
 | 主干与容量 | 六层、宽度 192 的 ViT；G/B 参数量相同 |
 | 训练预算 | 五个 seed，每 run 固定 8000 次 optimizer 更新 |
 | 主要估计量 | 基础测试微平均准确率的配对差 \(\Delta_s=\mathrm{Acc}_{B,s}-\mathrm{Acc}_{G,s}\) |
-| 实现来源 | 论文正文与作者/机构官方仓库均可定位；版本、许可证和接口边界已记录 |
+| 进入实现前的复用门槛 | 论文正文与作者/机构官方仓库均可定位；固定 revision，并记录许可证、维护状态、所需 API 及采用或不采用的理由 |
 
 “RGB + question”本身不足以证明可比。例如，固定 ImageNet 特征、预训练语言模型、对象框监督或程序派生对齐都会改变可用信息或优化难度；完整 CLEVR 28/29 类答案分类也不是当前二分类筛选任务。
+
+该表最后一行是进入实现前必须满足的门槛，不表示下文所有文献候选已经通过复用审查。本项目当前实际采用的 RoPE-ViT 已固定 commit；FiLM、MAC、LCGN、NS-CL、MDETR、VisionLLaMA、LieRE 与 PoPE 本轮只核读论文和官方仓库中的相关接口，尚未统一固定 revision 或验证运行环境。它们若被提议进入实现，须先另做完整的版本、许可证、维护状态和 API 记录。论文级排除项 RN 不进入当前库复用审查。
 
 ## 4. 最接近的位置编码实现：RoPE-ViT
 
@@ -101,7 +103,7 @@ G/B 的二维平面顺序为每头前 16 个 x 平面、后 16 个 y 平面。�
 
 ## 5. 输入与监督最接近的开源问答架构
 
-### 5.1 FiLM：从像素训练的首选诊断参考
+### 5.1 FiLM：从像素训练的待定义诊断参考
 
 **论文与源码。** Perez et al., *FiLM: Visual Reasoning with a General Conditioning Layer*, AAAI 2018：[论文正文](https://arxiv.org/pdf/1709.07871)、[作者仓库](https://github.com/ethanjperez/film)。
 
@@ -116,9 +118,9 @@ G/B 的二维平面顺序为每头前 16 个 x 平面、后 16 个 y 平面。�
 
 **官方实现定位。** [`vr/models/film_gen.py`](https://github.com/ethanjperez/film/blob/master/vr/models/film_gen.py) 的 `FiLMGen` 负责问题编码与调制参数生成；[`vr/models/filmed_net.py`](https://github.com/ethanjperez/film/blob/master/vr/models/filmed_net.py) 的 `FiLM`、`FiLMedResBlock` 与 `FiLMedNet` 负责逐通道调制、残差视觉计算和答案分类。
 
-**结果边界。** 论文 Table 1 报告完整 CLEVR 的总体准确率：预训练特征版 97.7%，从像素版 97.6%；Table 2 明确是 validation ablation，并给出 raw-pixels 97.6%。这些数字对应完整多答案任务和论文配方，不是 PUB-R1.1 的二分类 test，也没有 G/B 配对控制。
+**结果边界。** 论文 Table 1 报告完整 CLEVR 的总体准确率：预训练特征版 97.7%，从像素版 97.6%；该表及相邻正文未明确说明 split，因此这里将其 split 记为未知。Table 2 明确是 validation ablation，并给出 raw-pixels 97.6%。这些数字对应完整多答案任务和论文配方，不是 PUB-R1.1 的二分类 test，也没有 G/B 配对控制。
 
-**为何列为首选诊断参考。** 从像素版只依赖 RGB、问题和答案监督，在信息类别上最接近 PUB-R1.1，可用于回答“当前 ViT 失败是否可能来自一般视觉—语言融合能力不足”。但 FiLM 的卷积归纳偏置、显式 x/y 坐标、条件化位置、容量和优化都与当前模型不同；即使它在相同筛选数据上学会任务，也不能证明 B 的区域相位机制有效。
+**为何值得进一步定义。** 从像素版只依赖 RGB、问题和答案监督，在信息类别上最接近 PUB-R1.1，可能用于检查当前 ViT 的任务学习是否受视觉—语言融合路径限制。但这只是待验证解释：FiLM 的卷积归纳偏置、显式 x/y 坐标、条件化位置、容量和优化都与当前模型不同；即使它在相同筛选数据上学会任务，也不能证明 B 的区域相位机制有效，也不能单独归因于 FiLM 调制。
 
 **工程状态。** 官方代码许可证为 [CC BY-NC 4.0](https://github.com/ethanjperez/film/blob/master/LICENSE)，且 [`requirements.txt`](https://github.com/ethanjperez/film/blob/master/requirements.txt) 仍引用 PyTorch 0.1.11。该仓库适合核对结构，不应未经许可证与现代 PyTorch 兼容性审查直接复制。
 
@@ -130,7 +132,7 @@ G/B 的二维平面顺序为每头前 16 个 x 平面、后 16 个 y 平面。�
 
 **官方实现定位。** [`mac_cell.py`](https://github.com/stanfordnlp/mac-network/blob/master/mac_cell.py) 的 `MACCell.control`、`read`、`write` 对应三个单元；[`model.py`](https://github.com/stanfordnlp/mac-network/blob/master/model.py) 的 `MACnet` 连接问题 encoder、视觉 feature、循环推理和输出层。
 
-**结果边界。** 论文 §4 报告完整 CLEVR 总体准确率 98.94%，Appendix Table 2 明确给出 validation accuracy 98.9%。该结果使用预训练视觉特征、完整多答案任务和不同训练预算，不能与 PUB-R1.1 排名。
+**结果边界。** 论文 §4 报告完整 CLEVR validation accuracy 98.94%，Appendix Table 2 在 validation ablation 中给出 98.9%。该结果使用预训练视觉特征、完整多答案任务和不同训练预算，不能与 PUB-R1.1 排名。
 
 **工程状态。** 官方代码为 [Apache-2.0](https://github.com/stanfordnlp/mac-network/blob/master/LICENSE)，README 说明原实现基于 TensorFlow 1.3。它适合作为多步问题引导推理的架构参考，不是当前 PyTorch 主干的可直接替换件。
 
@@ -164,7 +166,7 @@ G/B 的二维平面顺序为每头前 16 个 x 平面、后 16 个 y 平面。�
 | --- | --- | --- |
 | VisionLLaMA | Chu et al., ECCV 2024，[§3.1–3.3、式 (1)–(4)](https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/08280.pdf)；[官方实现](https://github.com/Meituan-AutoML/VisionLLaMA/blob/main/deit/my_models.py)含 `precompute_freqs_cis_2d`、`apply_rotary_emb` 与 `RAttention`。AS2DRoPE 按 anchor/current resolution 缩放坐标。 | 可核对固定二维旋转与分辨率缩放；完整采用还会改变 SwiGLU、pooling 或 attention topology。仓库根部的统一复用许可证本次未核实，暂不复制源码。 |
 | LieRE | Ostmeier et al., ICML 2025，[§4/Figure 3](https://arxiv.org/html/2406.10322v5#S4)：\(R(p)=\exp(\sum_a p_aA_a)\)，其中 \(A_a^\top=-A_a\)；[官方实现](https://github.com/StanfordMIMI/LieRE/blob/main/models/rope_vit.py)用 `torch.matrix_exp` 学习旋转。 | 引入按层/头的矩阵生成元和额外计算；非交换生成元下不自动保留普通 RoPE 的精确相对坐标性质。属于新的可学习 PE 容量，不是 B 的等容量替代。 |
-| PoPE | Gopalakrishnan et al., ICML 2026，[§3 式 (3)–(6)](https://arxiv.org/html/2509.10534v3#S3)将 content 表示为正幅值并以位置相位计算 attention；[官方代码](https://github.com/agopal42/pope)实现因果序列模型。 | 已核实实验是字符序列的 indirect indexing，不是二维图像。发布实现没有可直接采用的二维双向视觉映射；“polar”指 feature 的极坐标表示，不是图像极坐标。 |
+| PoPE | Gopalakrishnan et al., ICML 2026，[§3 式 (3)–(6)](https://arxiv.org/html/2509.10534v3#S3)将 content 表示为正幅值并以位置相位计算 attention；[官方代码](https://github.com/agopal42/pope)实现因果序列模型。 | 已核实实验覆盖若干一维因果序列任务，包括 indirect indexing、符号音乐、基因组和语言建模；尚未核实二维双向视觉实验。发布实现没有可直接采用的二维双向视觉映射；“polar”指 feature 的极坐标表示，不是图像极坐标。 |
 
 这三项若进入实验，都需要先给出二维坐标、CLS 行为、参数量、初始化、计算增量和退化回 G 的完整数学定义，再单独审批预算。现阶段 M10 已覆盖“官方 RoPE-ViT 可学习 Mixed 频率”这一最近对照，不应同时堆叠多个新 PE 变体。
 
@@ -174,7 +176,7 @@ G/B 的二维平面顺序为每头前 16 个 x 平面、后 16 个 y 平面。�
 
 | 方法 | 论文报告 | 输入/监督或 split 条件 | 对 PUB-R1.1 的含义 |
 | --- | --- | --- | --- |
-| FiLM | 97.6% raw pixels；Table 2 明确为 validation ablation | 完整 CLEVR、多答案分类、RGB+问题+答案；内部坐标通道 | 输入/监督类别接近，任务与架构不同 |
+| FiLM | Table 1：97.7% pretrained features、97.6% raw pixels，split 未明确；Table 2：97.6% raw pixels，明确为 validation ablation | 完整 CLEVR、多答案分类、RGB+问题+答案；内部坐标通道 | 输入/监督类别接近，任务与架构不同 |
 | MAC | 98.9% validation，Appendix Table 2 | 固定 ImageNet ResNet-101 feature；完整 CLEVR | 有预训练与容量差异 |
 | LCGN | 97.9% official test，Table 3 | ImageNet ResNet-101 C4；完整 CLEVR | 有预训练、空间编码和推理结构差异 |
 | RN | 95.5% overall、97.8% Exist，official test，Table 1 | scratch CNN；完整 CLEVR；29 类答案头 | Exist 范围大于当前筛选，且官方代码未核实 |
@@ -189,7 +191,7 @@ G/B 的二维平面顺序为每头前 16 个 x 平面、后 16 个 y 平面。�
 
 1. 先检查数据、标签复算、问题长度、图像通路、梯度、恢复状态和共同初始化，不把工程错误解释为架构不足。
 2. 若实现正确但任务增量仍不可重复，记录“当前配方不足以定位 PE 效应”，不宣布 RoPE 或 B 无效。
-3. 在独立协议中将 **scratch FiLM** 作为 answer-only、RGB+问题的架构诊断候选。其输出改为二分类，使用相同 train/dev/test manifest；保留论文的 FiLM 机制时，必须把显式坐标通道列为架构差异。该实验只回答更强视觉—语言融合能否学习任务，不参与 B−G 主比较。
+3. 若要提出新的架构诊断，在独立协议中可继续评估 **scratch FiLM** 是否值得进入候选集，但本文件不对候选排序，也不构成实施定义。至少还缺少精确 feature-map 与调制张量形状、参数/FLOPs 增量、初始化、退化回无 FiLM 条件的方式、预注册证伪判据，以及分别控制 CNN、显式坐标、FiLM 调制和容量的消融。在这些要素补齐并获批前不得编码。未来若形成合格方案，其输出须为二分类并使用相同 train/dev/test manifest；该实验只诊断另一种视觉—语言架构能否学习任务，不参与 B−G 主比较。
 4. 只有当诊断需要区分单步融合与关系推理容量时，再考虑 MAC 或 LCGN。若采用预训练 feature，应与随机初始化条件分表报告；若改为 scratch RGB，则这是新的实现，不得引用论文原始准确率作为其验证。
 5. 任一候选在编码前先冻结：输入输出形状、监督、坐标、参数与 FLOPs 增量、初始化、预算、退化条件、失败预测和逐项消融。一次只验证一个主要机制。
 
