@@ -2,6 +2,7 @@
 
 from inspect import signature
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -194,6 +195,19 @@ class CLEVRMixedPositionTests(unittest.TestCase):
                 CLEVRMixedPosition(seed=seed)
         with self.assertRaises(ValueError):
             CLEVRMixedPosition(seed=-1)
+
+    def test_initialization_does_not_seed_accelerator_generators(self):
+        def unexpected_seed(_seed):
+            raise AssertionError("M10 initialization touched an accelerator RNG")
+
+        with (
+            patch.object(torch.cuda, "manual_seed_all", side_effect=unexpected_seed),
+            patch.object(torch.mps, "manual_seed", side_effect=unexpected_seed),
+            patch.object(torch.xpu, "manual_seed_all", side_effect=unexpected_seed),
+        ):
+            position = CLEVRMixedPosition(seed=20007)
+
+        self.assertEqual(tuple(position.freqs.shape), (2, 6, 96))
 
     def test_matches_official_flattened_layout_and_base_ten_geometry(self):
         seed = 20007
@@ -416,40 +430,63 @@ class CLEVRQuestionAnswererM10Tests(unittest.TestCase):
                 )
         self.assertFalse(torch.equal(captured[0], captured[1]))
 
-    def test_answer_loss_reaches_q_k_and_frequencies_and_update_recomputes_phase(self):
+    def test_answer_loss_reaches_q_k_and_frequencies_across_an_update(self):
         torch.manual_seed(20261025)
         model = CLEVRQuestionAnswerer(
             vocab_size=8, mode="M10", m10_seed=20007
         )
         image, question_tokens, question_length = _valid_answerer_inputs()
-        logits = model(image, question_tokens, question_length)
-        loss = nn.functional.cross_entropy(
-            logits, torch.tensor((1,), dtype=torch.int64)
+        captured = []
+
+        def capture_first_block_phase(_module, _args, kwargs):
+            captured.append(kwargs["freqs_cis"])
+
+        handle = model.backbone.blocks[0].register_forward_pre_hook(
+            capture_first_block_phase, with_kwargs=True
         )
-        loss.backward()
+        try:
+            logits = model(image, question_tokens, question_length)
+            loss = nn.functional.cross_entropy(
+                logits, torch.tensor((1,), dtype=torch.int64)
+            )
+            loss.backward()
 
-        frequency_gradient = model.position.freqs.grad
-        self.assertIsNotNone(frequency_gradient)
-        self.assertTrue(torch.isfinite(frequency_gradient).all())
-        self.assertGreater(frequency_gradient.abs().sum().item(), 0.0)
-        for block_index, block in enumerate(model.backbone.blocks):
-            gradient = block.attn.qkv.weight.grad
-            self.assertIsNotNone(gradient)
-            for projection, rows in (
-                ("q", slice(0, 192)),
-                ("k", slice(192, 384)),
-            ):
-                with self.subTest(block=block_index, projection=projection):
-                    selected = gradient[rows]
-                    self.assertTrue(torch.isfinite(selected).all())
-                    self.assertGreater(selected.abs().sum().item(), 0.0)
+            frequency_gradient = model.position.freqs.grad.detach().clone()
+            self.assertTrue(torch.isfinite(frequency_gradient).all())
+            self.assertGreater(frequency_gradient.abs().sum().item(), 0.0)
+            for block_index, block in enumerate(model.backbone.blocks):
+                gradient = block.attn.qkv.weight.grad
+                self.assertIsNotNone(gradient)
+                for projection, rows in (
+                    ("q", slice(0, 192)),
+                    ("k", slice(192, 384)),
+                ):
+                    with self.subTest(
+                        block=block_index, projection=projection
+                    ):
+                        selected = gradient[rows]
+                        self.assertTrue(torch.isfinite(selected).all())
+                        self.assertGreater(selected.abs().sum().item(), 0.0)
 
-        before_update = model.position()
-        with torch.no_grad():
-            model.position.freqs.add_(frequency_gradient, alpha=-0.01)
-            after_update = model.position()
-        self.assertIsNot(before_update, after_update)
-        self.assertFalse(torch.equal(before_update, after_update))
+            with torch.no_grad():
+                model.position.freqs[0, 0, 0].add_(0.125)
+            model.zero_grad(set_to_none=True)
+
+            second_logits = model(image, question_tokens, question_length)
+            second_loss = nn.functional.cross_entropy(
+                second_logits, torch.tensor((1,), dtype=torch.int64)
+            )
+            second_loss.backward()
+        finally:
+            handle.remove()
+
+        self.assertEqual(len(captured), 2)
+        self.assertIsNot(captured[0], captured[1])
+        self.assertFalse(torch.equal(captured[0], captured[1]))
+        second_frequency_gradient = model.position.freqs.grad
+        self.assertIsNotNone(second_frequency_gradient)
+        self.assertTrue(torch.isfinite(second_frequency_gradient).all())
+        self.assertGreater(second_frequency_gradient.abs().sum().item(), 0.0)
 
 
 class CLEVRQuestionAnswererArchitectureTests(unittest.TestCase):

@@ -25,7 +25,7 @@ class CLEVRMixedPosition(nn.Module):
             raise ValueError("seed must be non-negative")
 
         with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(seed)
+            torch.random.default_generator.manual_seed(seed)
             frequencies = torch.stack(
                 [
                     init_random_2d_freqs(
