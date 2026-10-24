@@ -1,0 +1,507 @@
+"""Synthetic CPU tests for the committed CLEVR computation seam."""
+
+import importlib
+import importlib.util
+import math
+import unittest
+from copy import deepcopy
+from unittest.mock import patch
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+
+from src.clevr_dataset import (
+    CLEVRSampleIdentity, collate_clevr_questions, collate_clevr_question_only,
+)
+from src.clevr_run_artifacts import CLEVRPredictionRecord
+from src.clevr_sampling import CLEVRIndexStream, CLEVRSamplingError
+
+
+def setUpModule():
+    global _old_threads
+    _old_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+
+
+def tearDownModule():
+    torch.set_num_threads(_old_threads)
+
+
+class TinyDataset:
+    def __init__(self, size=129, *, rgb=True, partition="train"):
+        self.size, self.rgb, self.partition = size, rgb, partition
+        self.accessed = []
+        self.identities = []
+        self.image = torch.full((3, 224, 224), 0.25)
+        self.fail_item = None
+        self.identity_override = None
+
+    def __len__(self):
+        return self.size
+
+    def sample_identity(self, index):
+        self.identities.append(index)
+        if self.identity_override is not None:
+            return self.identity_override(index)
+        return CLEVRSampleIdentity(
+            self.partition, "train" if self.partition != "base_test" else "val",
+            index, f"fake_{index}.png", 1000 + self.size - index, index,
+        )
+
+    def __getitem__(self, index):
+        if index == self.fail_item:
+            raise RuntimeError("item failure")
+        self.accessed.append(index)
+        middle = [3 + index % 5] * (1 + index % 2)
+        result = {
+            "question_tokens": torch.tensor([1, *middle, 2]),
+            "question_length": torch.tensor(2 + len(middle)),
+            "answer": torch.tensor(int(index % 5 == 0)),
+        }
+        if self.rgb:
+            result["image"] = self.image
+        return result
+
+
+class TinyAnswerer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor([[0.8, -0.6], [0.2, 0.4]]))
+        self.bias = nn.Parameter(torch.tensor([0.1, -0.1]))
+        self.patch = nn.Parameter(torch.tensor(0.3))
+        self.calls = []
+        self.output_grads = []
+        self.fail_call = None
+        self.output_transform = None
+        self.observe = None
+
+    def forward(self, image, tokens, lengths):
+        self.calls.append((image is None, len(tokens), torch.is_inference_mode_enabled(), self.training))
+        if self.observe is not None:
+            self.observe()
+        if len(self.calls) == self.fail_call:
+            raise RuntimeError("forward failure")
+        features = torch.stack((tokens[:, 1].float(), lengths.float()), dim=1)
+        logits = features @ self.weight + self.bias
+        if image is not None:
+            logits = logits + self.patch * image[:, 0, 0, 0, None] * logits.new_tensor([1., -1.])
+        if self.output_transform is not None:
+            logits = self.output_transform(logits)
+        if logits.requires_grad:
+            logits.register_hook(lambda grad: self.output_grads.append(grad.detach().clone()))
+        return logits
+
+
+class ObservedAdamW(AdamW):
+    def __init__(self, model, events):
+        self.events = events
+        self.step_lrs = []
+        self.patch_grads = []
+        self.model = model
+        super().__init__([
+            {"params": [model.weight, model.patch], "weight_decay": 0.1},
+            {"params": [model.bias], "weight_decay": 0.0},
+        ], lr=0.02)
+
+    def zero_grad(self, set_to_none=True):
+        self.events.append(("zero", set_to_none))
+        return super().zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        self.events.append("optimizer")
+        self.step_lrs.append(tuple(g["lr"] for g in self.param_groups))
+        self.patch_grads.append(None if self.model.patch.grad is None else self.model.patch.grad.clone())
+        return super().step(closure)
+
+
+class ObservedScheduler(LambdaLR):
+    def __init__(self, optimizer, events):
+        self.events = events
+        super().__init__(optimizer, lambda epoch: 1 / (epoch + 1))
+
+    def step(self, epoch=None):
+        self.events.append("scheduler")
+        return super().step(epoch)
+
+
+class RunnerCase(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(importlib.util.find_spec("src.clevr_runner"),
+                             "Task 3 computation engine is missing")
+        self.runner = importlib.import_module("src.clevr_runner")
+        self.events = []
+        self.dataset = TinyDataset()
+        self.model = TinyAnswerer()
+        self.optimizer = ObservedAdamW(self.model, self.events)
+        self.scheduler = ObservedScheduler(self.optimizer, self.events)
+        self.events.clear()
+        self.sampler = CLEVRIndexStream(dataset_size=129, run_seed=101)
+        self.groups = []
+
+    def collate(self, samples):
+        self.groups.append(len(samples))
+        return (collate_clevr_questions if self.dataset.rgb else collate_clevr_question_only)(samples)
+
+    def update(self, **overrides):
+        args = dict(model=self.model, optimizer=self.optimizer, scheduler=self.scheduler,
+                    sampler=self.sampler, dataset=self.dataset, collate_fn=self.collate,
+                    method="G" if self.dataset.rgb else "Q-only", device=torch.device("cpu"))
+        args.update(overrides)
+        return self.runner.run_clevr_update(**args)
+
+    def evaluate(self, **overrides):
+        args = dict(model=self.model, dataset=self.dataset, collate_fn=self.collate,
+                    method="G" if self.dataset.rgb else "Q-only", partition=self.dataset.partition,
+                    device=torch.device("cpu"))
+        args.update(overrides)
+        return self.runner.evaluate_clevr_model(**args)
+
+
+class UpdateTests(RunnerCase):
+    def test_exact_accumulation_order_loss_gradients_and_commit(self):
+        indices = self.sampler.preview(128)
+        initial_sampler = deepcopy(self.sampler.state_dict())
+        reference = TinyAnswerer()
+        reference.load_state_dict(self.model.state_dict())
+        ref_opt = ObservedAdamW(reference, [])
+        ref_scheduler = ObservedScheduler(ref_opt, [])
+        batch = collate_clevr_questions([self.dataset[i] for i in indices])
+        logits = reference(batch["image"], batch["question_tokens"], batch["question_length"])
+        individual = F.cross_entropy(logits, batch["answer"], reduction="none")
+        # Independent scalar binary CE, avoiding the runner's reduction logic.
+        scalar_losses = [math.log1p(math.exp(float(z[1] - z[0]))) - int(y) * float(z[1] - z[0])
+                         for z, y in zip(logits.detach(), batch["answer"])]
+        individual.mean().backward()
+        norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), 1.0, error_if_nonfinite=True)
+        ref_opt.step()
+        ref_scheduler.step()
+        ref_opt.zero_grad(set_to_none=True)
+        self.dataset.accessed.clear()
+        # A dirty prior gradient must be cleared before this call's backward.
+        self.model.bias.grad = torch.ones_like(self.model.bias) * 123
+        self.model.observe = lambda: self.assertEqual(self.sampler.state_dict(), initial_sampler)
+        original_clip = torch.nn.utils.clip_grad_norm_
+        clip_calls = []
+        def clip(parameters, max_norm, **kwargs):
+            self.events.append("clip")
+            clip_calls.append((max_norm, kwargs))
+            return original_clip(parameters, max_norm, **kwargs)
+        original_commit = self.sampler.commit
+        def commit(supplied):
+            self.events.append("commit")
+            self.assertEqual(tuple(supplied), indices)
+            self.assertTrue(all(p.grad is None for p in self.model.parameters()))
+            self.assertEqual(self.sampler.state_dict(), initial_sampler)
+            return original_commit(supplied)
+        original_preview = self.sampler.preview
+        with patch.object(self.sampler, "preview", wraps=original_preview) as preview, \
+                patch.object(self.sampler, "commit", side_effect=commit), \
+                patch("torch.nn.utils.clip_grad_norm_", side_effect=clip):
+            result = self.update()
+        # commit's own validation also previews the exact stream prefix.
+        self.assertEqual(preview.call_args_list[0].args, (128,))
+        self.assertTrue(all(call.args == (128,) for call in preview.call_args_list))
+        self.assertEqual(self.dataset.accessed, list(indices))
+        self.assertEqual(self.groups, [16] * 8)
+        self.assertEqual(self.events, [("zero", True), "clip", "optimizer", "scheduler", ("zero", True), "commit"])
+        self.assertEqual(clip_calls, [(1.0, {"error_if_nonfinite": True})])
+        self.assertEqual(self.optimizer.step_lrs, [(0.02, 0.02)])
+        self.assertEqual(result.learning_rate, 0.02)
+        self.assertEqual([g["lr"] for g in self.optimizer.param_groups], [0.01, 0.01])
+        self.assertEqual(result.dataset_indices, indices)
+        self.assertEqual(result.question_indices, tuple(1129 - i for i in indices))
+        self.assertAlmostEqual(result.loss_sum, sum(scalar_losses), places=4)
+        self.assertAlmostEqual(result.loss_mean, sum(scalar_losses) / 128, places=6)
+        self.assertAlmostEqual(result.gradient_norm, norm.item(), places=5)
+        self.assertGreater(result.gradient_norm, 1.0)
+        for name, value in self.model.state_dict().items():
+            torch.testing.assert_close(value, reference.state_dict()[name])
+        expected_grad = logits.detach().softmax(-1)
+        expected_grad[torch.arange(128), batch["answer"]] -= 1
+        torch.testing.assert_close(torch.cat(self.model.output_grads), expected_grad / 128)
+        self.assertEqual(self.sampler.state_dict()["cursor"], 128)
+        self.assertTrue(all(p.grad is None for p in self.model.parameters()))
+        self.assertTrue(all(call == (False, 16, False, True) for call in self.model.calls))
+
+    def test_qonly_unused_patch_has_no_gradient_or_weight_decay_update(self):
+        self.dataset.rgb = False
+        initial_patch = self.model.patch.detach().clone()
+        self.model.patch.grad = torch.ones_like(self.model.patch)
+        self.update()
+        self.assertEqual(self.optimizer.patch_grads, [None])
+        self.assertIsNone(self.model.patch.grad)
+        self.assertNotIn(self.model.patch, self.optimizer.state)
+        self.assertTrue(torch.equal(initial_patch, self.model.patch))
+        self.assertTrue(all(call[0] for call in self.model.calls))
+
+    def test_all_rgb_methods_share_the_call_contract(self):
+        for method in ("G", "B", "M10"):
+            with self.subTest(method=method):
+                self.update(method=method)
+        self.assertEqual(len(self.model.calls), 24)
+        self.assertTrue(all(not call[0] for call in self.model.calls))
+
+    def test_failure_boundaries_never_return_success_or_commit_early(self):
+        for boundary in ("forward1", "forward8", "backward", "clip", "optimizer", "scheduler", "commit"):
+            with self.subTest(boundary=boundary):
+                self.setUp()
+                state = deepcopy(self.sampler.state_dict())
+                initial_weight = self.model.weight.detach().clone()
+                if boundary.startswith("forward"):
+                    self.model.fail_call = int(boundary[-1])
+                if boundary == "backward":
+                    def fail_grad(grad):
+                        raise RuntimeError("backward failure")
+                    self.model.weight.register_hook(fail_grad)
+                from contextlib import ExitStack
+                with ExitStack() as stack:
+                    commit = stack.enter_context(patch.object(self.sampler, "commit", wraps=self.sampler.commit))
+                    if boundary == "clip":
+                        stack.enter_context(patch("torch.nn.utils.clip_grad_norm_", side_effect=RuntimeError(boundary)))
+                    elif boundary in ("optimizer", "scheduler"):
+                        owner = self.optimizer if boundary == "optimizer" else self.scheduler
+                        original = owner.step
+                        def after_effect(*args, **kwargs):
+                            original(*args, **kwargs)
+                            raise RuntimeError(boundary)
+                        stack.enter_context(patch.object(owner, "step", side_effect=after_effect))
+                    elif boundary == "commit":
+                        commit.side_effect = RuntimeError(boundary)
+                    with self.assertRaisesRegex(RuntimeError, "failure|clip|optimizer|scheduler|commit"):
+                        self.update()
+                    self.assertEqual(commit.call_count, int(boundary == "commit"))
+                self.assertEqual(self.sampler.state_dict(), state)
+                if boundary in ("optimizer", "scheduler", "commit"):
+                    self.assertFalse(torch.equal(initial_weight, self.model.weight))
+                else:
+                    self.assertTrue(torch.equal(initial_weight, self.model.weight))
+                self.assertEqual(self.events[0], ("zero", True))
+
+    def test_commit_stream_mismatch_is_not_complete(self):
+        def disturb():
+            if len(self.model.calls) == 8:
+                self.sampler.commit(self.sampler.preview(1))
+        self.model.observe = disturb
+        with self.assertRaises(CLEVRSamplingError):
+            self.update()
+        self.assertEqual(self.sampler.state_dict()["cursor"], 1)
+
+    def test_post_effect_commit_failure_is_not_success_or_rollback(self):
+        original = self.sampler.commit
+        def fail_after(indices):
+            original(indices)
+            raise RuntimeError("post commit")
+        with patch.object(self.sampler, "commit", side_effect=fail_after):
+            with self.assertRaisesRegex(RuntimeError, "post commit"):
+                self.update()
+        self.assertEqual(self.sampler.state_dict()["cursor"], 128)
+
+    def test_bad_method_lr_groups_and_dataset_size_reject_before_forward(self):
+        cases = ("method", "different_lr", "nan_lr", "inf_lr", "one_group", "size")
+        for case in cases:
+            with self.subTest(case=case):
+                self.setUp()
+                args = {}
+                if case == "method":
+                    args["method"] = "C"
+                elif case == "different_lr":
+                    self.optimizer.param_groups[1]["lr"] = 0.03
+                elif case in ("nan_lr", "inf_lr"):
+                    for group in self.optimizer.param_groups:
+                        group["lr"] = float(case[:3])
+                elif case == "one_group":
+                    self.optimizer.param_groups.pop()
+                else:
+                    self.dataset.size = 130
+                with self.assertRaises(self.runner.CLEVRRunnerError):
+                    self.update(**args)
+                self.assertEqual(self.events, [("zero", True)])
+                self.assertFalse(self.model.calls)
+                self.assertEqual(self.sampler.state_dict()["cursor"], 0)
+
+    def test_malformed_collated_batches_are_rejected(self):
+        mutations = {
+            "extra": lambda b: b.update(question_index=torch.zeros(16)),
+            "missing": lambda b: b.pop("question_length"),
+            "rgb_without_image": lambda b: b.pop("image"),
+            "label_rank": lambda b: b.update(answer=b["answer"][:, None]),
+            "label_dtype": lambda b: b.update(answer=b["answer"].float()),
+            "label_range": lambda b: b.update(answer=torch.full((16,), 2)),
+            "tokens_rank": lambda b: b.update(question_tokens=b["question_tokens"][:, None]),
+            "tokens_dtype": lambda b: b.update(question_tokens=b["question_tokens"].float()),
+            "length_shape": lambda b: b.update(question_length=b["question_length"][:1]),
+            "length_dtype": lambda b: b.update(question_length=b["question_length"].float()),
+            "length_range": lambda b: b.update(question_length=torch.zeros(16, dtype=torch.long)),
+            "image_shape": lambda b: b.update(image=b["image"][:, :1]),
+            "image_nan": lambda b: b.update(image=b["image"] * float("nan")),
+            "value_type": lambda b: b.update(answer=[0] * 16),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                def corrupt(samples):
+                    batch = self.collate(samples)
+                    mutate(batch)
+                    return batch
+                with self.assertRaises(self.runner.CLEVRRunnerError):
+                    self.update(collate_fn=corrupt)
+                self.assertEqual(self.sampler.state_dict()["cursor"], 0)
+        self.dataset.rgb = False
+        with self.assertRaises(self.runner.CLEVRRunnerError):
+            self.update(collate_fn=lambda s: {**self.collate(s), "image": self.dataset.image})
+
+    def test_bad_logits_and_nonfinite_loss_or_gradients_reject(self):
+        transforms = {
+            "shape": lambda z: z[:, :1],
+            "nan": lambda z: z * float("nan"),
+            "inf": lambda z: z * float("inf"),
+            # Finite FP32 inputs with an overflowing loss.
+            "loss": lambda z: z * 0 + z.new_tensor([3e38, -3e38]),
+        }
+        for name, transform in transforms.items():
+            with self.subTest(name=name):
+                self.model.output_transform = transform
+                with self.assertRaises(self.runner.CLEVRRunnerError):
+                    self.update()
+                self.assertEqual(self.sampler.state_dict()["cursor"], 0)
+        self.model.output_transform = None
+        handle = self.model.weight.register_hook(lambda g: g * float("nan"))
+        try:
+            with self.assertRaises(self.runner.CLEVRRunnerError):
+                self.update()
+        finally:
+            handle.remove()
+        self.assertFalse(self.optimizer.state)
+        self.assertEqual(self.sampler.state_dict()["cursor"], 0)
+
+    def test_invalid_identity_rejects_before_optimizer_or_commit(self):
+        for value in (-1, True, 1.0):
+            with self.subTest(value=value):
+                self.dataset.identity_override = lambda i: CLEVRSampleIdentity("train", "train", i, "x", value, i)
+                with self.assertRaises(self.runner.CLEVRRunnerError):
+                    self.update()
+                self.assertFalse(self.optimizer.state)
+                self.assertEqual(self.sampler.state_dict()["cursor"], 0)
+
+
+class EvaluationTests(RunnerCase):
+    def setUp(self):
+        super().setUp()
+        self.dataset = TinyDataset(19, partition="dev")
+
+    def test_ascending_uneven_sum_mean_accuracy_and_sorted_exact_rows(self):
+        # First 18 have tied logits; last has a high-confidence wrong prediction.
+        with torch.no_grad():
+            self.model.weight.zero_()
+            self.model.bias.zero_()
+            self.model.patch.zero_()
+        def logits(z):
+            if len(self.model.calls) == 2:
+                z = z.clone()
+                z[-1] = z.new_tensor([0., 4.])
+            return z
+        self.model.output_transform = logits
+        result = self.evaluate()
+        self.assertEqual(self.dataset.accessed, list(range(19)))
+        self.assertEqual(self.dataset.identities, list(range(19)))
+        self.assertEqual(self.groups, [16, 3])
+        self.assertEqual(self.model.calls, [(False, 16, True, False), (False, 3, True, False)])
+        self.assertTrue(self.model.training)
+        self.assertEqual(result.partition, "dev")
+        self.assertEqual(result.total_questions, 19)
+        # Four true labels at 0,5,10,15 plus one wrong last prediction.
+        self.assertEqual(result.correct, 14)
+        self.assertEqual(result.accuracy, 14 / 19)
+        total_loss = 18 * math.log(2) + math.log1p(math.exp(4))
+        self.assertAlmostEqual(result.loss_sum, total_loss, places=5)
+        self.assertAlmostEqual(result.cross_entropy, total_loss / 19, places=6)
+        expected_rows = tuple(sorted((CLEVRPredictionRecord(
+            1019 - i, int(i % 5 == 0), (0., 4. if i == 18 else 0.))
+            for i in range(19)), key=lambda row: row.question_index))
+        self.assertEqual(result.rows, expected_rows)
+        self.assertTrue(all(type(v) is float and math.isfinite(v) for row in result.rows for v in row.logits))
+        self.assertTrue(all(p.grad is None for p in self.model.parameters()))
+
+    def test_qonly_passes_none_and_preserves_eval_mode(self):
+        self.dataset.rgb = False
+        self.model.eval()
+        result = self.evaluate()
+        self.assertFalse(self.model.training)
+        self.assertEqual(len(result.rows), 19)
+        self.assertTrue(all(call[0] and call[2] and not call[3] for call in self.model.calls))
+
+    def test_restores_mode_on_item_collation_forward_and_identity_failure(self):
+        for training in (True, False):
+            for boundary in ("item", "collate", "forward", "identity"):
+                with self.subTest(training=training, boundary=boundary):
+                    self.setUp()
+                    self.model.train(training)
+                    args = {}
+                    if boundary == "item":
+                        self.dataset.fail_item = 16
+                    elif boundary == "collate":
+                        def fail_collate(samples):
+                            raise RuntimeError("collate failure")
+                        args["collate_fn"] = fail_collate
+                    elif boundary == "forward":
+                        self.model.fail_call = 2
+                    else:
+                        def fail_identity(i):
+                            raise RuntimeError("identity failure")
+                        self.dataset.identity_override = fail_identity
+                    with self.assertRaisesRegex(RuntimeError, "failure"):
+                        self.evaluate(**args)
+                    self.assertEqual(self.model.training, training)
+
+    def test_empty_duplicate_partition_and_invalid_ids_reject(self):
+        for case in ("empty", "duplicate", "partition", "negative", "bool", "confirmation"):
+            with self.subTest(case=case):
+                self.setUp()
+                args = {}
+                if case == "empty":
+                    self.dataset.size = 0
+                elif case == "confirmation":
+                    args["partition"] = "confirmation"
+                else:
+                    def identity(i):
+                        return CLEVRSampleIdentity(
+                            "train" if case == "partition" else "dev", "train", i, "x",
+                            {"duplicate": 7, "negative": -1, "bool": True}.get(case, i), i)
+                    self.dataset.identity_override = identity
+                with self.assertRaises(self.runner.CLEVRRunnerError):
+                    self.evaluate(**args)
+                self.assertTrue(self.model.training)
+
+    def test_bad_contract_and_nonfinite_outputs_do_not_return_partial_result(self):
+        for case in ("method", "shape", "nan", "loss", "labels", "keys", "qonly_image"):
+            with self.subTest(case=case):
+                self.setUp()
+                args = {}
+                if case == "method":
+                    args["method"] = "bad"
+                elif case in ("shape", "nan", "loss"):
+                    self.model.output_transform = {
+                        "shape": lambda z: z[:, :1],
+                        "nan": lambda z: z * float("nan"),
+                        "loss": lambda z: z * 0 + z.new_tensor([3e38, -3e38]),
+                    }[case]
+                else:
+                    if case == "qonly_image":
+                        args["method"] = "Q-only"
+                    def corrupt(samples):
+                        b = self.collate(samples)
+                        if case == "labels":
+                            b["answer"] = torch.full((len(samples),), 2)
+                        elif case == "keys":
+                            b["question_index"] = torch.zeros(len(samples))
+                        return b
+                    args["collate_fn"] = corrupt
+                with self.assertRaises(self.runner.CLEVRRunnerError):
+                    self.evaluate(**args)
+                self.assertTrue(self.model.training)
+
+
+if __name__ == "__main__":
+    unittest.main()
