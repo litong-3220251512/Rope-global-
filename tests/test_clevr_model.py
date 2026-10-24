@@ -1,5 +1,6 @@
 """Data-free tests for the frozen PUB-R1.1 CLEVR model contract."""
 
+from inspect import signature
 import unittest
 
 import torch
@@ -7,6 +8,7 @@ from torch import nn
 
 from src.clevr_model import CLEVRQuestionAnswerer, CLEVRQuestionEncoder
 from src.local_rope import build_axial_cis
+from src.segmentation import differentiable_attention
 
 
 def _valid_answerer_inputs(batch_size=1):
@@ -202,6 +204,18 @@ class CLEVRQuestionAnswererArchitectureTests(unittest.TestCase):
         self.assertIsNone(model.backbone.pos_embed)
         self.assertFalse(model.backbone.rope_mixed)
         self.assertEqual(model.backbone.dropout_rate, 0.0)
+        for attribute in (
+            "relative_position_bias_table",
+            "relative_position_index",
+            "relative_position_bias",
+            "rel_pos_bias",
+            "attn_mask",
+            "local_attn_mask",
+            "local_mask",
+            "window_size",
+        ):
+            with self.subTest(module="backbone", forbidden_attribute=attribute):
+                self.assertFalse(hasattr(model.backbone, attribute))
         for block in model.backbone.blocks:
             with self.subTest(block=id(block)):
                 self.assertEqual(block.norm1.normalized_shape, (192,))
@@ -213,6 +227,34 @@ class CLEVRQuestionAnswererArchitectureTests(unittest.TestCase):
                 self.assertEqual(block.attn.qkv.in_features, 192)
                 self.assertEqual(block.attn.qkv.out_features, 576)
                 self.assertIsNotNone(block.attn.qkv.bias)
+                self.assertIs(
+                    block.attn.forward.__func__, differentiable_attention
+                )
+                self.assertEqual(
+                    tuple(signature(block.attn.forward).parameters),
+                    ("x", "freqs_cis"),
+                )
+                self.assertEqual(
+                    tuple(name for name, _ in block.attn.named_children()),
+                    ("qkv", "attn_drop", "proj", "proj_drop"),
+                )
+                self.assertEqual(
+                    tuple(block.attn.named_parameters(recurse=False)), ()
+                )
+                self.assertEqual(tuple(block.attn.named_buffers(recurse=False)), ())
+                for attribute in (
+                    "q_norm",
+                    "k_norm",
+                    "relative_position_bias_table",
+                    "relative_position_index",
+                    "relative_position_bias",
+                    "rel_pos_bias",
+                    "attn_mask",
+                    "local_attn_mask",
+                    "local_mask",
+                    "window_size",
+                ):
+                    self.assertFalse(hasattr(block.attn, attribute))
                 self.assertEqual(block.attn.attn_drop.p, 0.0)
                 self.assertEqual(block.attn.proj_drop.p, 0.0)
                 self.assertEqual(block.mlp.fc1.in_features, 192)
@@ -430,9 +472,16 @@ class CLEVRQuestionAnswererPositionTests(unittest.TestCase):
         for mode in ("C", "unknown"):
             with self.subTest(mode=mode):
                 torch.manual_seed(seed)
-                with self.assertRaises(ValueError):
+                error = None
+                try:
                     CLEVRQuestionAnswerer(vocab_size=8, mode=mode)
-                self.assertTrue(torch.equal(torch.rand(4), expected_next_random))
+                except Exception as caught:
+                    error = caught
+                next_random = torch.rand(4)
+                with self.subTest(contract="rejected before allocation"):
+                    self.assertTrue(torch.equal(next_random, expected_next_random))
+                with self.subTest(contract="raises ValueError"):
+                    self.assertIs(type(error), ValueError)
 
 
 if __name__ == "__main__":
