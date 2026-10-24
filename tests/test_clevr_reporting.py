@@ -1391,6 +1391,85 @@ class StatisticsBundleTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     replace(bundle, **changes)
 
+    def test_direct_construction_rejects_trailing_and_interleaved_wrong_types(self) -> None:
+        # Mutation caught: filtering malformed members before formal-grid comparison.
+        bundle = self._build()
+        report = bundle.report
+        malformed_prediction_tuples = (
+            report.predictions + (object(),),
+            report.predictions[:7] + (object(),) + report.predictions[7:],
+        )
+        for predictions in malformed_prediction_tuples:
+            with self.subTest(record="report", position=len(predictions)):
+                with self.assertRaises(ValueError):
+                    replace(report, predictions=predictions)
+
+        malformed_run_tuples = (
+            bundle.runs + (object(),),
+            bundle.runs[:7] + (object(),) + bundle.runs[7:],
+        )
+        for runs in malformed_run_tuples:
+            with self.subTest(record="bundle", position=len(runs)):
+                with self.assertRaises(ValueError):
+                    replace(bundle, runs=runs)
+
+    def test_report_and_bundle_reject_cross_component_count_mismatches(self) -> None:
+        # Mutation caught: independently valid components carrying conflicting counts.
+        bundle = self._build()
+        report = bundle.report
+
+        wrong_row_count = replace(
+            report.predictions[0],
+            row_count=report.predictions[0].row_count + 1,
+        )
+        with self.assertRaises(ValueError):
+            replace(
+                report,
+                predictions=(wrong_row_count,) + report.predictions[1:],
+            )
+
+        with self.assertRaises(ValueError):
+            replace(
+                report,
+                manifest_partition_counts=replace(
+                    report.manifest_partition_counts,
+                    base_test=report.manifest_partition_counts.base_test + 1,
+                ),
+            )
+
+        longer_first_run = replace(
+            bundle.runs[0],
+            rows=bundle.runs[0].rows + (bundle.runs[0].rows[0],),
+        )
+        with self.assertRaises(ValueError):
+            replace(bundle, runs=(longer_first_run,) + bundle.runs[1:])
+
+    def test_bundle_rejects_cross_spliced_report_from_different_valid_logits(self) -> None:
+        # Mutation caught: comparing only formal identities across bundle components.
+        first = self._build()
+        for source in self.sources:
+            rows = [
+                json.loads(line)
+                for line in source.path.read_text(encoding="utf-8").splitlines()
+            ]
+            for row in rows:
+                row["logits"] = [0.0, 2.0]
+            source.path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+        second = self._build()
+        self.assertEqual(first.targets, second.targets)
+        self.assertNotEqual(first.runs, second.runs)
+        self.assertNotEqual(first.report.statistics, second.report.statistics)
+
+        with self.assertRaises(ValueError):
+            StatisticsBundle(
+                report=first.report,
+                targets=second.targets,
+                runs=second.runs,
+            )
+
     def test_reordering_all_three_inputs_preserves_bundle_and_payload(self) -> None:
         # Mutation caught: depending on manifest, source argument, or row order.
         first = self._build()

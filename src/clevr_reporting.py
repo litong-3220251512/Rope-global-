@@ -225,11 +225,12 @@ class StatisticsReport:
         )
         if (
             not isinstance(self.predictions, tuple)
-            or tuple(
-                (item.method, item.seed)
+            or len(self.predictions) != len(expected_keys)
+            or any(
+                not isinstance(item, PredictionEvidence)
                 for item in self.predictions
-                if isinstance(item, PredictionEvidence)
             )
+            or tuple((item.method, item.seed) for item in self.predictions)
             != expected_keys
         ):
             raise ValueError(
@@ -239,6 +240,22 @@ class StatisticsReport:
             raise ValueError("statistics must be CLEVRStatistics")
         if not isinstance(self.environment, EnvironmentEvidence):
             raise ValueError("environment must be EnvironmentEvidence")
+        base_test_count = self.manifest_partition_counts.base_test
+        if self.statistics.train_majority.question_count != base_test_count:
+            raise ValueError(
+                "manifest base_test count does not match train-majority statistics"
+            )
+        for evidence, run_metrics in zip(
+            self.predictions, self.statistics.run_metrics, strict=True
+        ):
+            if run_metrics.metrics.question_count != base_test_count:
+                raise ValueError(
+                    "manifest base_test count does not match run statistics"
+                )
+            if evidence.row_count != base_test_count:
+                raise ValueError(
+                    "prediction evidence row_count does not match base_test count"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,11 +290,9 @@ class StatisticsBundle:
         )
         if (
             not isinstance(self.runs, tuple)
-            or tuple(
-                (run.method, run.seed)
-                for run in self.runs
-                if isinstance(run, RunPredictions)
-            )
+            or len(self.runs) != len(expected_keys)
+            or any(not isinstance(run, RunPredictions) for run in self.runs)
+            or tuple((run.method, run.seed) for run in self.runs)
             != expected_keys
         ):
             raise ValueError("runs must contain the ordered formal run grid")
@@ -286,6 +301,36 @@ class StatisticsBundle:
         )
         if evidence_keys != expected_keys:
             raise ValueError("report prediction evidence does not match runs")
+        base_test_count = sum(
+            target.partition == "base_test" for target in self.targets
+        )
+        if self.report.manifest_partition_counts.base_test != base_test_count:
+            raise ValueError(
+                "report base_test count does not match bundle targets"
+            )
+        for run, evidence in zip(
+            self.runs, self.report.predictions, strict=True
+        ):
+            if len(run.rows) != base_test_count:
+                raise ValueError(
+                    "run row count does not match bundle base_test targets"
+                )
+            if evidence.row_count != len(run.rows):
+                raise ValueError(
+                    "prediction evidence row_count does not match run rows"
+                )
+        try:
+            recomputed_statistics = compute_clevr_statistics(
+                self.targets, self.runs
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"bundle targets and runs are inconsistent: {exc}"
+            ) from exc
+        if recomputed_statistics != self.report.statistics:
+            raise ValueError(
+                "report statistics do not match bundle targets and runs"
+            )
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
