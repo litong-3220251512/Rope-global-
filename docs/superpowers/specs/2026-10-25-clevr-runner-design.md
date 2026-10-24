@@ -264,7 +264,8 @@ bitwise identity nor changes the frozen sampler's independent `10000+s` stream
 or M10's `20000+s` stream.
 
 Unit tests exercise CPU seams through injected tiny models/datasets and mocks;
-they are not experiment runs and do not weaken the production CUDA check.
+they run with `CUDA_VISIBLE_DEVICES=""`, are not experiment runs, and do not
+weaken the production CUDA check.
 
 ## 10. Mature-library and license review
 

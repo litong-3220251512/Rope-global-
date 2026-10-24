@@ -25,7 +25,7 @@
 - No downloads, data/weight discovery, user-data access, GPU work, engineering smoke, pilot, formal training, or evaluation may be executed while implementing this plan.
 - Do not add dependencies, hash checks, model parameters, thresholds, label changes, alternate losses, or statistics changes.
 - Follow strict TDD: every production behavior gets a focused failing test observed before implementation, then focused green and the allowed CPU regression suite. Exclude `tests.test_cifar_data` and `tests.test_cifar_training` because project policy forbids their legacy hash logic.
-- Use `/workspace/smbu_lt/my_envs/flightgpt/bin/python3.11` and `PYTHONDONTWRITEBYTECODE=1` for all tests. Do not create bytecode artifacts.
+- Use `/workspace/smbu_lt/my_envs/flightgpt/bin/python3.11`, `PYTHONDONTWRITEBYTECODE=1`, and `CUDA_VISIBLE_DEVICES=""` for all tests. Do not create bytecode artifacts or expose a GPU to the test process.
 
 ## Review Focus
 
@@ -57,7 +57,7 @@ Add tests proving both datasets expose equal `vocab_size`, return equal identiti
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 /workspace/smbu_lt/my_envs/flightgpt/bin/python3.11 -m unittest -v tests.test_clevr_dataset
+CUDA_VISIBLE_DEVICES="" PYTHONDONTWRITEBYTECODE=1 /workspace/smbu_lt/my_envs/flightgpt/bin/python3.11 -m unittest -v tests.test_clevr_dataset
 ```
 
 Expected: FAIL because `CLEVRSampleIdentity`, `vocab_size`, and `sample_identity` do not exist.
@@ -325,7 +325,7 @@ Use `argparse`, a `main(argv: Sequence[str] | None = None) -> int`, and the stan
 Run:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 /workspace/smbu_lt/my_envs/flightgpt/bin/python3.11 -m unittest -v tests.test_clevr_dataset tests.test_clevr_run_artifacts tests.test_clevr_runner tests.test_run_clevr_experiment
+CUDA_VISIBLE_DEVICES="" PYTHONDONTWRITEBYTECODE=1 /workspace/smbu_lt/my_envs/flightgpt/bin/python3.11 -m unittest -v tests.test_clevr_dataset tests.test_clevr_run_artifacts tests.test_clevr_runner tests.test_run_clevr_experiment
 ```
 
 Then run the entire allowed CPU suite, `python -m compileall -q` over the changed Python files with bytecode redirected to a temporary directory or disabled, and `git diff --check <runner-base>...HEAD`. Expected: all tests pass; only documented timm warnings and the expected CUDA skip remain; no user data/GPU/training/evaluation occurs.
