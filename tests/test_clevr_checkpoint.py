@@ -649,6 +649,63 @@ class CheckpointPublicationTests(unittest.TestCase):
             return True
         return False
 
+    def test_one_shot_first_fstat_interrupt_recovers_identity_and_cleans_staging(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "first-fstat-interrupt.pt"
+            descriptors: list[int] = []
+            staging_paths: list[str] = []
+            primary = KeyboardInterrupt("first staging identity inspection")
+            real_mkstemp = tempfile.mkstemp
+            real_fstat = os.fstat
+            fstat_attempts = 0
+
+            def recording_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+                descriptor, staging_name = real_mkstemp(*args, **kwargs)
+                descriptors.append(descriptor)
+                staging_paths.append(staging_name)
+                return descriptor, staging_name
+
+            def interrupt_first_fstat(descriptor: int) -> os.stat_result:
+                nonlocal fstat_attempts
+                fstat_attempts += 1
+                if fstat_attempts == 1:
+                    raise primary
+                return real_fstat(descriptor)
+
+            observed: BaseException | None = None
+            try:
+                with (
+                    mock.patch.object(
+                        checkpoint_module.tempfile,
+                        "mkstemp",
+                        side_effect=recording_mkstemp,
+                    ),
+                    mock.patch.object(
+                        checkpoint_module.os,
+                        "fstat",
+                        side_effect=interrupt_first_fstat,
+                    ),
+                ):
+                    try:
+                        self.save(target)
+                    except BaseException as error:
+                        observed = error
+
+                descriptor_closed = self.descriptor_is_closed(descriptors[0])
+                staging_exists = os.path.lexists(staging_paths[0])
+            finally:
+                if descriptors and not self.descriptor_is_closed(descriptors[0]):
+                    os.close(descriptors[0])
+                if staging_paths and os.path.lexists(staging_paths[0]):
+                    os.unlink(staging_paths[0])
+
+            self.assertIs(observed, primary)
+            self.assertTrue(descriptor_closed)
+            self.assertFalse(staging_exists)
+            self.assertFalse(target.exists())
+
     def test_first_post_mkstemp_interrupt_closes_descriptor_and_removes_staging(
         self,
     ) -> None:

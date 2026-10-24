@@ -532,6 +532,13 @@ def _publish_new_file(
     except BaseException as primary:
         cleanup_failures: list[tuple[str, BaseException]] = []
 
+        if staging_identity is None and descriptor is not None:
+            try:
+                recovered_stat = os.fstat(descriptor)
+                staging_identity = (recovered_stat.st_dev, recovered_stat.st_ino)
+            except BaseException as cleanup_error:
+                cleanup_failures.append(("staging identity recovery", cleanup_error))
+
         if output is not None and not bool(getattr(output, "closed", False)):
             try:
                 output.close()
