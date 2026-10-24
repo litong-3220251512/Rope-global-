@@ -1307,7 +1307,7 @@ class CheckpointLoadTests(unittest.TestCase):
         finally:
             self.assertFalse(marker.exists(), "unrestricted reducer executed")
 
-    def test_rejects_every_missing_and_extra_nested_mapping_key(self):
+    def test_rejects_missing_and_extra_required_nested_mapping_keys(self):
         def mappings(value, path=()):
             if isinstance(value, dict):
                 yield path, value
@@ -1324,6 +1324,10 @@ class CheckpointLoadTests(unittest.TestCase):
 
         for path, mapping in list(mappings(self.payload)):
             for key in mapping:
+                if path == ("optimizer_state", "state"):
+                    # Parameter IDs are optional lazy state entries; each present
+                    # entry still requires all AdamW fields checked below.
+                    continue
                 with self.subTest(path=path, missing=key):
                     malformed = copy.deepcopy(self.payload)
                     del at_path(malformed, path)[key]
@@ -1744,6 +1748,43 @@ class CheckpointLoadTests(unittest.TestCase):
         self.assertEqual(random.gauss(0, 1), expected["python"][2])
         self.assertEqual(np.random.standard_normal(), expected["numpy"][4])
 
+
+    def assert_nonzero_optimizer_subset_restore(self, saved_ids, target_ids):
+        f = self.fixture
+        full_state = _clone_state(f.optimizer.state_dict())
+        self.assertEqual(set(full_state["state"]), {0, 1})
+        saved_state = _clone_state(full_state)
+        saved_state["state"] = {key: saved_state["state"][key] for key in saved_ids}
+        f.optimizer.load_state_dict(saved_state)
+        expected = self.live_state()
+        expected_next = self.next_observations()
+        path = Path(self.directory.name) / "nonzero-subset.pt"
+        metadata = save_clevr_checkpoint(
+            path, method="G", run_seed=101, completed_updates=1,
+            model=f.model, optimizer=f.optimizer, scheduler=f.scheduler,
+            sampler=f.sampler, cuda_devices=(),
+        )
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        self.assertEqual(payload["completed_updates"], 1)
+        self.assertEqual(set(payload["optimizer_state"]["state"]), set(saved_ids))
+
+        target_state = _clone_state(full_state)
+        target_state["state"] = {key: target_state["state"][key] for key in target_ids}
+        f.optimizer.load_state_dict(target_state)
+        self.perturb()
+        self.assertEqual(set(f.optimizer.state_dict()["state"]), set(target_ids))
+        with mock.patch.object(checkpoint_module.torch, "cuda", new=_ForbiddenCUDA()):
+            self.assertEqual(self.load(path), metadata)
+        self.assertEqual(set(f.optimizer.state_dict()["state"]), set(saved_ids))
+        self.assert_state_equal(f.optimizer.state_dict(), payload["optimizer_state"])
+        self.assert_live_equal(expected)
+        self.assert_observations_equal(expected_next)
+
+    def test_restores_nonzero_partial_optimizer_state_over_fully_materialized_target(self):
+        self.assert_nonzero_optimizer_subset_restore(saved_ids=(0,), target_ids=(0, 1))
+
+    def test_restores_nonzero_full_optimizer_state_over_partially_materialized_target(self):
+        self.assert_nonzero_optimizer_subset_restore(saved_ids=(0, 1), target_ids=(0,))
 
     def test_restores_zero_update_checkpoint_over_initialized_live_optimizer(self):
         f = self.fixture

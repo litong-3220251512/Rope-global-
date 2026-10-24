@@ -347,14 +347,11 @@ def _validate_load_optimizer(
             if group["amsgrad"]:
                 template["max_exp_avg_sq"] = torch.empty_like(parameter, device="cpu")
             templates[identifier] = template
-    # At k=0 AdamW has not materialized any per-parameter state. At later
-    # boundaries require the same parameter coverage as an initialized target;
-    # a fresh target accepts the checkpoint's initialized parameter subset.
+    # AdamW materializes state lazily. Validate the saved subset against the
+    # named parameter mapping, independently of the live optimizer's subset.
     states = saved["state"]
     if type(states) is not dict or not set(states).issubset(templates):
         raise CLEVRCheckpointError("optimizer state parameter identifiers disagree")
-    if payload["completed_updates"] != 0 and live["state"] and set(states) != set(live["state"]):
-        raise CLEVRCheckpointError("optimizer state parameter coverage disagrees")
     for identifier, state in states.items():
         _validate_state_schema(state, templates[identifier], f"optimizer state {identifier}")
     return saved["param_groups"]
