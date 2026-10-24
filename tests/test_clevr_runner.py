@@ -2,6 +2,7 @@
 
 import importlib
 import importlib.util
+import json
 import math
 from collections import OrderedDict
 from contextlib import ExitStack
@@ -10,7 +11,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from copy import deepcopy
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 from torch import nn
@@ -21,7 +22,9 @@ from torch.optim.lr_scheduler import LambdaLR
 from src.clevr_dataset import (
     CLEVRSampleIdentity, collate_clevr_questions, collate_clevr_question_only,
 )
-from src.clevr_run_artifacts import CLEVRPredictionRecord
+from src.clevr_run_artifacts import (
+    CLEVRPredictionRecord, CLEVRRunArtifactError, CLEVRRunArtifacts,
+)
 from src.clevr_sampling import CLEVRIndexStream, CLEVRSamplingError
 
 
@@ -543,6 +546,13 @@ class ProductionPreflightTests(unittest.TestCase):
         self.data = self.root / "data"
         self.audit.mkdir()
         self.data.mkdir()
+        self.audit_contents = {
+            "selected_questions.jsonl": '{"question_index":1}\n',
+            "vocabulary.json": '{"token_to_index":{"x":4}}\n',
+            "audit_report.json": '{"protocol_version":"PUB-R1.1"}\n',
+        }
+        for name, content in self.audit_contents.items():
+            (self.audit / name).write_text(content, encoding="utf-8")
         _PreflightDataset.constructions = []
         _PreflightDataset.sizes = {"train": 3, "dev": 2}
         _PreflightDataset.vocabularies = {"rgb": 17, "qonly": 17}
@@ -689,6 +699,7 @@ class ProductionPreflightTests(unittest.TestCase):
             "data": {
                 "audit_dir": str(self.audit), "data_root": str(self.data),
                 "train_size": 3, "vocab_size": 17,
+                "audit_artifacts": self.audit_contents,
             },
             "packages": {
                 "python": "3.11.14", "numpy": "2.2.6", "torch": "2.6.0+cu124",
@@ -740,9 +751,20 @@ class _OrchestrationDataset:
         self.name = name
         self.size = size
         self.vocab_size = 17
+        self.partition = ("base_test" if "base" in name else
+                          "dev" if "dev" in name else "train")
 
     def __len__(self):
         return self.size
+
+    def sample_identity(self, index):
+        return CLEVRSampleIdentity(
+            self.partition, "val" if self.partition == "base_test" else "train",
+            index, f"image_{index}.png", 10_000 + index, index,
+        )
+
+    def __getitem__(self, index):
+        return {"answer": torch.tensor(index % 2, dtype=torch.int64)}
 
 
 class _OrchestrationModel:
@@ -825,9 +847,25 @@ class _OrchestrationArtifacts:
         return self.run_dir / "checkpoints" / f"update_{update:04d}.pt"
 
     def publish_predictions(self, *, partition, completed_updates, rows):
-        self.predictions.append((partition, completed_updates, tuple(rows)))
+        snapshot = tuple(rows)
+        self.predictions.append((partition, completed_updates, snapshot))
         self.trace.append(("publish", self.spec.method, partition, completed_updates))
-        return self.run_dir / "predictions" / partition / f"{completed_updates}.jsonl"
+        parent = self.run_dir / "predictions" / partition
+        parent.mkdir(parents=True, exist_ok=True)
+        if partition == "base_test":
+            path = parent / f"{self.spec.method}_seed_{self.spec.seed}.jsonl"
+        else:
+            path = parent / f"update_{completed_updates:04d}.jsonl"
+        if path.exists() or path.is_symlink():
+            raise RuntimeError("prediction target already exists")
+        content = "".join(json.dumps({
+            "protocol_version": "PUB-R1.1", "method": self.spec.method,
+            "seed": self.spec.seed, "question_index": row.question_index,
+            "label": row.label, "logits": list(row.logits),
+        }, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n"
+                          for row in snapshot)
+        path.write_text(content, encoding="utf-8")
+        return path
 
     def close(self):
         self.closed = True
@@ -844,6 +882,13 @@ class ProductionTrainingTests(unittest.TestCase):
         self.output = self.root / "output"
         for path in (self.audit, self.data, self.output):
             path.mkdir()
+        self.audit_contents = {
+            "selected_questions.jsonl": "alpha\n",
+            "vocabulary.json": "vocab\n",
+            "audit_report.json": "audit\n",
+        }
+        for name, content in self.audit_contents.items():
+            (self.audit / name).write_text(content, encoding="utf-8")
         self.train_rgb = _OrchestrationDataset("train-rgb")
         self.dev_rgb = _OrchestrationDataset("dev-rgb", 19)
         self.train_q = _OrchestrationDataset("train-q")
@@ -907,21 +952,38 @@ class ProductionTrainingTests(unittest.TestCase):
     def _evaluate(self, **kwargs):
         self.eval_calls.append(kwargs)
         partition = kwargs["partition"]
+        dataset = kwargs["dataset"]
+        _OrchestrationFactory.trace.append(("evaluate", kwargs["method"], partition))
+        rows = tuple(
+            self.runner.CLEVRPredictionRecord(
+                dataset.sample_identity(index).question_index,
+                index % 2,
+                (2.0, 0.0) if index % 2 == 0 else (0.0, 2.0),
+            )
+            for index in range(len(dataset))
+        )
         return self.runner.CLEVREvaluationResult(
-            partition, 2, 1, 1.0, 0.5, 0.5,
-            (self.runner.CLEVRPredictionRecord(1, 0, (1.0, 0.0)),),
+            partition, len(dataset), len(dataset), 1.0, 1.0 / len(dataset), 1.0,
+            rows,
         )
 
-    def _patches(self, *, phase, methods, seed, load=None, update=None):
+    def _patches(
+        self, *, phase, methods, seed, load=None, update=None,
+        use_real_config=False, artifact_class=None,
+    ):
         preflight = self._preflight(phase, methods, seed)
         stack = ExitStack()
         stack.enter_context(patch.object(self.runner, "preflight_clevr_run", return_value=preflight))
         stack.enter_context(patch.object(self.runner, "_setup_clevr_runtime", return_value=torch.device("cpu")))
-        self.config_mock = stack.enter_context(
-            patch.object(self.runner, "_expanded_clevr_config", return_value={"frozen": True})
-        )
+        self.config_mock = None
+        if not use_real_config:
+            self.config_mock = stack.enter_context(
+                patch.object(self.runner, "_expanded_clevr_config", return_value={"frozen": True})
+            )
         stack.enter_context(patch.object(self.runner, "CLEVRPairedInitialization", _OrchestrationFactory))
-        stack.enter_context(patch.object(self.runner, "CLEVRRunArtifacts", _OrchestrationArtifacts))
+        stack.enter_context(patch.object(
+            self.runner, "CLEVRRunArtifacts", artifact_class or _OrchestrationArtifacts,
+        ))
         stack.enter_context(patch.object(self.runner, "build_clevr_adamw", side_effect=lambda model: SimpleNamespace(model=model)))
         stack.enter_context(patch.object(self.runner, "build_clevr_lr_scheduler", side_effect=lambda optimizer: SimpleNamespace(optimizer=optimizer)))
         stack.enter_context(patch.object(self.runner, "CLEVRIndexStream", _OrchestrationSampler))
@@ -948,6 +1010,43 @@ class ProductionTrainingTests(unittest.TestCase):
             data_root=None if methods == ("Q-only",) else self.data,
             output_root=self.output, device_index=0, resume_checkpoints=resumes,
         )
+
+    def _checkpoint(self, *, phase, seed, method, update):
+        path = (self.output / phase / f"seed_{seed}" / method /
+                "checkpoints" / f"update_{update:04d}.pt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"injected")
+        return path
+
+    @staticmethod
+    def _load_at(update, *, method, seed):
+        def load(path, **kwargs):
+            kwargs["sampler"].completed = update
+            return SimpleNamespace(
+                method=method, run_seed=seed, completed_updates=update,
+                dataset_size=kwargs["sampler"].dataset_size,
+                cuda_devices=kwargs["cuda_devices"],
+            )
+        return load
+
+    def _write_prediction(self, *, phase, seed, method, partition, update, dataset):
+        path = (self.output / phase / f"seed_{seed}" / method /
+                "predictions" / partition / f"update_{update:04d}.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for index in range(len(dataset)):
+            label = index % 2
+            rows.append({
+                "protocol_version": "PUB-R1.1", "method": method, "seed": seed,
+                "question_index": dataset.sample_identity(index).question_index,
+                "label": label,
+                "logits": [2.0, 0.0] if label == 0 else [0.0, 2.0],
+            })
+        path.write_text("".join(
+            json.dumps(row, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n"
+            for row in rows
+        ), encoding="utf-8")
+        return path
 
     def test_fresh_seed_uses_one_factory_reseeds_each_arm_and_commits_update_zero_then_final(self):
         methods = ("G", "Q-only")
@@ -978,9 +1077,11 @@ class ProductionTrainingTests(unittest.TestCase):
         )
         self.assertEqual(self.config_mock.call_args_list, [
             call(device_index=0, audit_dir=self.audit, data_root=self.data,
-                 vocab_size=17, train_size=257),
+                 vocab_size=17, train_size=257,
+                 audit_artifacts=self.audit_contents),
             call(device_index=0, audit_dir=self.audit, data_root=None,
-                 vocab_size=17, train_size=257),
+                 vocab_size=17, train_size=257,
+                 audit_artifacts=self.audit_contents),
         ])
         for artifact, resume, _ in _OrchestrationArtifacts.opened:
             self.assertFalse(resume)
@@ -1008,8 +1109,9 @@ class ProductionTrainingTests(unittest.TestCase):
         self.assertEqual(len(_OrchestrationArtifacts.opened), 1)
 
     def test_resume_constructs_then_loads_and_runs_8000_without_update_zero(self):
-        checkpoint = self.root / "formal-update-7999.pt"
-        checkpoint.write_bytes(b"injected")
+        checkpoint = self._checkpoint(
+            phase="formal", seed=101, method="B", update=7999,
+        )
         with self._patches(phase="formal", methods=("B",), seed=101):
             self._train(phase="formal", seed=101, methods=("B",), resumes={"B": checkpoint})
         trace = _OrchestrationFactory.trace
@@ -1027,8 +1129,9 @@ class ProductionTrainingTests(unittest.TestCase):
         self.assertFalse(any(event[0] == "checkpoint-path" and event[2] == 0 for event in trace))
 
     def test_resume_at_target_runs_no_update_and_finishes_required_evaluation(self):
-        checkpoint = self.root / "pilot-update-0800.pt"
-        checkpoint.write_bytes(b"injected")
+        checkpoint = self._checkpoint(
+            phase="pilot", seed=9001, method="G", update=800,
+        )
         def load_target(path, **kwargs):
             kwargs["sampler"].completed = 800
             return SimpleNamespace(
@@ -1052,9 +1155,219 @@ class ProductionTrainingTests(unittest.TestCase):
         self.assertEqual([event[1] for event in artifact.events],
                          ["resume", "evaluation", "complete"])
 
+    def test_resume_intermediate_checkpoint_completes_missing_dev_before_next_update(self):
+        checkpoint = self._checkpoint(
+            phase="formal", seed=101, method="G", update=1000,
+        )
+        def load_boundary(path, **kwargs):
+            kwargs["sampler"].completed = 1000
+            return SimpleNamespace(
+                method="G", run_seed=101, completed_updates=1000,
+                dataset_size=kwargs["sampler"].dataset_size,
+                cuda_devices=kwargs["cuda_devices"],
+            )
+        def stop_after_boundary(**kwargs):
+            _OrchestrationFactory.trace.append(("update-attempt", "G", 1001))
+            raise RuntimeError("stop after recovered boundary")
+        with self._patches(
+            phase="formal", methods=("G",), seed=101,
+            load=load_boundary, update=stop_after_boundary,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop after recovered boundary"):
+                self._train(
+                    phase="formal", seed=101, methods=("G",),
+                    resumes={"G": checkpoint},
+                )
+        self.assertEqual([call["partition"] for call in self.eval_calls], ["dev"])
+        self.assertLess(
+            _OrchestrationFactory.trace.index(("evaluate", "G", "dev")),
+            _OrchestrationFactory.trace.index(("update-attempt", "G", 1001)),
+        )
+        self.assertTrue((self.output / "formal" / "seed_101" / "G" /
+                         "predictions" / "dev" / "update_1000.jsonl").is_file())
+
+    def test_resume_final_before_dev_completes_both_evaluations(self):
+        checkpoint = self._checkpoint(
+            phase="formal", seed=101, method="G", update=8000,
+        )
+        with self._patches(
+            phase="formal", methods=("G",), seed=101,
+            load=self._load_at(8000, method="G", seed=101),
+        ):
+            self._train(
+                phase="formal", seed=101, methods=("G",),
+                resumes={"G": checkpoint},
+            )
+        self.assertEqual([call["partition"] for call in self.eval_calls],
+                         ["dev", "train"])
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertEqual([event[1] for event in artifact.events],
+                         ["resume", "evaluation", "evaluation", "complete"])
+
+    def test_resume_final_between_dev_and_train_reuses_dev_then_completes_train(self):
+        checkpoint = self._checkpoint(
+            phase="formal", seed=101, method="G", update=8000,
+        )
+        self._write_prediction(
+            phase="formal", seed=101, method="G", partition="dev", update=8000,
+            dataset=self.dev_rgb,
+        )
+        with self._patches(
+            phase="formal", methods=("G",), seed=101,
+            load=self._load_at(8000, method="G", seed=101),
+        ):
+            self._train(
+                phase="formal", seed=101, methods=("G",),
+                resumes={"G": checkpoint},
+            )
+        self.assertEqual([call["partition"] for call in self.eval_calls], ["train"])
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertEqual([event[1] for event in artifact.events],
+                         ["resume", "evaluation", "evaluation", "complete"])
+
+    def test_resume_final_after_both_predictions_only_appends_completion(self):
+        checkpoint = self._checkpoint(
+            phase="formal", seed=101, method="G", update=8000,
+        )
+        for partition, dataset in (("dev", self.dev_rgb), ("train", self.train_rgb)):
+            self._write_prediction(
+                phase="formal", seed=101, method="G", partition=partition,
+                update=8000, dataset=dataset,
+            )
+        with self._patches(
+            phase="formal", methods=("G",), seed=101,
+            load=self._load_at(8000, method="G", seed=101),
+        ):
+            self._train(
+                phase="formal", seed=101, methods=("G",),
+                resumes={"G": checkpoint},
+            )
+        self.assertFalse(self.eval_calls)
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertEqual([event[1] for event in artifact.events],
+                         ["resume", "evaluation", "evaluation", "complete"])
+
+    def test_resume_pilot_with_published_dev_is_idempotent(self):
+        checkpoint = self._checkpoint(
+            phase="pilot", seed=9001, method="G", update=800,
+        )
+        self._write_prediction(
+            phase="pilot", seed=9001, method="G", partition="dev", update=800,
+            dataset=self.dev_rgb,
+        )
+        with self._patches(
+            phase="pilot", methods=("G",), seed=9001,
+            load=self._load_at(800, method="G", seed=9001),
+        ):
+            self._train(
+                phase="pilot", seed=9001, methods=("G",),
+                resumes={"G": checkpoint},
+            )
+        self.assertFalse(self.eval_calls)
+        artifact = _OrchestrationArtifacts.opened[0][0]
+        self.assertEqual([event[1] for event in artifact.events],
+                         ["resume", "evaluation", "complete"])
+
+    def test_resume_rejects_published_prediction_with_changed_label(self):
+        checkpoint = self._checkpoint(
+            phase="pilot", seed=9001, method="G", update=800,
+        )
+        path = self._write_prediction(
+            phase="pilot", seed=9001, method="G", partition="dev", update=800,
+            dataset=self.dev_rgb,
+        )
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows[0]["label"] = 1 - rows[0]["label"]
+        path.write_text("".join(
+            json.dumps(row, allow_nan=False, sort_keys=True, separators=(",", ":")) + "\n"
+            for row in rows
+        ), encoding="utf-8")
+        update = Mock(side_effect=AssertionError("invalid boundary must not update"))
+        with self._patches(
+            phase="pilot", methods=("G",), seed=9001,
+            load=self._load_at(800, method="G", seed=9001), update=update,
+        ):
+            with self.assertRaisesRegex(
+                self.runner.CLEVRRunnerError,
+                "prediction identities or labels disagree",
+            ):
+                self._train(
+                    phase="pilot", seed=9001, methods=("G",),
+                    resumes={"G": checkpoint},
+                )
+        self.assertFalse(self.eval_calls)
+        update.assert_not_called()
+
+    def test_resume_rejects_smoke_checkpoint_for_pilot_before_load_or_update(self):
+        checkpoint = self._checkpoint(
+            phase="smoke", seed=9001, method="G", update=1,
+        )
+        load = Mock(side_effect=AssertionError("foreign checkpoint must not load"))
+        update = Mock(side_effect=AssertionError("foreign checkpoint must not update"))
+        with self._patches(
+            phase="pilot", methods=("G",), seed=9001, load=load, update=update,
+        ):
+            with self.assertRaises(self.runner.CLEVRRunnerError):
+                self._train(
+                    phase="pilot", seed=9001, methods=("G",),
+                    resumes={"G": checkpoint},
+                )
+        load.assert_not_called()
+        update.assert_not_called()
+
+    def test_resume_rejects_pilot_checkpoint_for_smoke_before_load_or_update(self):
+        checkpoint = self._checkpoint(
+            phase="pilot", seed=9001, method="G", update=0,
+        )
+        load = Mock(side_effect=AssertionError("foreign checkpoint must not load"))
+        update = Mock(side_effect=AssertionError("foreign checkpoint must not update"))
+        with self._patches(
+            phase="smoke", methods=("G",), seed=9001, load=load, update=update,
+        ):
+            with self.assertRaises(self.runner.CLEVRRunnerError):
+                self._train(
+                    phase="smoke", seed=9001, methods=("G",),
+                    resumes={"G": checkpoint},
+                )
+        load.assert_not_called()
+        update.assert_not_called()
+
+    def test_resume_rejects_same_size_audit_mutation_before_checkpoint_load(self):
+        with patch.object(self.runner.torch.cuda, "get_device_name", return_value="GPU"), \
+                self._patches(
+                    phase="smoke", methods=("G",), seed=9001,
+                    use_real_config=True, artifact_class=CLEVRRunArtifacts,
+                ):
+            self._train(phase="smoke", seed=9001, methods=("G",), resumes={})
+        checkpoint = self._checkpoint(
+            phase="smoke", seed=9001, method="G", update=1,
+        )
+        manifest = self.audit / "selected_questions.jsonl"
+        original_size = manifest.stat().st_size
+        manifest.write_text("omega\n", encoding="utf-8")
+        self.assertEqual(manifest.stat().st_size, original_size)
+        self.assertEqual(len(self.train_rgb), 257)
+        self.assertEqual(self.train_rgb.vocab_size, 17)
+        load = Mock(side_effect=AssertionError("mismatched data must not load"))
+        update = Mock(side_effect=AssertionError("mismatched data must not update"))
+        with patch.object(self.runner.torch.cuda, "get_device_name", return_value="GPU"), \
+                self._patches(
+                    phase="smoke", methods=("G",), seed=9001, load=load,
+                    update=update, use_real_config=True,
+                    artifact_class=CLEVRRunArtifacts,
+                ):
+            with self.assertRaisesRegex(CLEVRRunArtifactError, "resume config disagrees"):
+                self._train(
+                    phase="smoke", seed=9001, methods=("G",),
+                    resumes={"G": checkpoint},
+                )
+        load.assert_not_called()
+        update.assert_not_called()
+
     def test_resume_mapping_and_metadata_mismatch_fail_before_update(self):
-        checkpoint = self.root / "pilot-update-0799.pt"
-        checkpoint.write_bytes(b"injected")
+        checkpoint = self._checkpoint(
+            phase="pilot", seed=9001, method="G", update=799,
+        )
         cases = (
             {"G": Path("relative.pt")},
             {"unknown": checkpoint},
@@ -1068,10 +1381,12 @@ class ProductionTrainingTests(unittest.TestCase):
         def mismatched(path, **kwargs):
             return SimpleNamespace(method="G", run_seed=9001, completed_updates=801,
                                    dataset_size=257, cuda_devices=(0,))
-        with self._patches(phase="pilot", methods=("G",), seed=9001, load=mismatched):
+        load = Mock(side_effect=mismatched)
+        with self._patches(phase="pilot", methods=("G",), seed=9001, load=load):
             with self.assertRaises(self.runner.CLEVRRunnerError):
                 self._train(phase="pilot", seed=9001, methods=("G",),
                             resumes={"G": checkpoint})
+        load.assert_called_once()
         self.assertFalse(self.update_counts)
 
     def test_failure_event_is_best_effort_and_primary_baseexception_is_reraised(self):
@@ -1109,8 +1424,13 @@ class ProductionFormalEvaluationTests(unittest.TestCase):
         self.output = self.root / "output"
         for path in (self.audit, self.data, self.output):
             path.mkdir()
-        self.checkpoint = self.root / "update_8000.pt"
-        self.checkpoint.write_bytes(b"injected")
+        for name, content in {
+            "selected_questions.jsonl": "questions\n",
+            "vocabulary.json": "vocabulary\n",
+            "audit_report.json": "report\n",
+        }.items():
+            (self.audit / name).write_text(content, encoding="utf-8")
+        self.checkpoint = self._checkpoint_for("G")
         self.trace = []
         _OrchestrationFactory.instances = []
         _OrchestrationFactory.trace = self.trace
@@ -1123,6 +1443,13 @@ class ProductionFormalEvaluationTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def _checkpoint_for(self, method):
+        path = (self.output / "formal" / "seed_101" / method /
+                "checkpoints" / "update_8000.pt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"injected")
+        return path
 
     def _dataset(self, *, data_root, audit_dir, partition):
         self.trace.append(("dataset", "rgb", partition))
@@ -1156,13 +1483,19 @@ class ProductionFormalEvaluationTests(unittest.TestCase):
             (self.runner.CLEVRPredictionRecord(8, 1, (0.0, 2.0)),),
         )
 
-    def _patches(self, *, setup=None, load=None, artifact_class=None):
+    def _patches(
+        self, *, setup=None, load=None, artifact_class=None,
+        use_real_config=False,
+    ):
         stack = ExitStack()
         stack.enter_context(patch.object(self.runner, "CLEVRQuestionDataset", side_effect=self._dataset))
         stack.enter_context(patch.object(self.runner, "CLEVRQuestionOnlyDataset", side_effect=self._q_dataset))
         stack.enter_context(patch.object(self.runner, "_setup_clevr_runtime",
                                          side_effect=setup, return_value=torch.device("cpu")))
-        stack.enter_context(patch.object(self.runner, "_expanded_clevr_config", return_value={"frozen": True}))
+        if not use_real_config:
+            stack.enter_context(patch.object(
+                self.runner, "_expanded_clevr_config", return_value={"frozen": True},
+            ))
         stack.enter_context(patch.object(self.runner, "CLEVRPairedInitialization", _OrchestrationFactory))
         stack.enter_context(patch.object(self.runner, "CLEVRRunArtifacts", artifact_class or _OrchestrationArtifacts))
         stack.enter_context(patch.object(self.runner, "build_clevr_adamw", side_effect=lambda model: SimpleNamespace(model=model)))
@@ -1179,6 +1512,9 @@ class ProductionFormalEvaluationTests(unittest.TestCase):
             checkpoint=self.checkpoint, partition="base_test",
         )
         arguments.update(overrides)
+        if ("checkpoint" not in overrides
+                and arguments["method"] in ("G", "B", "M10", "Q-only")):
+            arguments["checkpoint"] = self._checkpoint_for(arguments["method"])
         return self.runner.evaluate_clevr_checkpoint(**arguments)
 
     def test_verifies_train_state_then_constructs_base_test_evaluates_once_and_publishes(self):
@@ -1200,7 +1536,10 @@ class ProductionFormalEvaluationTests(unittest.TestCase):
         self.assertTrue(_OrchestrationArtifacts.opened[0][1])
         self.assertEqual([(p, u) for p, u, _ in artifact.predictions],
                          [("base_test", 8000)])
-        self.assertEqual(path, artifact.run_dir / "predictions" / "base_test" / "8000.jsonl")
+        self.assertEqual(
+            path,
+            artifact.run_dir / "predictions" / "base_test" / "G_seed_101.jsonl",
+        )
         self.assertEqual([event[1] for event in artifact.events],
                          ["evaluation", "complete"])
         self.assertTrue(artifact.closed)
@@ -1211,6 +1550,41 @@ class ProductionFormalEvaluationTests(unittest.TestCase):
         self.assertEqual([event for event in self.trace if event[0] == "dataset"],
                          [("dataset", "qonly", "train"),
                           ("dataset", "qonly", "base_test")])
+
+    def test_rejects_checkpoint_outside_current_formal_run_before_load(self):
+        foreign = self.root / "foreign" / "update_8000.pt"
+        foreign.parent.mkdir()
+        foreign.write_bytes(b"injected")
+        load = Mock(side_effect=AssertionError("foreign checkpoint must not load"))
+        with self._patches(load=load), self.assertRaises(self.runner.CLEVRRunnerError):
+            self._run(checkpoint=foreign)
+        load.assert_not_called()
+
+    def test_evaluation_rejects_same_size_audit_mutation_before_checkpoint_load(self):
+        method = "B"
+        spec = self.runner.CLEVRRunSpec("formal", method, 101)
+        with patch.object(self.runner.torch.cuda, "get_device_name", return_value="GPU"):
+            config = self.runner._expanded_clevr_config(
+                device_index=0, audit_dir=self.audit, data_root=self.data,
+                vocab_size=17, train_size=len(self.train),
+            )
+        CLEVRRunArtifacts.open(
+            output_root=self.output, spec=spec, expanded_config=config, resume=False,
+        ).close()
+        manifest = self.audit / "selected_questions.jsonl"
+        original_size = manifest.stat().st_size
+        manifest.write_text("altered!!\n", encoding="utf-8")
+        self.assertEqual(manifest.stat().st_size, original_size)
+        load = Mock(side_effect=AssertionError("mismatched data must not load"))
+        with patch.object(self.runner.torch.cuda, "get_device_name", return_value="GPU"), \
+                self._patches(
+                    load=load, artifact_class=CLEVRRunArtifacts,
+                    use_real_config=True,
+                ), self.assertRaisesRegex(
+                    CLEVRRunArtifactError, "resume config disagrees",
+                ):
+            self._run(method=method)
+        load.assert_not_called()
 
     def test_rejects_nonformal_confirmation_bad_paths_and_existing_output_before_base(self):
         cases = (

@@ -8,10 +8,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import json
 import math
+import os
 from pathlib import Path
 import platform
 import random
+import re
+import stat
 
 import numpy as np
 import PIL
@@ -190,10 +194,47 @@ def _setup_clevr_runtime(device_index: int) -> torch.device:
     return torch.device(f"cuda:{device_index}")
 
 
+_AUDIT_ARTIFACT_NAMES = (
+    "selected_questions.jsonl", "vocabulary.json", "audit_report.json",
+)
+
+
+def _read_regular_utf8(path: Path, description: str) -> str:
+    try:
+        with path.open("rb") as source:
+            opened = os.fstat(source.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise CLEVRRunnerError(f"{description} is not a regular file")
+            content = source.read()
+        current = path.lstat()
+        if (not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)):
+            raise CLEVRRunnerError(f"{description} changed while it was read")
+        return content.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise CLEVRRunnerError(f"{description} is unreadable UTF-8") from exc
+
+
+def _audit_artifact_snapshot(audit_dir: Path) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    for name in _AUDIT_ARTIFACT_NAMES:
+        snapshot[name] = _read_regular_utf8(
+            audit_dir / name, f"audit artifact {name}",
+        )
+    return snapshot
+
+
 def _expanded_clevr_config(
     *, device_index: int, audit_dir: Path, data_root: Path | None,
     vocab_size: int, train_size: int,
+    audit_artifacts: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
+    if audit_artifacts is None:
+        audit_artifacts = _audit_artifact_snapshot(audit_dir)
+    elif (not isinstance(audit_artifacts, Mapping)
+          or tuple(audit_artifacts) != _AUDIT_ARTIFACT_NAMES
+          or any(type(value) is not str for value in audit_artifacts.values())):
+        raise CLEVRRunnerError("audit artifact snapshot is invalid")
     return {
         "protocol_version": PROTOCOL_VERSION,
         "data": {
@@ -201,6 +242,7 @@ def _expanded_clevr_config(
             "data_root": None if data_root is None else str(data_root.resolve()),
             "train_size": train_size,
             "vocab_size": vocab_size,
+            "audit_artifacts": dict(audit_artifacts),
         },
         "packages": {
             "python": platform.python_version(), "numpy": str(np.__version__),
@@ -259,6 +301,25 @@ def _validate_resume_checkpoints(
     return result
 
 
+def _checkpoint_update_for_run(
+    path: Path, *, artifacts: CLEVRRunArtifacts, target_updates: int,
+) -> int:
+    match = re.fullmatch(r"update_([0-9]+)\.pt", path.name)
+    if match is None:
+        raise CLEVRRunnerError("checkpoint filename does not encode its update")
+    update = int(match.group(1))
+    expected = artifacts.run_dir / "checkpoints" / f"update_{update:04d}.pt"
+    try:
+        regular = stat.S_ISREG(path.lstat().st_mode)
+    except OSError as exc:
+        raise CLEVRRunnerError("checkpoint is not an accessible regular file") from exc
+    if (not regular or path != expected or not 0 <= update <= target_updates):
+        raise CLEVRRunnerError(
+            "checkpoint is not bound to the current phase/seed/method/target"
+        )
+    return update
+
+
 def _save_boundary(
     *, artifacts: CLEVRRunArtifacts, completed_updates: int, method: str,
     seed: int, model: nn.Module, optimizer: AdamW, scheduler: LambdaLR,
@@ -282,6 +343,17 @@ def _publish_evaluation(
         partition=result.partition, completed_updates=completed_updates,
         rows=result.rows,
     )
+    _append_evaluation_event(
+        artifacts=artifacts, result=result, completed_updates=completed_updates,
+        path=path,
+    )
+    return path
+
+
+def _append_evaluation_event(
+    *, artifacts: CLEVRRunArtifacts, result: CLEVREvaluationResult,
+    completed_updates: int, path: Path,
+) -> None:
     artifacts.append_event(
         completed_updates=completed_updates, event="evaluation",
         details={
@@ -294,7 +366,173 @@ def _publish_evaluation(
             "predictions": str(path),
         },
     )
-    return path
+
+
+_PREDICTION_FIELDS = {
+    "protocol_version", "method", "seed", "question_index", "label", "logits",
+}
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CLEVRRunnerError("prediction JSON contains a duplicate key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _prediction_path(
+    artifacts: CLEVRRunArtifacts, *, partition: str, completed_updates: int,
+) -> Path:
+    return (artifacts.run_dir / "predictions" / partition /
+            f"update_{completed_updates:04d}.jsonl")
+
+
+def _dataset_label(dataset: object, index: int) -> int:
+    sample = dataset[index]
+    if not isinstance(sample, Mapping) or "answer" not in sample:
+        raise CLEVRRunnerError("evaluation sample does not expose its answer")
+    answer = sample["answer"]
+    if type(answer) is torch.Tensor and answer.dtype == torch.int64 and answer.shape == ():
+        label = int(answer.item())
+    elif type(answer) is int:
+        label = answer
+    else:
+        raise CLEVRRunnerError("evaluation answer must be an int64 scalar")
+    if label not in (0, 1):
+        raise CLEVRRunnerError("evaluation answer must be binary")
+    return label
+
+
+def _read_boundary_evaluation(
+    *, path: Path, dataset: object, partition: str, method: str, seed: int,
+) -> CLEVREvaluationResult:
+    content = _read_regular_utf8(path, "existing prediction artifact")
+    lines = content.splitlines()
+    if not lines or any(not line for line in lines):
+        raise CLEVRRunnerError("existing prediction artifact is empty or has blank rows")
+    rows: list[CLEVRPredictionRecord] = []
+    try:
+        for line in lines:
+            document = json.loads(
+                line, object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+            if type(document) is not dict or set(document) != _PREDICTION_FIELDS:
+                raise CLEVRRunnerError("prediction row fields disagree with the protocol")
+            if (document["protocol_version"] != PROTOCOL_VERSION
+                    or document["method"] != method or document["seed"] != seed):
+                raise CLEVRRunnerError("prediction row protocol, method, or seed disagrees")
+            logits = document["logits"]
+            if type(logits) is not list:
+                raise CLEVRRunnerError("prediction logits must be a JSON list")
+            rows.append(CLEVRPredictionRecord(
+                document["question_index"], document["label"], tuple(logits),
+            ))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        if isinstance(exc, CLEVRRunnerError):
+            raise
+        raise CLEVRRunnerError("existing prediction artifact is invalid") from exc
+    if len(rows) != len(dataset):
+        raise CLEVRRunnerError("prediction coverage disagrees with the evaluation dataset")
+    question_indices = [row.question_index for row in rows]
+    if question_indices != sorted(question_indices) or len(set(question_indices)) != len(rows):
+        raise CLEVRRunnerError("prediction question indices must be sorted and unique")
+    expected = sorted(
+        (_question_index(dataset, index, partition), _dataset_label(dataset, index))
+        for index in range(len(dataset))
+    )
+    if [(row.question_index, row.label) for row in rows] != expected:
+        raise CLEVRRunnerError("prediction identities or labels disagree with the dataset")
+    loss_sum = 0.0
+    correct = 0
+    for row in rows:
+        high = max(row.logits)
+        loss_sum += (high + math.log(sum(math.exp(value - high) for value in row.logits))
+                     - row.logits[row.label])
+        prediction = 0 if row.logits[0] >= row.logits[1] else 1
+        correct += int(prediction == row.label)
+    if not math.isfinite(loss_sum):
+        raise CLEVRRunnerError("reconstructed prediction loss is not finite")
+    total = len(rows)
+    return CLEVREvaluationResult(
+        partition, total, correct, loss_sum, loss_sum / total, correct / total,
+        tuple(rows),
+    )
+
+
+def _record_boundary_evaluation(
+    *, artifacts: CLEVRRunArtifacts, model: nn.Module, dataset: object,
+    collate_fn: Callable[..., Mapping[str, Tensor]], method: str, partition: str,
+    completed_updates: int, seed: int, device: torch.device,
+) -> None:
+    path = _prediction_path(
+        artifacts, partition=partition, completed_updates=completed_updates,
+    )
+    if path.exists() or path.is_symlink():
+        result = _read_boundary_evaluation(
+            path=path, dataset=dataset, partition=partition, method=method, seed=seed,
+        )
+        _append_evaluation_event(
+            artifacts=artifacts, result=result, completed_updates=completed_updates,
+            path=path,
+        )
+        return
+    result = evaluate_clevr_model(
+        model=model, dataset=dataset, collate_fn=collate_fn,
+        method=method, partition=partition, device=device,
+    )
+    try:
+        _publish_evaluation(
+            artifacts=artifacts, result=result, completed_updates=completed_updates,
+        )
+    except Exception as publication_failure:
+        if not (path.exists() or path.is_symlink()):
+            raise
+        try:
+            recovered = _read_boundary_evaluation(
+                path=path, dataset=dataset, partition=partition, method=method, seed=seed,
+            )
+            _append_evaluation_event(
+                artifacts=artifacts, result=recovered,
+                completed_updates=completed_updates, path=path,
+            )
+        except Exception as recovery_failure:
+            publication_failure.add_note(
+                "prediction collision recovery failed: "
+                f"{type(recovery_failure).__name__}: {recovery_failure}"
+            )
+            raise publication_failure
+
+
+def _complete_training_boundary(
+    *, artifacts: CLEVRRunArtifacts, spec: CLEVRRunSpec, model: nn.Module,
+    train_dataset: object, dev_dataset: object,
+    collate_fn: Callable[..., Mapping[str, Tensor]], method: str,
+    completed_updates: int, seed: int, device: torch.device,
+) -> None:
+    dev_boundary = (
+        (spec.phase == "pilot" and completed_updates == spec.target_updates)
+        or (spec.phase == "formal" and completed_updates > 0
+            and completed_updates % 1_000 == 0)
+    )
+    if dev_boundary:
+        _record_boundary_evaluation(
+            artifacts=artifacts, model=model, dataset=dev_dataset,
+            collate_fn=collate_fn, method=method, partition="dev",
+            completed_updates=completed_updates, seed=seed, device=device,
+        )
+    if spec.phase == "formal" and completed_updates == spec.target_updates:
+        _record_boundary_evaluation(
+            artifacts=artifacts, model=model, dataset=train_dataset,
+            collate_fn=collate_fn, method=method, partition="train",
+            completed_updates=completed_updates, seed=seed, device=device,
+        )
 
 
 def _append_failure(
@@ -325,10 +563,14 @@ def train_clevr_seed(
 ) -> None:
     """Run one explicitly authorized seed, one sequential method arm at a time."""
     _explicit_output_root(output_root)
+    _absolute_directory(audit_dir, "audit_dir")
+    audit_artifacts = _audit_artifact_snapshot(audit_dir)
     preflight = preflight_clevr_run(
         spec_phase=spec_phase, seed=seed, methods=methods, audit_dir=audit_dir,
         data_root=data_root, device_index=device_index,
     )
+    if _audit_artifact_snapshot(audit_dir) != audit_artifacts:
+        raise CLEVRRunnerError("audit artifacts changed while datasets were constructed")
     resumes = _validate_resume_checkpoints(resume_checkpoints, preflight.methods)
     device = _setup_clevr_runtime(device_index)
     factory = CLEVRPairedInitialization(vocab_size=preflight.vocab_size, run_seed=seed)
@@ -342,6 +584,7 @@ def train_clevr_seed(
             device_index=device_index, audit_dir=audit_dir,
             data_root=None if method == "Q-only" else data_root,
             vocab_size=preflight.vocab_size, train_size=len(train_dataset),
+            audit_artifacts=audit_artifacts,
         )
         artifacts = CLEVRRunArtifacts.open(
             output_root=output_root, spec=spec, expanded_config=expanded_config,
@@ -350,6 +593,11 @@ def train_clevr_seed(
         completed_updates = 0
         primary: BaseException | None = None
         try:
+            checkpoint_update = (None if resume_path is None else
+                                 _checkpoint_update_for_run(
+                                     resume_path, artifacts=artifacts,
+                                     target_updates=spec.target_updates,
+                                 ))
             artifacts.ensure_common_state(common_state)
             if resume_path is None:
                 random.seed(seed)
@@ -362,7 +610,6 @@ def train_clevr_seed(
             sampler = CLEVRIndexStream(dataset_size=len(train_dataset), run_seed=seed)
             collate_fn = (collate_clevr_question_only
                           if method == "Q-only" else collate_clevr_questions)
-            resumed_at_target = False
             if resume_path is None:
                 artifacts.append_event(
                     completed_updates=0, event="start",
@@ -383,18 +630,25 @@ def train_clevr_seed(
                         or metadata.dataset_size != len(train_dataset)
                         or metadata.cuda_devices != (device_index,)
                         or type(metadata.completed_updates) is not int
+                        or metadata.completed_updates != checkpoint_update
                         or not 0 <= metadata.completed_updates <= spec.target_updates):
                     raise CLEVRRunnerError(
                         "resume checkpoint metadata disagrees with method/seed/dataset/target"
                     )
                 completed_updates = metadata.completed_updates
-                resumed_at_target = completed_updates == spec.target_updates
                 artifacts.append_event(
                     completed_updates=completed_updates, event="resume",
                     details={"checkpoint": str(resume_path),
                              "target_updates": spec.target_updates},
                 )
             model.train(True)
+            if resume_path is not None:
+                _complete_training_boundary(
+                    artifacts=artifacts, spec=spec, model=model,
+                    train_dataset=train_dataset, dev_dataset=dev_dataset,
+                    collate_fn=collate_fn, method=method,
+                    completed_updates=completed_updates, seed=seed, device=device,
+                )
             for update in range(completed_updates + 1, spec.target_updates + 1):
                 result = run_clevr_update(
                     model=model, optimizer=optimizer, scheduler=scheduler,
@@ -421,46 +675,12 @@ def train_clevr_seed(
                         optimizer=optimizer, scheduler=scheduler,
                         sampler=sampler, device_index=device_index,
                     )
-                dev_boundary = (
-                    (spec.phase == "pilot" and update == spec.target_updates)
-                    or (spec.phase == "formal" and update % 1_000 == 0)
-                )
-                if dev_boundary:
-                    _publish_evaluation(
-                        artifacts=artifacts,
-                        result=evaluate_clevr_model(
-                            model=model, dataset=dev_dataset, collate_fn=collate_fn,
-                            method=method, partition="dev", device=device,
-                        ),
-                        completed_updates=update,
+                    _complete_training_boundary(
+                        artifacts=artifacts, spec=spec, model=model,
+                        train_dataset=train_dataset, dev_dataset=dev_dataset,
+                        collate_fn=collate_fn, method=method,
+                        completed_updates=completed_updates, seed=seed, device=device,
                     )
-                if spec.phase == "formal" and update == 8_000:
-                    _publish_evaluation(
-                        artifacts=artifacts,
-                        result=evaluate_clevr_model(
-                            model=model, dataset=train_dataset, collate_fn=collate_fn,
-                            method=method, partition="train", device=device,
-                        ),
-                        completed_updates=update,
-                    )
-            if resumed_at_target and spec.phase in ("pilot", "formal"):
-                _publish_evaluation(
-                    artifacts=artifacts,
-                    result=evaluate_clevr_model(
-                        model=model, dataset=dev_dataset, collate_fn=collate_fn,
-                        method=method, partition="dev", device=device,
-                    ),
-                    completed_updates=completed_updates,
-                )
-            if resumed_at_target and spec.phase == "formal":
-                _publish_evaluation(
-                    artifacts=artifacts,
-                    result=evaluate_clevr_model(
-                        model=model, dataset=train_dataset, collate_fn=collate_fn,
-                        method=method, partition="train", device=device,
-                    ),
-                    completed_updates=completed_updates,
-                )
             artifacts.append_event(
                 completed_updates=completed_updates, event="complete",
                 details={"target_updates": spec.target_updates},
@@ -499,6 +719,8 @@ def evaluate_clevr_checkpoint(
         raise CLEVRRunnerError("base-test evaluation is restricted to the formal phase")
     if partition != "base_test":
         raise CLEVRRunnerError("only the base_test partition is supported")
+    _absolute_directory(audit_dir, "audit_dir")
+    audit_artifacts = _audit_artifact_snapshot(audit_dir)
     ordered, specs = _validate_request(
         spec_phase=spec_phase, seed=seed, methods=(method,),
         audit_dir=audit_dir, data_root=data_root, device_index=device_index,
@@ -522,11 +744,14 @@ def evaluate_clevr_checkpoint(
             data_root=data_root, audit_dir=audit_dir, partition="train",
         )
         collate_fn = collate_clevr_questions
+    if _audit_artifact_snapshot(audit_dir) != audit_artifacts:
+        raise CLEVRRunnerError("audit artifacts changed while datasets were constructed")
     device = _setup_clevr_runtime(device_index)
     expanded_config = _expanded_clevr_config(
         device_index=device_index, audit_dir=audit_dir,
         data_root=None if method == "Q-only" else data_root,
         vocab_size=train_dataset.vocab_size, train_size=len(train_dataset),
+        audit_artifacts=audit_artifacts,
     )
     factory = CLEVRPairedInitialization(
         vocab_size=train_dataset.vocab_size, run_seed=seed,
@@ -539,6 +764,11 @@ def evaluate_clevr_checkpoint(
     completed_updates = 0
     primary: BaseException | None = None
     try:
+        checkpoint_update = _checkpoint_update_for_run(
+            checkpoint, artifacts=artifacts, target_updates=spec.target_updates,
+        )
+        if checkpoint_update != spec.target_updates:
+            raise CLEVRRunnerError("formal evaluation requires the final checkpoint")
         artifacts.ensure_common_state(factory.common_state_dict())
         model = factory.build(method).to(device)
         optimizer = build_clevr_adamw(model)
@@ -550,13 +780,13 @@ def evaluate_clevr_checkpoint(
             sampler=sampler, cuda_devices=(device_index,),
         )
         if (metadata.method != method or metadata.run_seed != seed
-                or metadata.completed_updates != 8_000
+                or metadata.completed_updates != checkpoint_update
                 or metadata.dataset_size != len(train_dataset)
                 or metadata.cuda_devices != (device_index,)):
             raise CLEVRRunnerError(
                 "formal evaluation requires the matching update-8000 checkpoint"
             )
-        completed_updates = 8_000
+        completed_updates = checkpoint_update
         if method == "Q-only":
             base_test = CLEVRQuestionOnlyDataset(
                 audit_dir=audit_dir, partition="base_test",
@@ -566,6 +796,8 @@ def evaluate_clevr_checkpoint(
             base_test = CLEVRQuestionDataset(
                 data_root=data_root, audit_dir=audit_dir, partition="base_test",
             )
+        if _audit_artifact_snapshot(audit_dir) != audit_artifacts:
+            raise CLEVRRunnerError("audit artifacts changed before base-test evaluation")
         if (base_test.vocab_size != train_dataset.vocab_size or len(base_test) == 0):
             raise CLEVRRunnerError("base-test vocabulary or size is invalid")
         result = evaluate_clevr_model(
