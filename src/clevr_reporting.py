@@ -10,12 +10,13 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import metadata
 from pathlib import Path
 from typing import Any
 
 from src.clevr_partitions import ImageIdentity
+from src.clevr_data_contract import AUDIT_ARTIFACT_NAMES, run_data_contract
 from src.clevr_statistics import (
     CLEVRStatistics,
     METHODS,
@@ -145,10 +146,13 @@ class PartitionCounts:
 @dataclass(frozen=True, slots=True)
 class PredictionSource:
     path: Path
+    run_config_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
             raise ValueError("prediction source path must be a pathlib.Path")
+        if self.run_config_path is not None and not isinstance(self.run_config_path, Path):
+            raise ValueError("run_config_path must be a pathlib.Path or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +163,12 @@ class PredictionEvidence:
     size_bytes: int
     row_count: int
     canonical_path: str
+    run_config_source_path: str | None = None
+    run_config_json: str | None = None
+
+    @property
+    def canonical_run_config_path(self) -> str:
+        return f"predictions/{self.method}_seed_{self.seed}.run_config.json"
 
     def __post_init__(self) -> None:
         if type(self.method) is not str or self.method not in METHODS:
@@ -183,6 +193,11 @@ class PredictionEvidence:
             raise ValueError(
                 "prediction evidence canonical_path does not match method and seed"
             )
+        if self.run_config_json is not None:
+            if (type(self.run_config_json) is not str
+                    or type(self.run_config_source_path) is not str
+                    or not Path(self.run_config_source_path).is_absolute()):
+                raise ValueError("run configuration evidence requires text and absolute source path")
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,9 +233,9 @@ class StatisticsReport:
             )
         if (
             type(self.report_schema_version) is not int
-            or self.report_schema_version != 1
+            or self.report_schema_version != 2
         ):
-            raise ValueError("report_schema_version must be exactly 1")
+            raise ValueError("report_schema_version must be exactly 2")
         if (
             not isinstance(self.audit_sources, tuple)
             or len(self.audit_sources) != 3
@@ -256,6 +271,8 @@ class StatisticsReport:
             )
         if not isinstance(self.statistics, CLEVRStatistics):
             raise ValueError("statistics must be CLEVRStatistics")
+        if any(item.run_config_json is None for item in self.predictions):
+            raise ValueError("paired report requires original run configuration evidence")
         if not isinstance(self.environment, EnvironmentEvidence):
             raise ValueError("environment must be EnvironmentEvidence")
         base_test_count = self.manifest_partition_counts.base_test
@@ -883,12 +900,48 @@ def _validated_prediction_sources(
     return sources
 
 
+def _audit_text_snapshot(audit_dir: Path) -> dict[str, str]:
+    if not isinstance(audit_dir, Path):
+        raise CLEVRReportError("audit_dir must be a pathlib.Path")
+    try:
+        return {name: (audit_dir / name).read_bytes().decode("utf-8")
+                for name in AUDIT_ARTIFACT_NAMES}
+    except (OSError, UnicodeError) as exc:
+        raise CLEVRReportError(f"paired data audit snapshot is unavailable: {exc}") from exc
+
+
+def _load_run_provenance(
+    source: PredictionSource, run: RunPredictions, evidence: PredictionEvidence,
+    expected_audit: dict[str, str],
+) -> tuple[PredictionEvidence, str | None]:
+    path = source.run_config_path
+    if path is None:
+        prediction = source.path
+        if prediction.parent.name == "base_test" and prediction.parent.parent.name == "predictions":
+            path = prediction.parent.parent.parent / "run_config.json"
+        else:
+            path = prediction.with_suffix(".run_config.json")
+    config, _, resolved = _read_json_document(path)
+    try:
+        snapshot, rgb_root = run_data_contract(
+            config, method=run.method, seed=run.seed, phase="formal", target_updates=8000,
+        )
+        if snapshot != expected_audit:
+            different = [name for name in AUDIT_ARTIFACT_NAMES if snapshot[name] != expected_audit[name]]
+            raise ValueError(f"paired data differs from supplied audit: {different}")
+    except ValueError as exc:
+        raise _context_error(resolved, str(exc)) from exc
+    return replace(evidence, run_config_source_path=str(resolved),
+                   run_config_json=json.dumps(config, sort_keys=True, allow_nan=False)), rgb_root
+
+
 def build_statistics_bundle(
     audit_dir: Path,
     prediction_sources: Sequence[PredictionSource],
 ) -> StatisticsBundle:
     """Build one typed report from explicit audit and prediction sources."""
     sources = _validated_prediction_sources(prediction_sources)
+    audit_snapshot = _audit_text_snapshot(audit_dir)
     targets, audit_sources, partition_counts = load_audit_targets(audit_dir)
 
     loaded = tuple(load_prediction_run(source) for source in sources)
@@ -909,9 +962,21 @@ def build_statistics_bundle(
             f"duplicate={duplicates}, missing={missing}"
         )
 
+    paired = []
+    rgb_root = None
+    for source, (run, evidence) in zip(sources, loaded, strict=True):
+        verified, root = _load_run_provenance(source, run, evidence, audit_snapshot)
+        if root is not None:
+            if rgb_root is not None and root != rgb_root:
+                raise CLEVRReportError("paired RGB roots disagree across prediction runs")
+            rgb_root = root
+        paired.append((run, verified))
+    if _audit_text_snapshot(audit_dir) != audit_snapshot:
+        raise CLEVRReportError("paired data audit changed while report was constructed")
+
     by_key = {
         (run.method, run.seed): (run, evidence)
-        for run, evidence in loaded
+        for run, evidence in paired
     }
     runs = tuple(by_key[key][0] for key in expected_keys)
     prediction_evidence = tuple(by_key[key][1] for key in expected_keys)
@@ -922,7 +987,7 @@ def build_statistics_bundle(
 
     report = StatisticsReport(
         protocol_version=PROTOCOL_VERSION,
-        report_schema_version=1,
+        report_schema_version=2,
         audit_sources=audit_sources,
         targets_path="targets.jsonl",
         manifest_partition_counts=partition_counts,
@@ -963,6 +1028,8 @@ def _prediction_evidence_payload(
         "size_bytes": evidence.size_bytes,
         "row_count": evidence.row_count,
         "canonical_path": evidence.canonical_path,
+        "run_config_source_path": evidence.run_config_source_path,
+        "canonical_run_config_path": evidence.canonical_run_config_path,
     }
 
 
@@ -1346,6 +1413,10 @@ def publish_statistics_bundle(
             bundle.report.predictions,
             strict=True,
         ):
+            _write_json_document(
+                staging_dir / evidence.canonical_run_config_path,
+                json.loads(evidence.run_config_json),
+            )
             _write_json_lines(
                 staging_dir / evidence.canonical_path,
                 tuple(

@@ -412,6 +412,17 @@ _FORMAL_RUN_KEYS = (
 )
 
 
+def _write_run_provenance(audit_dir, prediction_path, method, seed):
+    names = ("selected_questions.jsonl", "vocabulary.json", "audit_report.json", "image_partitions.json")
+    config = {
+        "protocol_version": "PUB-R1.1", "phase": "formal", "method": method,
+        "seed": seed, "target_updates": 8000,
+        "data": {"data_root": None if method == "Q-only" else "/explicit/rgb",
+                 "audit_artifacts": {name: (audit_dir / name).read_bytes().decode() for name in names}},
+    }
+    prediction_path.with_suffix(".run_config.json").write_text(json.dumps(config))
+
+
 class AuditBundleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -1217,11 +1228,13 @@ class StatisticsBundleTests(unittest.TestCase):
         for method, seed in _FORMAL_RUN_KEYS:
             path = self.prediction_dir / f"input-{method}-{seed}.jsonl"
             self._write_prediction_file(path, method, seed)
+            _write_run_provenance(self.audit_dir, path, method, seed)
             source = PredictionSource(path)
             self.sources.append(source)
             self.source_by_key[(method, seed)] = source
 
     def _write_audit_bundle(self) -> None:
+        (self.audit_dir / "vocabulary.json").write_text('{"tokens":["red"]}\n')
         (self.audit_dir / "image_partitions.json").write_text(
             json.dumps(_IMAGE_PARTITIONS, indent=2) + "\n", encoding="utf-8"
         )
@@ -1233,6 +1246,8 @@ class StatisticsBundleTests(unittest.TestCase):
             json.dumps(_REPORTING_AUDIT_REPORT, indent=2) + "\n",
             encoding="utf-8",
         )
+        for (method, seed), source in getattr(self, "source_by_key", {}).items():
+            _write_run_provenance(self.audit_dir, source.path, method, seed)
 
     @staticmethod
     def _write_prediction_file(path: Path, method: str, seed: int) -> None:
@@ -1260,7 +1275,7 @@ class StatisticsBundleTests(unittest.TestCase):
         report = bundle.report
 
         self.assertEqual(report.protocol_version, "PUB-R1.1")
-        self.assertEqual(report.report_schema_version, 1)
+        self.assertEqual(report.report_schema_version, 2)
         self.assertEqual(report.targets_path, "targets.jsonl")
         self.assertEqual(
             report.manifest_partition_counts,
@@ -1456,7 +1471,7 @@ class StatisticsBundleTests(unittest.TestCase):
         invalid_reports = (
             {"protocol_version": "PUB-R1.0"},
             {"protocol_version": True},
-            {"report_schema_version": 2},
+            {"report_schema_version": 1},
             {"report_schema_version": True},
             {"audit_sources": list(report.audit_sources)},
             {"audit_sources": report.audit_sources[:2]},
@@ -1563,7 +1578,7 @@ class StatisticsBundleTests(unittest.TestCase):
                 runs=second.runs,
             )
 
-    def test_reordering_all_three_inputs_preserves_bundle_and_payload(self) -> None:
+    def test_reordering_inputs_preserves_metrics_but_records_new_provenance(self) -> None:
         # Mutation caught: depending on manifest, source argument, or row order.
         first = self._build()
 
@@ -1579,7 +1594,9 @@ class StatisticsBundleTests(unittest.TestCase):
         second = self._build()
         self.assertEqual(second.targets, first.targets)
         self.assertEqual(second.runs, first.runs)
-        self.assertEqual(second.report, first.report)
+        self.assertEqual(second.report.statistics, first.report.statistics)
+        self.assertNotEqual(second.report.predictions[0].run_config_json,
+                            first.report.predictions[0].run_config_json)
         self.assertEqual(
             statistics_report_payload(second.report),
             statistics_report_payload(first.report),
@@ -1680,6 +1697,7 @@ class PublicationTests(unittest.TestCase):
         *,
         reverse_rows: bool,
     ) -> None:
+        (audit_dir / "vocabulary.json").write_text('{"tokens":["red"]}\n')
         manifest_rows = copy.deepcopy(list(_REPORTING_MANIFEST_ROWS))
         prediction_rows = copy.deepcopy(list(_BALANCED_PREDICTION_ROWS))
         if reverse_rows:
@@ -1713,6 +1731,7 @@ class PublicationTests(unittest.TestCase):
                 "".join(json.dumps(row) + "\n" for row in rows),
                 encoding="utf-8",
             )
+            _write_run_provenance(audit_dir, prediction_dir / f"input-{method}-{seed}.jsonl", method, seed)
 
     @staticmethod
     def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1777,11 +1796,12 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in prediction_dir.iterdir()},
             {
-                f"{method}_seed_{seed}.jsonl"
+                f"{method}_seed_{seed}{suffix}"
                 for method, seed in _FORMAL_RUN_KEYS
+                for suffix in (".jsonl", ".run_config.json")
             },
         )
-        for path in prediction_dir.iterdir():
+        for path in prediction_dir.glob("*.jsonl"):
             self.assertEqual(len(self._strict_jsonl(path)), 8)
         report = self._strict_json(
             (output_dir / "statistics_report.json").read_text(encoding="utf-8")
@@ -1832,6 +1852,7 @@ class PublicationTests(unittest.TestCase):
             source["path"] = f"/<audit>/{Path(source['path']).name}"
         for source in payload["predictions"]:  # type: ignore[union-attr]
             source["source_path"] = f"/<prediction>/{Path(source['source_path']).name}"
+            source["run_config_source_path"] = f"/<prediction>/{Path(source['run_config_source_path']).name}"
 
     def test_cli_publishes_complete_recomputable_canonical_bundle(self) -> None:
         # Mutation caught: incomplete/noncanonical output or CLI/input-order coupling.
@@ -1854,7 +1875,8 @@ class PublicationTests(unittest.TestCase):
         )
         prediction_output_dir = output_dir / "predictions"
         expected_prediction_names = {
-            f"{method}_seed_{seed}.jsonl" for method, seed in _FORMAL_RUN_KEYS
+            f"{method}_seed_{seed}{suffix}" for method, seed in _FORMAL_RUN_KEYS
+            for suffix in (".jsonl", ".run_config.json")
         }
         self.assertTrue(prediction_output_dir.is_dir())
         self.assertEqual(
@@ -2138,6 +2160,13 @@ class PublicationTests(unittest.TestCase):
             (reversed_output / "targets.jsonl").read_bytes(),
         )
         for name in expected_prediction_names:
+            if name.endswith(".run_config.json"):
+                first_config = json.loads((prediction_output_dir / name).read_bytes())
+                second_config = json.loads((reversed_output / "predictions" / name).read_bytes())
+                for config, audit in ((first_config, self.audit_dir), (second_config, reversed_audit)):
+                    for filename, text in config["data"]["audit_artifacts"].items():
+                        self.assertEqual(text, (audit / filename).read_bytes().decode())
+                continue
             self.assertEqual(
                 (prediction_output_dir / name).read_bytes(),
                 (reversed_output / "predictions" / name).read_bytes(),

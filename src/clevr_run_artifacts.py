@@ -20,6 +20,8 @@ from typing import BinaryIO
 import numpy as np
 import torch
 
+from src.clevr_data_contract import run_data_contract
+
 PROTOCOL_VERSION = "PUB-R1.1"
 _PHASES = {
     "smoke": ((9001,), 1, "engineering-only"),
@@ -344,6 +346,7 @@ class CLEVRRunArtifacts:
         result = cls()
         result.run_dir = run_dir
         result.spec = spec
+        result._config = json.loads(serialized)
         result._lock = threading.Lock()
         result._closed = False
         result._journal_failed = False
@@ -417,6 +420,56 @@ class CLEVRRunArtifacts:
         if path.exists() or path.is_symlink():
             raise CLEVRRunArtifactError("prediction target already exists")
         return path
+
+    def ensure_data_contract(self) -> Path:
+        """Bind this phase's arms/seeds to literal audit texts and one RGB root."""
+        self._require_open()
+        phase_dir = self.run_dir.parent.parent
+        try:
+            snapshot, rgb_root = run_data_contract(
+                self._config, method=self.spec.method, seed=self.spec.seed,
+                phase=self.spec.phase, target_updates=self.spec.target_updates,
+            )
+            # Also check older run configs before establishing a shared contract.
+            # This prevents silently blessing a new arm beside incompatible evidence.
+            for path in phase_dir.glob("seed_*/*/run_config.json"):
+                _directory(path.parent, create=False)
+                _identity(path)
+                config = json.loads(path.read_bytes(), object_pairs_hook=_json_pairs)
+                spec = CLEVRRunSpec(self.spec.phase, path.parent.name,
+                                    int(path.parent.parent.name.removeprefix("seed_")))
+                other, other_root = run_data_contract(
+                    config, method=spec.method, seed=spec.seed, phase=spec.phase,
+                    target_updates=spec.target_updates,
+                )
+                if other != snapshot:
+                    raise CLEVRRunArtifactError(f"paired data disagrees with {path}")
+                if rgb_root is not None and other_root is not None and rgb_root != other_root:
+                    raise CLEVRRunArtifactError(f"paired RGB root disagrees with {path}")
+            payload = {"protocol_version": PROTOCOL_VERSION, "pairing_schema_version": 1,
+                       "audit_artifacts": snapshot}
+            path = phase_dir / "paired_data.json"
+            self._ensure_shared_json(path, payload, "paired data")
+            if rgb_root is not None:
+                self._ensure_shared_json(phase_dir / "rgb_data_root.json",
+                                         {"data_root": rgb_root}, "paired RGB root")
+            return path
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, CLEVRRunArtifactError):
+                raise
+            raise CLEVRRunArtifactError(f"paired data validation failed: {exc}") from exc
+
+    @staticmethod
+    def _ensure_shared_json(path: Path, payload: object, description: str) -> None:
+        expected = _json_bytes(payload) + b"\n"
+        if not path.exists() and not path.is_symlink():
+            try:
+                _publish(path, lambda output: _write_bytes(output, expected))
+            except _TargetExists:
+                pass
+        _identity(path)
+        if path.read_bytes() != expected:
+            raise CLEVRRunArtifactError(f"{description} disagrees with {path}")
 
     def ensure_common_state(self, common_state: Mapping[str, torch.Tensor]) -> Path:
         self._require_open()

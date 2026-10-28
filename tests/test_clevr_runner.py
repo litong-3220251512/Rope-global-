@@ -549,6 +549,7 @@ class ProductionPreflightTests(unittest.TestCase):
         self.audit_contents = {
             "selected_questions.jsonl": '{"question_index":1}\n',
             "vocabulary.json": '{"token_to_index":{"x":4}}\n',
+            "image_partitions.json": "partitions\n",
             "audit_report.json": '{"protocol_version":"PUB-R1.1"}\n',
         }
         for name, content in self.audit_contents.items():
@@ -832,6 +833,9 @@ class _OrchestrationArtifacts:
         cls.trace.append(("open", spec.method, resume))
         return artifact
 
+    def ensure_data_contract(self):
+        self.trace.append(("ensure-data", self.spec.method))
+
     def ensure_common_state(self, state):
         snapshot = OrderedDict((key, value.clone()) for key, value in state.items())
         self.trace.append(("ensure-common", self.spec.method, snapshot))
@@ -886,6 +890,7 @@ class ProductionTrainingTests(unittest.TestCase):
         self.audit_contents = {
             "selected_questions.jsonl": "alpha\n",
             "vocabulary.json": "vocab\n",
+            "image_partitions.json": "partitions\n",
             "audit_report.json": "audit\n",
         }
         for name, content in self.audit_contents.items():
@@ -1065,6 +1070,7 @@ class ProductionTrainingTests(unittest.TestCase):
             update = next(i for i, event in enumerate(trace)
                           if event[:4] == ("event", method, 1, "update"))
             final_checkpoint = trace.index(("checkpoint-path", method, 1))
+            self.assertLess(trace.index(("ensure-data", method)), ensure)
             self.assertLess(ensure, update)
             self.assertLess(build, update)
             self.assertLess(update, final_checkpoint)
@@ -1452,6 +1458,22 @@ class ProductionTrainingTests(unittest.TestCase):
         load.assert_not_called()
         update.assert_not_called()
 
+    def test_fresh_arm_rejects_changed_vocabulary_before_checkpoint_or_update(self):
+        with patch.object(self.runner.torch.cuda, "get_device_name", return_value="GPU"), \
+                self._patches(phase="smoke", methods=("G",), seed=9001,
+                              use_real_config=True, artifact_class=CLEVRRunArtifacts):
+            self._train(phase="smoke", seed=9001, methods=("G",), resumes={})
+        (self.audit / "vocabulary.json").write_text("other\n")
+        update = Mock(side_effect=AssertionError("unpaired arm must not update"))
+        saved_count = len(self.saved)
+        with patch.object(self.runner.torch.cuda, "get_device_name", return_value="GPU"), \
+                self._patches(phase="smoke", methods=("B",), seed=9001, update=update,
+                              use_real_config=True, artifact_class=CLEVRRunArtifacts):
+            with self.assertRaisesRegex(CLEVRRunArtifactError, "paired data"):
+                self._train(phase="smoke", seed=9001, methods=("B",), resumes={})
+        update.assert_not_called()
+        self.assertEqual(len(self.saved), saved_count)
+
     def test_resume_mapping_and_metadata_mismatch_fail_before_update(self):
         checkpoint = self._checkpoint(
             phase="pilot", seed=9001, method="G", update=799,
@@ -1515,6 +1537,7 @@ class ProductionFormalEvaluationTests(unittest.TestCase):
         for name, content in {
             "selected_questions.jsonl": "questions\n",
             "vocabulary.json": "vocabulary\n",
+            "image_partitions.json": "partitions\n",
             "audit_report.json": "report\n",
         }.items():
             (self.audit / name).write_text(content, encoding="utf-8")

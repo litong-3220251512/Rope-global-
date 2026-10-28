@@ -35,6 +35,7 @@ from src.clevr_dataset import (
     collate_clevr_questions,
 )
 from src.clevr_checkpoint import load_clevr_checkpoint, save_clevr_checkpoint
+from src.clevr_data_contract import AUDIT_ARTIFACT_NAMES as _AUDIT_ARTIFACT_NAMES
 from src.clevr_run_artifacts import (
     CLEVRPredictionRecord,
     CLEVRRunArtifacts,
@@ -233,11 +234,6 @@ def _require_float32_model(model: nn.Module, device: torch.device) -> None:
                     f"model persistent floating buffer must be float32 on {device}: "
                     f"{qualified}"
                 )
-
-
-_AUDIT_ARTIFACT_NAMES = (
-    "selected_questions.jsonl", "vocabulary.json", "audit_report.json",
-)
 
 
 def _read_regular_utf8(path: Path, description: str) -> str:
@@ -630,6 +626,7 @@ def train_clevr_seed(
         completed_updates = 0
         primary: BaseException | None = None
         try:
+            artifacts.ensure_data_contract()
             checkpoint_update = (None if resume_path is None else
                                  _checkpoint_update_for_run(
                                      resume_path, artifacts=artifacts,
@@ -798,6 +795,7 @@ def evaluate_clevr_checkpoint(
     completed_updates = 0
     primary: BaseException | None = None
     try:
+        artifacts.ensure_data_contract()
         checkpoint_update = _checkpoint_update_for_run(
             checkpoint, artifacts=artifacts, target_updates=spec.target_updates,
         )
