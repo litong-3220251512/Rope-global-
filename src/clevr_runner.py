@@ -7,7 +7,7 @@ checkpoint; only a returned result denotes a successfully committed update.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import os
@@ -16,6 +16,7 @@ import platform
 import random
 import re
 import stat
+from time import perf_counter
 
 import numpy as np
 import PIL
@@ -42,6 +43,7 @@ from src.clevr_run_artifacts import (
     PROTOCOL_VERSION,
 )
 from src.clevr_sampling import CLEVRIndexStream
+from src.clevr_resources import CLEVRResourceMeter, CLEVRResourceSummary, CLEVRResourceUsage
 from src.clevr_training import (
     CLEVRPairedInitialization,
     build_clevr_adamw,
@@ -61,6 +63,7 @@ class CLEVRUpdateResult:
     loss_mean: float
     gradient_norm: float
     learning_rate: float
+    resources: CLEVRResourceUsage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +75,7 @@ class CLEVREvaluationResult:
     cross_entropy: float
     accuracy: float
     rows: tuple[CLEVRPredictionRecord, ...]
+    resources: CLEVRResourceUsage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +409,7 @@ def _append_evaluation_event(
             "cross_entropy": result.cross_entropy,
             "accuracy": result.accuracy,
             "predictions": str(path),
+            "resources": None if result.resources is None else result.resources.as_dict(),
         },
     )
 
@@ -511,6 +516,7 @@ def _record_boundary_evaluation(
     *, artifacts: CLEVRRunArtifacts, model: nn.Module, dataset: object,
     collate_fn: Callable[..., Mapping[str, Tensor]], method: str, partition: str,
     completed_updates: int, seed: int, device: torch.device,
+    resource_summary: CLEVRResourceSummary | None = None,
 ) -> None:
     path = _prediction_path(
         artifacts, partition=partition, completed_updates=completed_updates,
@@ -519,6 +525,8 @@ def _record_boundary_evaluation(
         result = _read_boundary_evaluation(
             path=path, dataset=dataset, partition=partition, method=method, seed=seed,
         )
+        if resource_summary is not None:
+            resource_summary.reused_evaluations += 1
         _append_evaluation_event(
             artifacts=artifacts, result=result, completed_updates=completed_updates,
             path=path,
@@ -528,6 +536,8 @@ def _record_boundary_evaluation(
         model=model, dataset=dataset, collate_fn=collate_fn,
         method=method, partition=partition, device=device,
     )
+    if resource_summary is not None:
+        resource_summary.add("evaluation", result.resources)
     _publish_evaluation(
         artifacts=artifacts, result=result, completed_updates=completed_updates,
     )
@@ -538,6 +548,7 @@ def _complete_training_boundary(
     train_dataset: object, dev_dataset: object,
     collate_fn: Callable[..., Mapping[str, Tensor]], method: str,
     completed_updates: int, seed: int, device: torch.device,
+    resource_summary: CLEVRResourceSummary | None = None,
 ) -> None:
     dev_boundary = (
         (spec.phase == "pilot" and completed_updates == spec.target_updates)
@@ -549,22 +560,26 @@ def _complete_training_boundary(
             artifacts=artifacts, model=model, dataset=dev_dataset,
             collate_fn=collate_fn, method=method, partition="dev",
             completed_updates=completed_updates, seed=seed, device=device,
+            resource_summary=resource_summary,
         )
     if spec.phase == "formal" and completed_updates == spec.target_updates:
         _record_boundary_evaluation(
             artifacts=artifacts, model=model, dataset=train_dataset,
             collate_fn=collate_fn, method=method, partition="train",
             completed_updates=completed_updates, seed=seed, device=device,
+            resource_summary=resource_summary,
         )
 
 
 def _append_failure(
     artifacts: CLEVRRunArtifacts, completed_updates: int, primary: BaseException,
+    resource_summary: CLEVRResourceSummary | None = None,
 ) -> None:
     try:
         artifacts.append_event(
             completed_updates=completed_updates, event="failure",
-            details={"type": type(primary).__name__, "message": str(primary)},
+            details={"type": type(primary).__name__, "message": str(primary),
+                     "resources": None if resource_summary is None else resource_summary.snapshot(succeeded=False)},
         )
     except BaseException as logging_failure:
         primary.add_note(
@@ -585,6 +600,7 @@ def train_clevr_seed(
     resume_checkpoints: Mapping[str, Path],
 ) -> None:
     """Run one explicitly authorized seed, one sequential method arm at a time."""
+    shared_started = perf_counter()
     _explicit_output_root(output_root)
     _absolute_directory(audit_dir, "audit_dir")
     audit_artifacts = _audit_artifact_snapshot(audit_dir)
@@ -600,7 +616,11 @@ def train_clevr_seed(
     factory = CLEVRPairedInitialization(vocab_size=preflight.vocab_size, run_seed=seed)
     common_state = factory.common_state_dict()
     _require_float32_common_state(common_state)
+    shared_setup_seconds = perf_counter() - shared_started
     for method in preflight.methods:
+        resources = CLEVRResourceSummary(
+            shared_setup_seconds=shared_setup_seconds if method == preflight.methods[0] else 0.0,
+        )
         spec = preflight.specs[method]
         resume_path = resumes.get(method)
         train_dataset = preflight.train_datasets[method]
@@ -674,6 +694,7 @@ def train_clevr_seed(
                     train_dataset=train_dataset, dev_dataset=dev_dataset,
                     collate_fn=collate_fn, method=method,
                     completed_updates=completed_updates, seed=seed, device=device,
+                    resource_summary=resources,
                 )
             for update in range(completed_updates + 1, spec.target_updates + 1):
                 result = run_clevr_update(
@@ -682,6 +703,7 @@ def train_clevr_seed(
                     collate_fn=collate_fn, method=method, device=device,
                 )
                 completed_updates = update
+                resources.add("training", result.resources)
                 artifacts.append_event(
                     completed_updates=update, event="update",
                     details={
@@ -691,6 +713,7 @@ def train_clevr_seed(
                         "loss_mean": result.loss_mean,
                         "gradient_norm": result.gradient_norm,
                         "learning_rate": result.learning_rate,
+                        "resources": None if result.resources is None else result.resources.as_dict(),
                     },
                 )
                 checkpoint_boundary = update % 1_000 == 0 or update == spec.target_updates
@@ -706,14 +729,16 @@ def train_clevr_seed(
                         train_dataset=train_dataset, dev_dataset=dev_dataset,
                         collate_fn=collate_fn, method=method,
                         completed_updates=completed_updates, seed=seed, device=device,
+                        resource_summary=resources,
                     )
             artifacts.append_event(
                 completed_updates=completed_updates, event="complete",
-                details={"target_updates": spec.target_updates},
+                details={"target_updates": spec.target_updates,
+                         "resources": resources.snapshot(succeeded=True)},
             )
         except BaseException as exc:
             primary = exc
-            _append_failure(artifacts, completed_updates, exc)
+            _append_failure(artifacts, completed_updates, exc, resources)
             raise
         finally:
             try:
@@ -740,6 +765,7 @@ def evaluate_clevr_checkpoint(
     partition: str = "base_test",
 ) -> Path:
     """Evaluate one explicit formal update-8000 checkpoint on base-test once."""
+    resources = CLEVRResourceSummary()
     _absolute_directory(output_root, "output_root")
     if spec_phase != "formal":
         raise CLEVRRunnerError("base-test evaluation is restricted to the formal phase")
@@ -834,17 +860,19 @@ def evaluate_clevr_checkpoint(
             model=model, dataset=base_test, collate_fn=collate_fn,
             method=method, partition="base_test", device=device,
         )
+        resources.add("evaluation", result.resources)
         path = _publish_evaluation(
             artifacts=artifacts, result=result, completed_updates=8_000,
         )
         artifacts.append_event(
             completed_updates=8_000, event="complete",
-            details={"partition": "base_test", "checkpoint": str(checkpoint)},
+            details={"partition": "base_test", "checkpoint": str(checkpoint),
+                     "resources": resources.snapshot(succeeded=True)},
         )
         return path
     except BaseException as exc:
         primary = exc
-        _append_failure(artifacts, completed_updates, exc)
+        _append_failure(artifacts, completed_updates, exc, resources)
         raise
     finally:
         try:
@@ -932,6 +960,7 @@ def run_clevr_update(
     The caller owns model mode and device placement. No checkpoint, journal,
     retry, or rollback is attempted, even if a dependency raises after mutation.
     """
+    meter = CLEVRResourceMeter(device)
     optimizer.zero_grad(set_to_none=True)
     _require_method(method)
     if len(optimizer.param_groups) != 2:
@@ -954,25 +983,27 @@ def run_clevr_update(
         image, tokens, lengths, labels = _model_batch(
             collate_fn(samples), size=16, method=method, device=device,
         )
-        logits = _logits(model, image, tokens, lengths)
-        loss = F.cross_entropy(logits, labels, reduction="mean")
-        loss_sum += _finite_scalar(loss, "loss") * 16
-        (loss / 8).backward()
+        with meter.compute():
+            logits = _logits(model, image, tokens, lengths)
+            loss = F.cross_entropy(logits, labels, reduction="mean")
+            loss_sum += _finite_scalar(loss, "loss") * 16
+            (loss / 8).backward()
     if not math.isfinite(loss_sum):
         raise CLEVRRunnerError("accumulated loss must be finite")
-    try:
-        norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-    except RuntimeError as exc:
-        raise CLEVRRunnerError("gradient clipping failed") from exc
-    gradient_norm = _finite_scalar(norm, "gradient norm")
-    # Validate and construct all metadata before the irreversible step sequence.
-    result = CLEVRUpdateResult(indices, question_indices, loss_sum, loss_sum / 128,
-                               gradient_norm, learning_rate)
-    optimizer.step()
-    scheduler.step()
-    optimizer.zero_grad(set_to_none=True)
+    with meter.compute():
+        try:
+            norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+        except RuntimeError as exc:
+            raise CLEVRRunnerError("gradient clipping failed") from exc
+        gradient_norm = _finite_scalar(norm, "gradient norm")
+        # Validate and construct all metadata before the irreversible step sequence.
+        result = CLEVRUpdateResult(indices, question_indices, loss_sum, loss_sum / 128,
+                                   gradient_norm, learning_rate)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
     sampler.commit(indices)
-    return result
+    return replace(result, resources=meter.finish(128))
 
 
 def evaluate_clevr_model(
@@ -989,6 +1020,7 @@ def evaluate_clevr_model(
     This seam never publishes files or chooses checkpoints. The caller must
     separately authorize and assemble any production evaluation.
     """
+    meter = CLEVRResourceMeter(device)
     was_training = model.training
     try:
         model.eval()
@@ -1016,10 +1048,11 @@ def evaluate_clevr_model(
                 image, tokens, lengths, labels = _model_batch(
                     collate_fn(samples), size=len(indices), method=method, device=device,
                 )
-                logits = _logits(model, image, tokens, lengths)
-                loss = F.cross_entropy(logits, labels, reduction="sum")
-                loss_sum += _finite_scalar(loss, "evaluation loss")
-                correct += int((logits.argmax(dim=1) == labels).sum().item())
+                with meter.compute():
+                    logits = _logits(model, image, tokens, lengths)
+                    loss = F.cross_entropy(logits, labels, reduction="sum")
+                    loss_sum += _finite_scalar(loss, "evaluation loss")
+                    correct += int((logits.argmax(dim=1) == labels).sum().item())
                 cpu_logits = logits.detach().cpu().tolist()
                 cpu_labels = labels.detach().cpu().tolist()
                 rows.extend(CLEVRPredictionRecord(question_index, label, tuple(values))
@@ -1029,6 +1062,7 @@ def evaluate_clevr_model(
         return CLEVREvaluationResult(
             partition, size, correct, loss_sum, loss_sum / size, correct / size,
             tuple(sorted(rows, key=lambda row: row.question_index)),
+            resources=meter.finish(size),
         )
     finally:
         model.train(was_training)
