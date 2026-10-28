@@ -189,11 +189,11 @@ def build_clevr_adamw(model: CLEVRQuestionAnswerer) -> AdamW:
         ("decay", _WEIGHT_DECAY),
         ("no_decay", 0.0),
     ):
-        names = tuple(
+        names = [
             name
             for name, parameter in named_parameters.items()
             if decay_by_id[id(parameter)] == weight_decay
-        )
+        ]
         parameters = [named_parameters[name] for name in names]
         if not parameters:
             raise CLEVRTrainingConfigurationError(
