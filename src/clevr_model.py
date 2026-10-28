@@ -92,7 +92,7 @@ class CLEVRQuestionEncoder(nn.Module):
 
 
 class CLEVRQuestionAnswerer(nn.Module):
-    """Frozen PUB-R1.1 RGB/question architecture with G, B, or M10 RoPE."""
+    """Frozen PUB-R1.1 answerer with G, B, M10, or Q-only input."""
 
     def __init__(
         self,
@@ -102,8 +102,8 @@ class CLEVRQuestionAnswerer(nn.Module):
         m10_seed: int | None = None,
     ) -> None:
         super().__init__()
-        if mode not in {"G", "B", "M10"}:
-            raise ValueError("mode must be G, B, or M10")
+        if mode not in {"G", "B", "M10", "Q-only"}:
+            raise ValueError("mode must be G, B, M10, or Q-only")
         if mode == "M10":
             if m10_seed is None:
                 raise ValueError("M10 requires m10_seed")
@@ -115,7 +115,7 @@ class CLEVRQuestionAnswerer(nn.Module):
             raise ValueError("m10_seed is only valid for M10")
 
         classifier = RoPEClassifier(
-            mode="G" if mode == "M10" else mode,
+            mode="G" if mode in {"M10", "Q-only"} else mode,
             fixed_lambda=1.0,
             image_size=224,
             patch_size=16,
@@ -156,34 +156,53 @@ class CLEVRQuestionAnswerer(nn.Module):
 
     def forward_tokens(
         self,
-        image: Tensor,
+        image: Tensor | None,
         question_tokens: Tensor,
         question_length: Tensor,
         *,
         lam: Lambda | None = None,
     ) -> Tensor:
         """Return all normalized CLS and patch tokens."""
-        self._validate_batch(image, question_tokens, question_length)
-        if self.mode == "M10" and lam is not None:
-            raise ValueError("lam is not valid for M10")
-        patches = self.backbone.patch_embed(image)
-        question = self.question_encoder(question_tokens, question_length)
-        cls = self.backbone.cls_token.expand(image.shape[0], -1, -1)
+        if self.mode == "Q-only":
+            if image is not None:
+                raise ValueError("image must be None for Q-only")
+            if lam is not None:
+                raise ValueError("lam is not valid for Q-only")
+            question = self.question_encoder(question_tokens, question_length)
+            if question.shape[0] == 0:
+                raise ValueError("question batch must not be empty")
+            batch_size = question.shape[0]
+        else:
+            self._validate_batch(image, question_tokens, question_length)
+            if self.mode == "M10" and lam is not None:
+                raise ValueError("lam is not valid for M10")
+            patches = self.backbone.patch_embed(image)
+            question = self.question_encoder(question_tokens, question_length)
+            batch_size = image.shape[0]
+        cls = self.backbone.cls_token.expand(batch_size, -1, -1)
         cls = cls + question.unsqueeze(1)
+        if self.mode == "Q-only":
+            patches = cls.new_zeros(
+                (
+                    batch_size,
+                    self.backbone.patch_embed.num_patches,
+                    self.backbone.embed_dim,
+                )
+            )
         tokens = torch.cat((cls, patches), dim=1)
         if self.mode == "M10":
             phases = self.position()
             for block_index, block in enumerate(self.backbone.blocks):
                 tokens = block(tokens, freqs_cis=phases[block_index])
         else:
-            phases = self.position(14, 14, lam=lam, device=image.device)
+            phases = self.position(14, 14, lam=lam, device=tokens.device)
             for block in self.backbone.blocks:
                 tokens = block(tokens, freqs_cis=phases)
         return self.backbone.norm(tokens)
 
     def forward_features(
         self,
-        image: Tensor,
+        image: Tensor | None,
         question_tokens: Tensor,
         question_length: Tensor,
         *,
@@ -195,7 +214,7 @@ class CLEVRQuestionAnswerer(nn.Module):
 
     def forward(
         self,
-        image: Tensor,
+        image: Tensor | None,
         question_tokens: Tensor,
         question_length: Tensor,
         *,
