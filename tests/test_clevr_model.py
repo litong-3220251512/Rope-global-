@@ -2,13 +2,20 @@
 
 from inspect import signature
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
+from torch.func import functional_call
 
-from src.clevr_model import CLEVRQuestionAnswerer, CLEVRQuestionEncoder
+from src.clevr_model import (
+    CLEVRMixedPosition,
+    CLEVRQuestionAnswerer,
+    CLEVRQuestionEncoder,
+)
 from src.local_rope import build_axial_cis
 from src.segmentation import differentiable_attention
+from models.vit_rope import init_random_2d_freqs
 
 
 def _valid_answerer_inputs(batch_size=1):
@@ -179,6 +186,463 @@ class CLEVRQuestionEncoderTests(unittest.TestCase):
                     self.assertIs(type(error), exception)
                 else:
                     self.fail(f"{name} was not rejected")
+
+
+class CLEVRMixedPositionTests(unittest.TestCase):
+    def test_rejects_non_integer_or_negative_seed(self):
+        for seed in (True, 1.0, "1"):
+            with self.subTest(seed=seed), self.assertRaises(TypeError):
+                CLEVRMixedPosition(seed=seed)
+        with self.assertRaises(ValueError):
+            CLEVRMixedPosition(seed=-1)
+
+    def test_initialization_does_not_seed_accelerator_generators(self):
+        def unexpected_seed(_seed):
+            raise AssertionError("M10 initialization touched an accelerator RNG")
+
+        with (
+            patch.object(torch.cuda, "manual_seed_all", side_effect=unexpected_seed),
+            patch.object(torch.mps, "manual_seed", side_effect=unexpected_seed),
+            patch.object(torch.xpu, "manual_seed_all", side_effect=unexpected_seed),
+        ):
+            position = CLEVRMixedPosition(seed=20007)
+
+        self.assertEqual(tuple(position.freqs.shape), (2, 6, 96))
+
+    def test_matches_official_flattened_layout_and_base_ten_geometry(self):
+        seed = 20007
+        position = CLEVRMixedPosition(seed=seed)
+
+        self.assertEqual(tuple(position.freqs.shape), (2, 6, 96))
+        self.assertEqual(
+            sum(parameter.numel() for parameter in position.parameters()),
+            1152,
+        )
+        self.assertTrue(position.freqs.requires_grad)
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            expected = torch.stack(
+                [
+                    init_random_2d_freqs(
+                        dim=64, num_heads=3, theta=10.0
+                    )
+                    for _ in range(6)
+                ],
+                dim=1,
+            ).view(2, 6, 96)
+        self.assertTrue(torch.equal(position.freqs, expected))
+
+        semantic = position.freqs.detach().view(2, 6, 3, 32)
+        magnitudes = torch.sqrt(semantic[0].square() + semantic[1].square())
+        expected_magnitudes = 10.0 ** (
+            -torch.arange(16, dtype=magnitudes.dtype) / 16.0
+        )
+        self.assertTrue(
+            torch.allclose(
+                magnitudes[..., :16],
+                expected_magnitudes.expand(6, 3, -1),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                magnitudes[..., 16:],
+                expected_magnitudes.expand(6, 3, -1),
+            )
+        )
+        dot_products = (
+            semantic[0, ..., :16] * semantic[0, ..., 16:]
+            + semantic[1, ..., :16] * semantic[1, ..., 16:]
+        )
+        torch.testing.assert_close(
+            dot_products,
+            torch.zeros_like(dot_products),
+            rtol=1.3e-6,
+            atol=1e-5,
+        )
+
+    def test_forward_matches_hand_computed_phases_and_relative_invariants(self):
+        position = CLEVRMixedPosition(seed=20007)
+
+        phases = position()
+        self.assertEqual(tuple(phases.shape), (6, 3, 196, 32))
+        self.assertIsNot(phases, position())
+        torch.testing.assert_close(
+            phases.abs(),
+            torch.ones_like(phases.abs()),
+            rtol=1.3e-6,
+            atol=1e-5,
+        )
+        self.assertTrue(
+            torch.equal(
+                position.freqs_t_x[:16],
+                torch.tensor(
+                    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0, 1),
+                    dtype=torch.float32,
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                position.freqs_t_y[:16],
+                torch.tensor(
+                    (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1),
+                    dtype=torch.float32,
+                ),
+            )
+        )
+
+        semantic = position.freqs.detach().view(2, 6, 3, 32)
+        selected_angle = 2.0 * semantic[0, 0, 0] + 3.0 * semantic[1, 0, 0]
+        expected = torch.complex(selected_angle.cos(), selected_angle.sin())
+        torch.testing.assert_close(
+            phases[0, 0, 44], expected, rtol=1.3e-6, atol=1e-5
+        )
+
+        same_patch = phases[0, 0, 44] * phases[0, 0, 44].conj()
+        torch.testing.assert_close(
+            same_patch,
+            torch.ones_like(same_patch),
+            rtol=1.3e-6,
+            atol=1e-5,
+        )
+        relative = phases[0, 0, 44] * phases[0, 0, 15].conj()
+        translated_relative = phases[0, 0, 118] * phases[0, 0, 89].conj()
+        torch.testing.assert_close(
+            relative, translated_relative, rtol=1.3e-6, atol=1e-5
+        )
+
+    def test_float64_frequency_derivative_passes_gradcheck(self):
+        position = CLEVRMixedPosition(seed=20007).double()
+        base_frequencies = position.freqs.detach().clone()
+        mask = torch.zeros_like(base_frequencies)
+        mask[0, 0, 0] = 1.0
+        delta = torch.zeros((), dtype=torch.float64, requires_grad=True)
+
+        def selected_phase(real_delta):
+            phases = functional_call(
+                position,
+                {"freqs": base_frequencies + real_delta * mask},
+                (),
+            )
+            return torch.view_as_real(phases[0, 0, (1, 44), 0])
+
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                selected_phase,
+                (delta,),
+                eps=1e-6,
+                rtol=1e-7,
+                atol=1e-7,
+            )
+        )
+
+
+class CLEVRQuestionAnswererM10Tests(unittest.TestCase):
+    def test_requires_a_dedicated_seed_only_for_m10_and_rejects_lambda(self):
+        with self.assertRaises(ValueError):
+            CLEVRQuestionAnswerer(vocab_size=8, mode="M10")
+        for seed in (True, 1.0, "1"):
+            with self.subTest(seed=seed), self.assertRaises(TypeError):
+                CLEVRQuestionAnswerer(
+                    vocab_size=8, mode="M10", m10_seed=seed
+                )
+        with self.assertRaises(ValueError):
+            CLEVRQuestionAnswerer(vocab_size=8, mode="M10", m10_seed=-1)
+        for mode in ("G", "B"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                CLEVRQuestionAnswerer(
+                    vocab_size=8, mode=mode, m10_seed=20007
+                )
+
+        model = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="M10", m10_seed=20007
+        ).eval()
+        self.assertIsInstance(model.position, CLEVRMixedPosition)
+        image, question_tokens, question_length = _valid_answerer_inputs()
+        with self.assertRaises(ValueError):
+            model(
+                image,
+                question_tokens,
+                question_length,
+                lam=0.0,
+            )
+
+    def test_common_state_and_global_rng_match_g_at_equal_common_seed(self):
+        common_seed = 20261025
+        torch.manual_seed(common_seed)
+        global_model = CLEVRQuestionAnswerer(vocab_size=8, mode="G")
+        next_after_global = torch.rand(8)
+
+        torch.manual_seed(common_seed)
+        mixed_model = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="M10", m10_seed=20007
+        )
+        next_after_mixed = torch.rand(8)
+
+        global_state = {
+            name: value
+            for name, value in global_model.state_dict().items()
+            if not name.startswith("position.")
+        }
+        mixed_state = {
+            name: value
+            for name, value in mixed_model.state_dict().items()
+            if not name.startswith("position.")
+        }
+        self.assertEqual(tuple(global_state), tuple(mixed_state))
+        for name, global_value in global_state.items():
+            with self.subTest(state=name):
+                mixed_value = mixed_state[name]
+                self.assertEqual(global_value.shape, mixed_value.shape)
+                self.assertEqual(global_value.dtype, mixed_value.dtype)
+                self.assertTrue(torch.equal(global_value, mixed_value))
+        self.assertTrue(torch.equal(next_after_global, next_after_mixed))
+
+    def test_routes_each_live_mixed_phase_to_its_matching_block(self):
+        torch.manual_seed(20261025)
+        model = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="M10", m10_seed=20007
+        ).eval()
+        image, question_tokens, question_length = _valid_answerer_inputs()
+        captured = []
+
+        def capture_phase(_module, _args, kwargs):
+            captured.append(kwargs["freqs_cis"])
+
+        handles = [
+            block.register_forward_pre_hook(capture_phase, with_kwargs=True)
+            for block in model.backbone.blocks
+        ]
+        try:
+            with torch.no_grad():
+                expected = model.position()
+                model.forward_tokens(image, question_tokens, question_length)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertEqual(len(captured), 6)
+        for block_index, block_phase in enumerate(captured):
+            with self.subTest(block=block_index):
+                self.assertEqual(tuple(block_phase.shape), (3, 196, 32))
+                self.assertTrue(
+                    torch.equal(block_phase, expected[block_index])
+                )
+        self.assertFalse(torch.equal(captured[0], captured[1]))
+
+    def test_answer_loss_reaches_q_k_and_frequencies_across_an_update(self):
+        torch.manual_seed(20261025)
+        model = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="M10", m10_seed=20007
+        )
+        image, question_tokens, question_length = _valid_answerer_inputs()
+        captured = []
+
+        def capture_first_block_phase(_module, _args, kwargs):
+            captured.append(kwargs["freqs_cis"])
+
+        handle = model.backbone.blocks[0].register_forward_pre_hook(
+            capture_first_block_phase, with_kwargs=True
+        )
+        try:
+            logits = model(image, question_tokens, question_length)
+            loss = nn.functional.cross_entropy(
+                logits, torch.tensor((1,), dtype=torch.int64)
+            )
+            loss.backward()
+
+            frequency_gradient = model.position.freqs.grad.detach().clone()
+            self.assertTrue(torch.isfinite(frequency_gradient).all())
+            self.assertGreater(frequency_gradient.abs().sum().item(), 0.0)
+            for block_index, block in enumerate(model.backbone.blocks):
+                gradient = block.attn.qkv.weight.grad
+                self.assertIsNotNone(gradient)
+                for projection, rows in (
+                    ("q", slice(0, 192)),
+                    ("k", slice(192, 384)),
+                ):
+                    with self.subTest(
+                        block=block_index, projection=projection
+                    ):
+                        selected = gradient[rows]
+                        self.assertTrue(torch.isfinite(selected).all())
+                        self.assertGreater(selected.abs().sum().item(), 0.0)
+
+            with torch.no_grad():
+                model.position.freqs[0, 0, 0].add_(0.125)
+            model.zero_grad(set_to_none=True)
+
+            second_logits = model(image, question_tokens, question_length)
+            second_loss = nn.functional.cross_entropy(
+                second_logits, torch.tensor((1,), dtype=torch.int64)
+            )
+            second_loss.backward()
+        finally:
+            handle.remove()
+
+        self.assertEqual(len(captured), 2)
+        self.assertIsNot(captured[0], captured[1])
+        self.assertFalse(torch.equal(captured[0], captured[1]))
+        second_frequency_gradient = model.position.freqs.grad
+        self.assertIsNotNone(second_frequency_gradient)
+        self.assertTrue(torch.isfinite(second_frequency_gradient).all())
+        self.assertGreater(second_frequency_gradient.abs().sum().item(), 0.0)
+
+
+class CLEVRQuestionAnswererQuestionOnlyTests(unittest.TestCase):
+    def test_same_seed_state_matches_g_and_mode_specific_arguments_are_rejected(self):
+        seed = 20261025
+        torch.manual_seed(seed)
+        global_model = CLEVRQuestionAnswerer(vocab_size=8, mode="G").eval()
+        torch.manual_seed(seed)
+        question_only = CLEVRQuestionAnswerer(
+            vocab_size=8, mode="Q-only"
+        ).eval()
+
+        global_state = global_model.state_dict()
+        question_only_state = question_only.state_dict()
+        self.assertEqual(tuple(global_state), tuple(question_only_state))
+        for name, global_value in global_state.items():
+            with self.subTest(state=name):
+                question_only_value = question_only_state[name]
+                self.assertEqual(global_value.shape, question_only_value.shape)
+                self.assertEqual(global_value.dtype, question_only_value.dtype)
+                self.assertTrue(torch.equal(global_value, question_only_value))
+
+        global_parameters = dict(global_model.named_parameters())
+        question_only_parameters = dict(question_only.named_parameters())
+        self.assertEqual(tuple(global_parameters), tuple(question_only_parameters))
+        self.assertEqual(
+            sum(parameter.numel() for parameter in global_parameters.values()),
+            sum(
+                parameter.numel()
+                for parameter in question_only_parameters.values()
+            ),
+        )
+
+        image, question_tokens, question_length = _valid_answerer_inputs()
+        for invalid_image in (image, object()):
+            with self.subTest(image=type(invalid_image).__name__), self.assertRaises(
+                ValueError
+            ):
+                question_only(invalid_image, question_tokens, question_length)
+        with self.assertRaises(ValueError):
+            question_only(None, question_tokens, question_length, lam=0.0)
+
+        torch.manual_seed(seed)
+        expected_next_random = torch.rand(4)
+        torch.manual_seed(seed)
+        with self.assertRaises(ValueError):
+            CLEVRQuestionAnswerer(
+                vocab_size=8, mode="Q-only", m10_seed=20007
+            )
+        self.assertTrue(torch.equal(torch.rand(4), expected_next_random))
+
+        rgb_modes = (
+            ("G", {}),
+            ("B", {}),
+            ("M10", {"m10_seed": 20007}),
+        )
+        for mode, kwargs in rgb_modes:
+            with self.subTest(mode=mode):
+                model = CLEVRQuestionAnswerer(
+                    vocab_size=8, mode=mode, **kwargs
+                ).eval()
+                with self.assertRaises(TypeError):
+                    model(None, question_tokens, question_length)
+
+    def test_zero_patch_tokens_use_g_phases_and_continue_through_all_blocks(self):
+        torch.manual_seed(20261025)
+        model = CLEVRQuestionAnswerer(vocab_size=8, mode="Q-only").eval()
+        _, question_tokens, question_length = _valid_answerer_inputs(2)
+        captured_tokens = []
+        captured_phases = []
+
+        def reject_projection(_module, _args):
+            raise AssertionError("Q-only called the RGB patch projection")
+
+        def capture_block(_module, args, kwargs):
+            captured_tokens.append(args[0].detach().clone())
+            captured_phases.append(kwargs["freqs_cis"])
+
+        projection_handle = model.backbone.patch_embed.register_forward_pre_hook(
+            reject_projection
+        )
+        block_handles = [
+            block.register_forward_pre_hook(capture_block, with_kwargs=True)
+            for block in model.backbone.blocks
+        ]
+        try:
+            with torch.no_grad():
+                expected_cls = model.backbone.cls_token.expand(2, -1, -1) + (
+                    model.question_encoder(
+                        question_tokens, question_length
+                    ).unsqueeze(1)
+                )
+                logits = model(None, question_tokens, question_length)
+        finally:
+            projection_handle.remove()
+            for handle in block_handles:
+                handle.remove()
+
+        self.assertEqual(tuple(logits.shape), (2, 2))
+        self.assertEqual(len(captured_tokens), 6)
+        self.assertEqual(tuple(captured_tokens[0].shape), (2, 197, 192))
+        self.assertTrue(torch.equal(captured_tokens[0][:, :1], expected_cls))
+        self.assertTrue(
+            torch.equal(
+                captured_tokens[0][:, 1:],
+                torch.zeros((2, 196, 192), dtype=captured_tokens[0].dtype),
+            )
+        )
+        self.assertGreater(captured_tokens[1][:, 1:].abs().sum().item(), 0.0)
+
+        expected_phase = build_axial_cis(
+            14, 14, mode="G", theta=100.0
+        )
+        self.assertEqual(len(captured_phases), 6)
+        for block_index, phase in enumerate(captured_phases):
+            with self.subTest(block=block_index):
+                self.assertIs(phase, captured_phases[0])
+                self.assertTrue(torch.equal(phase, expected_phase))
+
+    def test_answer_loss_skips_projection_and_reaches_nonvisual_components(self):
+        torch.manual_seed(20261025)
+        model = CLEVRQuestionAnswerer(vocab_size=8, mode="Q-only")
+        _, question_tokens, question_length = _valid_answerer_inputs(2)
+
+        logits = model(None, question_tokens, question_length)
+        nn.functional.cross_entropy(logits, torch.tensor((0, 1))).backward()
+
+        projection = model.backbone.patch_embed.proj
+        self.assertIsNone(projection.weight.grad)
+        self.assertIsNone(projection.bias.grad)
+        parameters = {
+            "embedding": model.question_encoder.embedding.weight,
+            "gru input weight": model.question_encoder.gru.weight_ih_l0,
+            "gru hidden weight": model.question_encoder.gru.weight_hh_l0,
+            "cls": model.backbone.cls_token,
+            "final norm": model.backbone.norm.weight,
+            "answer head": model.backbone.head.weight,
+        }
+        for block_index, block in enumerate(model.backbone.blocks):
+            parameters[f"block {block_index} qkv"] = block.attn.qkv.weight
+            parameters[f"block {block_index} mlp"] = block.mlp.fc1.weight
+        for name, parameter in parameters.items():
+            with self.subTest(parameter=name):
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+                self.assertGreater(parameter.grad.abs().sum().item(), 0.0)
+
+    def test_rejects_empty_question_batch_without_an_image(self):
+        model = CLEVRQuestionAnswerer(vocab_size=8, mode="Q-only").eval()
+
+        with self.assertRaises(ValueError):
+            model(
+                None,
+                torch.empty((0, 2), dtype=torch.int64),
+                torch.empty((0,), dtype=torch.int64),
+            )
 
 
 class CLEVRQuestionAnswererArchitectureTests(unittest.TestCase):

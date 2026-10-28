@@ -7,6 +7,44 @@ from torch import Tensor, nn
 
 from src.classification import RoPEClassifier
 from src.local_rope import Lambda
+from models.vit_rope import (
+    compute_mixed_cis,
+    init_random_2d_freqs,
+    init_t_xy,
+)
+
+
+class CLEVRMixedPosition(nn.Module):
+    """Official RoPE-Mixed frequencies for the fixed PUB-R1.1 backbone."""
+
+    def __init__(self, *, seed: int) -> None:
+        super().__init__()
+        if type(seed) is not int:
+            raise TypeError("seed must be an integer")
+        if seed < 0:
+            raise ValueError("seed must be non-negative")
+
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(seed)
+            frequencies = torch.stack(
+                [
+                    init_random_2d_freqs(
+                        dim=64, num_heads=3, theta=10.0
+                    )
+                    for _ in range(6)
+                ],
+                dim=1,
+            ).view(2, 6, 96)
+        self.freqs = nn.Parameter(frequencies)
+        t_x, t_y = init_t_xy(end_x=14, end_y=14)
+        self.register_buffer("freqs_t_x", t_x)
+        self.register_buffer("freqs_t_y", t_y)
+
+    def forward(self) -> Tensor:
+        """Return live per-layer/head phases with no cross-forward cache."""
+        t_x = self.freqs_t_x.to(dtype=self.freqs.dtype)
+        t_y = self.freqs_t_y.to(dtype=self.freqs.dtype)
+        return compute_mixed_cis(self.freqs, t_x, t_y, num_heads=3)
 
 
 class CLEVRQuestionEncoder(nn.Module):
@@ -54,15 +92,30 @@ class CLEVRQuestionEncoder(nn.Module):
 
 
 class CLEVRQuestionAnswerer(nn.Module):
-    """Frozen PUB-R1.1 RGB/question architecture with G or B axial RoPE."""
+    """Frozen PUB-R1.1 answerer with G, B, M10, or Q-only input."""
 
-    def __init__(self, vocab_size: int, *, mode: str = "G") -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        *,
+        mode: str = "G",
+        m10_seed: int | None = None,
+    ) -> None:
         super().__init__()
-        if mode not in {"G", "B"}:
-            raise ValueError("mode must be G or B")
+        if mode not in {"G", "B", "M10", "Q-only"}:
+            raise ValueError("mode must be G, B, M10, or Q-only")
+        if mode == "M10":
+            if m10_seed is None:
+                raise ValueError("M10 requires m10_seed")
+            if type(m10_seed) is not int:
+                raise TypeError("m10_seed must be an integer")
+            if m10_seed < 0:
+                raise ValueError("m10_seed must be non-negative")
+        elif m10_seed is not None:
+            raise ValueError("m10_seed is only valid for M10")
 
         classifier = RoPEClassifier(
-            mode=mode,
+            mode="G" if mode in {"M10", "Q-only"} else mode,
             fixed_lambda=1.0,
             image_size=224,
             patch_size=16,
@@ -80,6 +133,9 @@ class CLEVRQuestionAnswerer(nn.Module):
         self.backbone = classifier.backbone
         self.position = classifier.position
         self.question_encoder = CLEVRQuestionEncoder(vocab_size)
+        if mode == "M10":
+            self.position = CLEVRMixedPosition(seed=m10_seed)
+        self.mode = mode
 
     @staticmethod
     def _validate_batch(
@@ -100,27 +156,53 @@ class CLEVRQuestionAnswerer(nn.Module):
 
     def forward_tokens(
         self,
-        image: Tensor,
+        image: Tensor | None,
         question_tokens: Tensor,
         question_length: Tensor,
         *,
         lam: Lambda | None = None,
     ) -> Tensor:
         """Return all normalized CLS and patch tokens."""
-        self._validate_batch(image, question_tokens, question_length)
-        patches = self.backbone.patch_embed(image)
-        question = self.question_encoder(question_tokens, question_length)
-        cls = self.backbone.cls_token.expand(image.shape[0], -1, -1)
+        if self.mode == "Q-only":
+            if image is not None:
+                raise ValueError("image must be None for Q-only")
+            if lam is not None:
+                raise ValueError("lam is not valid for Q-only")
+            question = self.question_encoder(question_tokens, question_length)
+            if question.shape[0] == 0:
+                raise ValueError("question batch must not be empty")
+            batch_size = question.shape[0]
+        else:
+            self._validate_batch(image, question_tokens, question_length)
+            if self.mode == "M10" and lam is not None:
+                raise ValueError("lam is not valid for M10")
+            patches = self.backbone.patch_embed(image)
+            question = self.question_encoder(question_tokens, question_length)
+            batch_size = image.shape[0]
+        cls = self.backbone.cls_token.expand(batch_size, -1, -1)
         cls = cls + question.unsqueeze(1)
+        if self.mode == "Q-only":
+            patches = cls.new_zeros(
+                (
+                    batch_size,
+                    self.backbone.patch_embed.num_patches,
+                    self.backbone.embed_dim,
+                )
+            )
         tokens = torch.cat((cls, patches), dim=1)
-        phases = self.position(14, 14, lam=lam, device=image.device)
-        for block in self.backbone.blocks:
-            tokens = block(tokens, freqs_cis=phases)
+        if self.mode == "M10":
+            phases = self.position()
+            for block_index, block in enumerate(self.backbone.blocks):
+                tokens = block(tokens, freqs_cis=phases[block_index])
+        else:
+            phases = self.position(14, 14, lam=lam, device=tokens.device)
+            for block in self.backbone.blocks:
+                tokens = block(tokens, freqs_cis=phases)
         return self.backbone.norm(tokens)
 
     def forward_features(
         self,
-        image: Tensor,
+        image: Tensor | None,
         question_tokens: Tensor,
         question_length: Tensor,
         *,
@@ -132,7 +214,7 @@ class CLEVRQuestionAnswerer(nn.Module):
 
     def forward(
         self,
-        image: Tensor,
+        image: Tensor | None,
         question_tokens: Tensor,
         question_length: Tensor,
         *,
