@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import pickle
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 from PIL import Image
@@ -17,6 +19,8 @@ from torchvision.transforms import functional as tvf
 from src.clevr_dataset import (
     CLEVRDatasetError,
     CLEVRQuestionDataset,
+    CLEVRQuestionOnlyDataset,
+    collate_clevr_question_only,
     collate_clevr_questions,
 )
 
@@ -640,6 +644,300 @@ class RuntimeDatasetTests(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+
+class CLEVRQuestionOnlyDatasetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = RuntimeDatasetFixture()
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def assert_rejected(
+        self,
+        pattern: str,
+        *,
+        audit_dir: Path | None = None,
+        partition: str = "train",
+    ) -> None:
+        try:
+            CLEVRQuestionOnlyDataset(
+                audit_dir=(
+                    self.fixture.audit_dir if audit_dir is None else audit_dir
+                ),
+                partition=partition,
+            )
+        except Exception as error:
+            self.assertIsInstance(error, CLEVRDatasetError)
+            self.assertRegex(str(error), pattern)
+        else:
+            self.fail("invalid question-only runtime artifacts were accepted")
+
+    def test_needs_no_data_root_or_images_and_never_opens_png(self) -> None:
+        shutil.rmtree(self.fixture.data_root)
+
+        with mock.patch(
+            "src.clevr_dataset.Image.open",
+            side_effect=AssertionError("Q-only must not open a PNG"),
+        ) as image_open:
+            dataset = CLEVRQuestionOnlyDataset(
+                audit_dir=self.fixture.audit_dir,
+                partition="train",
+            )
+            sample = dataset[0]
+
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual(
+            set(sample), {"question_tokens", "question_length", "answer"}
+        )
+        torch.testing.assert_close(
+            sample["question_tokens"],
+            torch.tensor([1, 4, 2], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(sample["question_tokens"].dtype, torch.int64)
+        self.assertEqual(sample["question_length"].dtype, torch.int64)
+        self.assertEqual(tuple(sample["question_length"].shape), ())
+        self.assertEqual(sample["question_length"].item(), 3)
+        self.assertEqual(sample["answer"].dtype, torch.int64)
+        self.assertEqual(tuple(sample["answer"].shape), ())
+        self.assertEqual(sample["answer"].item(), 0)
+        image_open.assert_not_called()
+
+    def test_matches_rgb_question_projection_and_order(self) -> None:
+        rgb_dataset = CLEVRQuestionDataset(
+            data_root=self.fixture.data_root,
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+        question_dataset = CLEVRQuestionOnlyDataset(
+            audit_dir=self.fixture.audit_dir,
+            partition="train",
+        )
+
+        self.assertEqual(len(question_dataset), len(rgb_dataset))
+        for index in range(len(rgb_dataset)):
+            rgb_sample = rgb_dataset[index]
+            question_sample = question_dataset[index]
+            for field in ("question_tokens", "question_length", "answer"):
+                with self.subTest(index=index, field=field):
+                    self.assertTrue(
+                        torch.equal(question_sample[field], rgb_sample[field])
+                    )
+
+    def test_rejects_noncanonical_image_metadata_without_resolving_files(
+        self,
+    ) -> None:
+        self.fixture.rows[0]["image_path"] = (
+            "images/train/../train/CLEVR_train_000002.png"
+        )
+        self.fixture.write_artifacts()
+        shutil.rmtree(self.fixture.data_root)
+
+        self.assert_rejected(r"image_path|canonical")
+
+    def test_rejects_invalid_constructor_inputs_and_unrequested_bad_rows(
+        self,
+    ) -> None:
+        self.assert_rejected(r"partition", partition="unknown")
+        self.assert_rejected(
+            r"audit.*directory",
+            audit_dir=self.fixture.root / "missing-audit",
+        )
+
+        dev_row = next(
+            row for row in self.fixture.rows if row["partition"] == "dev"
+        )
+        dev_row["image_path"] = "images/train/not-the-image-identity.png"
+        self.fixture.write_artifacts()
+        shutil.rmtree(self.fixture.data_root)
+
+        self.assert_rejected(r"image_path|canonical", partition="train")
+
+
+class CLEVRQuestionOnlyCollateTests(unittest.TestCase):
+    @staticmethod
+    def sample(tokens: list[int], *, answer: int) -> dict[str, torch.Tensor]:
+        return {
+            "question_tokens": torch.tensor(tokens, dtype=torch.int64),
+            "question_length": torch.tensor(len(tokens), dtype=torch.int64),
+            "answer": torch.tensor(answer, dtype=torch.int64),
+        }
+
+    def assert_collate_rejected(
+        self,
+        samples: object,
+        pattern: str = r"sample|collate|batch|tensor|key",
+    ) -> None:
+        try:
+            collate_clevr_question_only(samples)  # type: ignore[arg-type]
+        except Exception as error:
+            self.assertIsInstance(error, CLEVRDatasetError)
+            self.assertRegex(str(error), pattern)
+        else:
+            self.fail("invalid CLEVR question-only samples were collated")
+
+    def test_pads_without_truncation_and_preserves_order(self) -> None:
+        samples = [
+            self.sample([1, 7, 2], answer=1),
+            self.sample([1, 5, 6, 2], answer=0),
+        ]
+
+        batch = collate_clevr_question_only(samples)
+
+        self.assertEqual(
+            set(batch), {"question_tokens", "question_length", "answer"}
+        )
+        torch.testing.assert_close(
+            batch["question_tokens"],
+            torch.tensor([[1, 7, 2, 0], [1, 5, 6, 2]], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            batch["question_length"],
+            torch.tensor([3, 4], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            batch["answer"],
+            torch.tensor([1, 0], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_dataloader_batch_contains_exactly_three_fields_without_images(
+        self,
+    ) -> None:
+        fixture = RuntimeDatasetFixture()
+        try:
+            shutil.rmtree(fixture.data_root)
+            dataset = CLEVRQuestionOnlyDataset(
+                audit_dir=fixture.audit_dir,
+                partition="train",
+            )
+            loader = DataLoader(
+                dataset,
+                batch_size=2,
+                shuffle=False,
+                collate_fn=collate_clevr_question_only,
+            )
+
+            batch = next(iter(loader))
+
+            self.assertEqual(
+                set(batch), {"question_tokens", "question_length", "answer"}
+            )
+            self.assertEqual(tuple(batch["question_tokens"].shape), (2, 3))
+            torch.testing.assert_close(
+                batch["answer"],
+                torch.tensor([0, 1], dtype=torch.int64),
+                rtol=0,
+                atol=0,
+            )
+        finally:
+            fixture.close()
+
+    def test_rejects_empty_missing_extra_and_non_tensor_samples(self) -> None:
+        self.assert_collate_rejected([], r"empty|sample")
+
+        missing = self.sample([1, 7, 2], answer=1)
+        missing.pop("answer")
+        self.assert_collate_rejected([missing], r"key|field|sample 0")
+
+        extra = self.sample([1, 7, 2], answer=1)
+        extra["image"] = torch.zeros((3, 224, 224), dtype=torch.float32)
+        self.assert_collate_rejected([extra], r"key|field|sample 0")
+
+        non_tensor = self.sample([1, 7, 2], answer=1)
+        non_tensor["answer"] = 1  # type: ignore[assignment]
+        self.assert_collate_rejected([non_tensor], r"tensor|sample 0")
+
+    def test_rejects_invalid_token_length_and_answer_contracts(self) -> None:
+        def run_case(name: str, mutate, pattern: str) -> None:
+            with self.subTest(case=name):
+                sample = self.sample([1, 7, 2], answer=1)
+                mutate(sample)
+                self.assert_collate_rejected([sample], pattern)
+
+        cases = (
+            (
+                "token dtype",
+                lambda sample: sample.update(
+                    {"question_tokens": sample["question_tokens"].to(torch.float32)}
+                ),
+                r"question_tokens|dtype|sample 0",
+            ),
+            (
+                "token rank",
+                lambda sample: sample.update(
+                    {"question_tokens": sample["question_tokens"].unsqueeze(0)}
+                ),
+                r"question_tokens|rank|sample 0",
+            ),
+            (
+                "start",
+                lambda sample: sample["question_tokens"].__setitem__(0, 3),
+                r"START|sample 0",
+            ),
+            (
+                "end",
+                lambda sample: sample["question_tokens"].__setitem__(-1, 3),
+                r"END|sample 0",
+            ),
+            (
+                "embedded null",
+                lambda sample: sample["question_tokens"].__setitem__(1, 0),
+                r"NULL|sample 0",
+            ),
+            (
+                "negative token",
+                lambda sample: sample["question_tokens"].__setitem__(1, -1),
+                r"negative|sample 0",
+            ),
+            (
+                "length dtype",
+                lambda sample: sample.update(
+                    {"question_length": sample["question_length"].to(torch.float32)}
+                ),
+                r"question_length|int64|sample 0",
+            ),
+            (
+                "length rank",
+                lambda sample: sample.update(
+                    {"question_length": sample["question_length"].unsqueeze(0)}
+                ),
+                r"question_length|scalar|sample 0",
+            ),
+            (
+                "length value",
+                lambda sample: sample["question_length"].fill_(2),
+                r"question_length|disagree|sample 0",
+            ),
+            (
+                "answer dtype",
+                lambda sample: sample.update(
+                    {"answer": sample["answer"].to(torch.float32)}
+                ),
+                r"answer|int64|sample 0",
+            ),
+            (
+                "answer rank",
+                lambda sample: sample.update(
+                    {"answer": sample["answer"].unsqueeze(0)}
+                ),
+                r"answer|scalar|sample 0",
+            ),
+            (
+                "answer value",
+                lambda sample: sample["answer"].fill_(2),
+                r"answer|0 or 1|sample 0",
+            ),
+        )
+        for name, mutate, pattern in cases:
+            run_case(name, mutate, pattern)
 
 
 class CLEVRQuestionCollateTests(unittest.TestCase):

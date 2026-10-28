@@ -43,6 +43,7 @@ _ROW_FIELDS = {
     "relation",
 }
 _MODEL_FIELDS = {"image", "question_tokens", "question_length", "answer"}
+_QUESTION_ONLY_MODEL_FIELDS = {"question_tokens", "question_length", "answer"}
 
 
 class CLEVRDatasetError(ValueError):
@@ -51,7 +52,7 @@ class CLEVRDatasetError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class _RuntimeRecord:
-    image_path: Path
+    image_path: Path | None
     image_index: int
     question_index: int
     source_position: int
@@ -164,7 +165,7 @@ def _parse_row(
     raw_row: object,
     *,
     context: str,
-    data_root: Path,
+    data_root: Path | None,
     vocabulary: Vocabulary,
 ) -> tuple[str, str, int, int, _RuntimeRecord]:
     if not isinstance(raw_row, Mapping):
@@ -200,11 +201,13 @@ def _parse_row(
             f"{context} image_path must be the canonical relative POSIX path "
             f"{expected_image_path!r}"
         )
-    image_path = _resolve_image_file(
-        data_root / serialized_image_path,
-        data_root=data_root,
-        context=context,
-    )
+    image_path = None
+    if data_root is not None:
+        image_path = _resolve_image_file(
+            data_root / serialized_image_path,
+            data_root=data_root,
+            context=context,
+        )
 
     question = _require_string(raw_row, "question", context)
     relation = _require_string(raw_row, "relation", context)
@@ -254,7 +257,7 @@ def _parse_row(
 def _load_records(
     path: Path,
     *,
-    data_root: Path,
+    data_root: Path | None,
     vocabulary: Vocabulary,
     report_counts: Mapping[str, int],
     selected_partition: str,
@@ -369,6 +372,10 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         record = self._records[index]
+        if record.image_path is None:
+            raise CLEVRDatasetError(
+                f"selected RGB index {index} has no resolved image_path"
+            )
         image_path = _resolve_image_file(
             record.image_path,
             data_root=self.data_root,
@@ -417,6 +424,41 @@ class CLEVRQuestionDataset(Dataset[dict[str, Tensor]]):
         }
 
 
+class CLEVRQuestionOnlyDataset(Dataset[dict[str, Tensor]]):
+    """Indexable question-only samples from an explicit accepted audit."""
+
+    def __init__(self, *, audit_dir: Path, partition: str) -> None:
+        self.audit_dir = Path(audit_dir).resolve()
+        if not self.audit_dir.is_dir():
+            raise CLEVRDatasetError(
+                f"CLEVR audit directory is not a directory: {self.audit_dir}"
+            )
+        if partition not in _PARTITION_SPLITS:
+            raise CLEVRDatasetError(f"unknown CLEVR partition: {partition!r}")
+
+        vocabulary = _load_vocabulary(self.audit_dir / "vocabulary.json")
+        report_counts = _load_report_counts(self.audit_dir / "audit_report.json")
+        self._records = _load_records(
+            self.audit_dir / "selected_questions.jsonl",
+            data_root=None,
+            vocabulary=vocabulary,
+            report_counts=report_counts,
+            selected_partition=partition,
+        )
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, index: int) -> dict[str, Tensor]:
+        record = self._records[index]
+        tokens = torch.tensor(record.encoded_tokens, dtype=torch.int64)
+        return {
+            "question_tokens": tokens,
+            "question_length": torch.tensor(tokens.numel(), dtype=torch.int64),
+            "answer": torch.tensor(record.answer, dtype=torch.int64),
+        }
+
+
 def collate_clevr_questions(
     samples: Sequence[Mapping[str, Tensor]],
 ) -> dict[str, Tensor]:
@@ -436,6 +478,29 @@ def collate_clevr_questions(
         ),
         "question_length": torch.stack([sample[2] for sample in validated]),
         "answer": torch.stack([sample[3] for sample in validated]),
+    }
+
+
+def collate_clevr_question_only(
+    samples: Sequence[Mapping[str, Tensor]],
+) -> dict[str, Tensor]:
+    """Pad audited question-only samples without image materialization."""
+    if not samples:
+        raise CLEVRDatasetError(
+            "cannot collate an empty CLEVR question-only sample sequence"
+        )
+    validated = [
+        _validate_question_only_collate_sample(sample, index=index)
+        for index, sample in enumerate(samples)
+    ]
+    return {
+        "question_tokens": pad_sequence(
+            [sample[0] for sample in validated],
+            batch_first=True,
+            padding_value=0,
+        ),
+        "question_length": torch.stack([sample[1] for sample in validated]),
+        "answer": torch.stack([sample[2] for sample in validated]),
     }
 
 
@@ -473,6 +538,45 @@ def _validate_collate_sample(
             f"{context} image must be within the float32 tolerance of [0,1]"
         )
 
+    tokens, length, answer = _validate_question_tensors(
+        tokens,
+        length,
+        answer,
+        context=context,
+    )
+    return image, tokens, length, answer
+
+
+def _validate_question_only_collate_sample(
+    sample: Mapping[str, Tensor], *, index: int
+) -> tuple[Tensor, Tensor, Tensor]:
+    context = f"CLEVR question-only collate sample {index}"
+    if not isinstance(sample, Mapping):
+        raise CLEVRDatasetError(f"{context} must be a mapping")
+    if set(sample) != _QUESTION_ONLY_MODEL_FIELDS:
+        missing = sorted(_QUESTION_ONLY_MODEL_FIELDS.difference(sample))
+        extra = sorted(set(sample).difference(_QUESTION_ONLY_MODEL_FIELDS))
+        raise CLEVRDatasetError(
+            f"{context} keys disagree with the model contract; "
+            f"missing={missing}, extra={extra}"
+        )
+    if any(not isinstance(value, Tensor) for value in sample.values()):
+        raise CLEVRDatasetError(f"{context} values must all be tensors")
+    return _validate_question_tensors(
+        sample["question_tokens"],
+        sample["question_length"],
+        sample["answer"],
+        context=context,
+    )
+
+
+def _validate_question_tensors(
+    tokens: Tensor,
+    length: Tensor,
+    answer: Tensor,
+    *,
+    context: str,
+) -> tuple[Tensor, Tensor, Tensor]:
     if tokens.dtype != torch.int64 or tokens.ndim != 1:
         raise CLEVRDatasetError(
             f"{context} question_tokens must have dtype int64 and rank 1"
@@ -506,4 +610,4 @@ def _validate_collate_sample(
         raise CLEVRDatasetError(f"{context} answer must be an int64 scalar")
     if answer.item() not in {0, 1}:
         raise CLEVRDatasetError(f"{context} answer must be 0 or 1")
-    return image, tokens, length, answer
+    return tokens, length, answer
